@@ -1,0 +1,66 @@
+{
+  "name": "incentiv-mcp",
+  "version": "0.2.0",
+  "description": "Incentiv MCP: a local server with chain tools and an encrypted, policy-constrained wallet.",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "cd test && node --import tsx --test",
+    "typecheck": "tsc --noEmit",
+    "ci": "npm run typecheck && npm test",
+    "build": "tsc && node scripts/copy-wallet-assets.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "incentiv",
+    "mcp",
+    "model-context-protocol",
+    "blockchain",
+    "account-abstraction",
+    "ethereum",
+    "erc-4337",
+    "hyperlane"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IncentivNetwork/incentiv-mcp.git"
+  },
+  "type": "module",
+  "bin": {
+    "incentiv-mcp": "dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@napi-rs/keyring": "2.1.0",
+    "viem": "2.55.4",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "files": [
+    "dist",
+    "npm-shrinkwrap.json",
+    "README.md",
+    "docs/wallet-storage.md",
+    "docs/wallet-usage.md",
+    "docs/wallet-policy.example.json",
+    "docs/network-configuration.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "homepage": "https://github.com/IncentivNetwork/incentiv-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/IncentivNetwork/incentiv-mcp/issues"
+  }
+}

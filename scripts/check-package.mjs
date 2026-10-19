@@ -1,0 +1,15 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
+const npm = process.env.npm_execpath;
+assert.ok(npm, "Run npm run check:package");
+const [packed] = JSON.parse(execFileSync(process.execPath, [npm, "pack", "--dry-run", "--ignore-scripts", "--json"], { encoding: "utf8" }));
+const files = new Set(packed.files.map(f => f.path));
+for (const path of ["dist/index.js", "dist/setup.js", "dist/setup-policy.js", "dist/setup-client.js", "dist/onboarding-docs.js", "dist/wallet/windows-permissions.ps1", "dist/wallet/capabilities.js", "dist/wallet/recovery.js", "npm-shrinkwrap.json", "docs/wallet-usage.md", "docs/wallet-policy.example.json"]) assert.ok(files.has(path), `Missing ${path}`);
+assert.ok([...files].every(path => !path.startsWith("test/") && !path.startsWith(".cache/") && !path.endsWith("master.key")));
+for (const path of ["dist/account-upgrade.js", "dist/wallet/implementation.js"]) assert.ok(files.has(path), `Missing ${path}`);
+const pkg = JSON.parse(await readFile("package.json", "utf8")), lock = JSON.parse(await readFile("npm-shrinkwrap.json", "utf8"));
+assert.equal(pkg.version, lock.version);
+for (const [name, version] of Object.entries(pkg.dependencies)) assert.equal(version, lock.packages[`node_modules/${name}`].version);
+for (const name of ["preinstall", "install", "postinstall"]) assert.equal(pkg.scripts[name], undefined);
+console.log(`Package verified: ${files.size} files, exact runtime dependencies and published shrinkwrap`);

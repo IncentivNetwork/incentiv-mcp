@@ -1,0 +1,20 @@
+{
+  "tokens": {
+    "native": {
+      "perTransaction": "1000000000000000000",
+      "daily": "3000000000000000000",
+      "exposure": "10000000000000000000",
+      "gasPayment": "1000000000000000000"
+    }
+  },
+  "recipients": { "mode": "allowlist", "addresses": [] },
+  "targets": {},
+  "swaps": false,
+  "maxSlippageBps": 50,
+  "maxQuoteDeviationBps": 50,
+  "independentRpcOrigins": [],
+  "maxGasCostWei": "1000000000000000000",
+  "maxFeePerGas": "100000000000000",
+  "maxGasUnits": "1000000",
+  "maxBatchCalls": 4
+}

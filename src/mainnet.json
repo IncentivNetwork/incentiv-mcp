@@ -1,0 +1,410 @@
+{
+  "identity": {
+    "schemaVersion": 1,
+    "name": "Incentiv Mainnet",
+    "chainId": 24101,
+    "genesisHash": "0x08c68c7667787a081a2bef5ddae2f09b968f2ac6a873929cae4591c475376c73",
+    "nativeSymbol": "CENT",
+    "userOpVersion": "0.7",
+    "signingScheme": "eip191-userop-hash",
+    "accountDerivation": "factory-create2-v1",
+    "accountInitCodeHash": "0x07ceb5e74beace77265bf145b60b5b1922930ef7d2b2d7f4201b70581fc5f927",
+    "accountVersion": "incentiv-account-beacon-v2.1.0",
+    "entryPoint": {
+      "address": "0x3eC61c5633BBD7Afa9144C6610930489736a72d4",
+      "codeHash": "0x97da451e93d5ba9d03c3836202d4df0163e01e4b1745e3273cfecc17c8429e39"
+    },
+    "accountFactory": {
+      "address": "0xfED842F3C1d054361A840AE863C0b72db5CB2a32",
+      "codeHash": "0x8374c98862ec868c31a4e4c7a5863566d6ddb61d84366bc3d955b80607391043"
+    },
+    "accountBeacon": {
+      "address": "0xB9a84EAEb76B7DC93b77d39b607f4A41CD93eb6e",
+      "codeHash": "0xbb22ddcad6a8ddd5e8b09175f081c28301aa8ea1fe63228be028c0b672b24467"
+    },
+    "accountImplementation": {
+      "address": "0x7F9Ff738B524a6A053Eb7bA1b89B37aF1CFE74c7",
+      "codeHash": "0xa87d658235db0e2931489cfd336bb9c93c0ebd4ccefae047f513356056cfc62a"
+    },
+    "networkId": "0xf7beea402d23219daa3790b6685ca14119813c0b802ff570696836bdda260101"
+  },
+  "manifest": {
+    "schemaVersion": 1,
+    "networkId": "0xf7beea402d23219daa3790b6685ca14119813c0b802ff570696836bdda260101",
+    "contracts": {
+      "contractRegistry": {
+        "address": "0x8E009Df4519c14D7D758F955993413F2e68CAB3E",
+        "codeHash": "0x07766f6a826cf83280df44310e4cc34d423fbc47df3bafaad89c06b4adf111d9"
+      },
+      "transferGate": {
+        "address": "0x66F51d740d0Ab781bc525B52d0d35D0585086Aa1",
+        "codeHash": "0x1fde723e898da8782a8c02b649ec73f9a4b3fd523eef63aab7904565c3696c14"
+      },
+      "bulkBalanceReader": {
+        "address": "0x1e7c87e0719400EF9e7433d09f6f98fB3994993f",
+        "codeHash": "0xccbce0243522088d764f5dbeeed2b075220360c8f7d4d24b7d7531c1a0d2d61a"
+      },
+      "unifiedTokenPaymaster": {
+        "address": "0x43000f785EB43BcB4961C5c70276eD00e088972c",
+        "codeHash": "0xe5e3693157141608a301682c8c228c0277eac7efc0b98b57f874ca49752b5fd8"
+      },
+      "wcent": {
+        "address": "0xB0f0A14A50F14dc9e6476d61C00cF0375Dd4EB04",
+        "codeHash": "0x04c2243ad89ba77fa8808d188fb15d27406e07e63058f114bc38f0dac43ca622"
+      },
+      "swapRouter": {
+        "address": "0x4a66A8bA9704DD06fE52A027f2B16a3F5D11B048",
+        "codeHash": "0xe8575d07353b8c1559ec2e95a32238f4c148b4724a3b45c1a745ea8947ba2609"
+      },
+      "quoter": {
+        "address": "0x1d317fFfBc3Bda5aA06F9f8f506e8C6082dC415A",
+        "codeHash": "0xd8f926f997871a503c460e053e2611ff1c6a356ea18df43892be926f08a00ce6"
+      }
+    },
+    "canonicalTokens": {
+      "WCENT": {
+        "address": "0xB0f0A14A50F14dc9e6476d61C00cF0375Dd4EB04",
+        "codeHash": "0x04c2243ad89ba77fa8808d188fb15d27406e07e63058f114bc38f0dac43ca622"
+      },
+      "WETH": {
+        "address": "0x3e425317dB7BaC8077093117081b40d9b46F29cb",
+        "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+      },
+      "WBTC": {
+        "address": "0x0292593D416Cb765E0e8FF77b32fA7e465958FEE",
+        "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+      },
+      "USDC": {
+        "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+        "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+      },
+      "USDT": {
+        "address": "0x39b076b5d23F588690D480af3Bf820edad31a4bB",
+        "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+      },
+      "SOL": {
+        "address": "0xfaC24134dbc4b00Ee11114eCDFE6397f389203E3",
+        "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+      }
+    },
+    "bridge": {
+      "enabled": true,
+      "incentivDomain": 24101,
+      "mailbox": {
+        "address": "0x3a464f746D23Ab22155710f44dB16dcA53e0775E",
+        "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+      },
+      "routes": [
+        {
+          "symbol": "USDC",
+          "incentivToken": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteChain": "ethereum",
+          "remoteToken": {
+            "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "codeHash": "0xd80d4b7c890cb9d6a4893e6b52bc34b56b25335cb13716e0d1d31383e6b41505"
+          },
+          "localRouter": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0x8918b0186136130FE8e02bfB221f23cbBbCDDE07",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 6,
+          "remoteStandard": "collateral",
+          "incentivStandard": "synthetic"
+        },
+        {
+          "symbol": "USDC",
+          "incentivToken": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteChain": "base",
+          "remoteToken": {
+            "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "codeHash": "0xa6705a10bb756b5dea144591118be77d7af0c3eee3bf2dfe2583dcb0364fefab"
+          },
+          "localRouter": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0xBBDE7EFB7a1AB3ED9122a14b33dC5C07D982367E",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 6,
+          "remoteStandard": "collateral",
+          "incentivStandard": "synthetic"
+        },
+        {
+          "symbol": "USDC",
+          "incentivToken": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteChain": "arbitrum",
+          "remoteToken": {
+            "address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+            "codeHash": "0xad30d819dbc47814b7e6cb837fd7cc57fcb591479a38596ee93de4fc52e8c435"
+          },
+          "localRouter": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0x67E26775847da2c066415d7F46fbEEc5C70F6a89",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 6,
+          "remoteStandard": "collateral",
+          "incentivStandard": "synthetic"
+        },
+        {
+          "symbol": "USDC",
+          "incentivToken": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteChain": "optimism",
+          "remoteToken": {
+            "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+            "codeHash": "0xaad43333d28e146557f1c682e8a4226743fb231fdd00a577512233bd9e920008"
+          },
+          "localRouter": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0xBb099fc67423e5173286cC5144e85A6aaa7737bF",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 6,
+          "remoteStandard": "collateral",
+          "incentivStandard": "synthetic"
+        },
+        {
+          "symbol": "USDC",
+          "incentivToken": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteChain": "polygon",
+          "remoteToken": {
+            "address": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+            "codeHash": "0x7dbf0ee7d6d69b563891ceb7056cf0ff0fa09d21a48e5f812d89981c2ef95944"
+          },
+          "localRouter": {
+            "address": "0x16e43840d8D79896A389a3De85aB0B0210C05685",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0x7022CffD405960c1B98fEB84DD03c29Cc1053f61",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 6,
+          "remoteStandard": "collateral",
+          "incentivStandard": "synthetic"
+        },
+        {
+          "symbol": "USDT",
+          "incentivToken": {
+            "address": "0x39b076b5d23F588690D480af3Bf820edad31a4bB",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteChain": "ethereum",
+          "remoteToken": {
+            "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            "codeHash": "0xb44fb4e949d0f78f87f79ee46428f23a2a5713ce6fc6e0beb3dda78c2ac1ea55"
+          },
+          "localRouter": {
+            "address": "0x39b076b5d23F588690D480af3Bf820edad31a4bB",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0x7a1E026306164e22e0746D0097B92AFcfcc45BA6",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 6,
+          "remoteStandard": "collateral",
+          "incentivStandard": "synthetic"
+        },
+        {
+          "symbol": "WETH",
+          "incentivToken": {
+            "address": "0x3e425317dB7BaC8077093117081b40d9b46F29cb",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteChain": "ethereum",
+          "remoteToken": {
+            "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            "codeHash": "0xd0a06b12ac47863b5c7be4185c2deaad1c61557033f56c7d4ea74429cbb25e23"
+          },
+          "localRouter": {
+            "address": "0x3e425317dB7BaC8077093117081b40d9b46F29cb",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0xAcCd04AC22BDdC7E262D507d6f2ffca540DADd42",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 18,
+          "remoteStandard": "collateral",
+          "incentivStandard": "synthetic"
+        },
+        {
+          "symbol": "WBTC",
+          "incentivToken": {
+            "address": "0x0292593D416Cb765E0e8FF77b32fA7e465958FEE",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteChain": "ethereum",
+          "remoteToken": {
+            "address": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+            "codeHash": "0x131ff5c755b710d543ea70fede2eb38e5d15b1456df0ae932ba12e2786f7e5df"
+          },
+          "localRouter": {
+            "address": "0x0292593D416Cb765E0e8FF77b32fA7e465958FEE",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0x6cFC3e0579F3706E6f2E4BC039e8372b868F3CA5",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 8,
+          "remoteStandard": "collateral",
+          "incentivStandard": "synthetic"
+        },
+        {
+          "symbol": "CENT",
+          "remoteChain": "ethereum",
+          "remoteToken": {
+            "address": "0xBBDE7EFB7a1AB3ED9122a14b33dC5C07D982367E",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "localRouter": {
+            "address": "0x23958cBa555AC52C9495Df9b121ff73003e39dBb",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0xBBDE7EFB7a1AB3ED9122a14b33dC5C07D982367E",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 18,
+          "remoteStandard": "synthetic",
+          "incentivStandard": "native"
+        },
+        {
+          "symbol": "CENT",
+          "remoteChain": "bsc",
+          "remoteToken": {
+            "address": "0x1E9A8531548aEd9b7fb83e80eF66422d182998C3",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "localRouter": {
+            "address": "0x23958cBa555AC52C9495Df9b121ff73003e39dBb",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "remoteRouter": {
+            "address": "0x1E9A8531548aEd9b7fb83e80eF66422d182998C3",
+            "codeHash": "0x12d65d137a79c184284b3b740ec6ccfc153fae6b7e34153a21cd793ddd8f9d9f"
+          },
+          "decimals": 18,
+          "remoteStandard": "synthetic",
+          "incentivStandard": "native"
+        }
+      ],
+      "remoteChains": {
+        "ethereum": {
+          "name": "Ethereum",
+          "nativeSymbol": "ETH",
+          "chainId": 1,
+          "domain": 1
+        },
+        "base": {
+          "name": "Base",
+          "nativeSymbol": "ETH",
+          "chainId": 8453,
+          "domain": 8453
+        },
+        "arbitrum": {
+          "name": "Arbitrum One",
+          "nativeSymbol": "ETH",
+          "chainId": 42161,
+          "domain": 42161
+        },
+        "optimism": {
+          "name": "OP Mainnet",
+          "nativeSymbol": "ETH",
+          "chainId": 10,
+          "domain": 10
+        },
+        "bsc": {
+          "name": "BNB Smart Chain",
+          "nativeSymbol": "BNB",
+          "chainId": 56,
+          "domain": 56
+        },
+        "polygon": {
+          "name": "Polygon",
+          "nativeSymbol": "POL",
+          "chainId": 137,
+          "domain": 137
+        }
+      },
+      "note": "SOL to Solana is listed only; non-EVM recipients are not supported."
+    },
+    "manifestId": "0x46e12b725e59f3f5c3fc3f39c48eb6e4301a5cfdb5f06b7df2a5c02cf65d77b4"
+  },
+  "accountCreationCode": "0x60a06040526040516105e43803806105e483398101604081905261002291610386565b61002c828261003e565b506001600160a01b031660805261047d565b610047826100fe565b6040516001600160a01b038316907f1cf3b03a6cf19fa2baba4df148e9dcabedea7f8a5c07840e207e5c089be95d3e90600090a28051156100f2576100ed826001600160a01b0316635c60da1b6040518163ffffffff1660e01b8152600401602060405180830381865afa1580156100c3573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906100e79190610446565b82610211565b505050565b6100fa610288565b5050565b806001600160a01b03163b60000361013957604051631933b43b60e21b81526001600160a01b03821660048201526024015b60405180910390fd5b807fa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d5080546001600160a01b0319166001600160a01b0392831617905560408051635c60da1b60e01b81529051600092841691635c60da1b9160048083019260209291908290030181865afa1580156101b5573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906101d99190610446565b9050806001600160a01b03163b6000036100fa57604051634c9c8ce360e01b81526001600160a01b0382166004820152602401610130565b6060600080846001600160a01b03168460405161022e9190610461565b600060405180830381855af49150503d8060008114610269576040519150601f19603f3d011682016040523d82523d6000602084013e61026e565b606091505b50909250905061027f8583836102a9565b95945050505050565b34156102a75760405163b398979f60e01b815260040160405180910390fd5b565b6060826102be576102b982610308565b610301565b81511580156102d557506001600160a01b0384163b155b156102fe57604051639996b31560e01b81526001600160a01b0385166004820152602401610130565b50805b9392505050565b80511561031757805160208201fd5b60405163d6bda27560e01b815260040160405180910390fd5b80516001600160a01b038116811461034757600080fd5b919050565b634e487b7160e01b600052604160045260246000fd5b60005b8381101561037d578181015183820152602001610365565b50506000910152565b6000806040838503121561039957600080fd5b6103a283610330565b60208401519092506001600160401b03808211156103bf57600080fd5b818501915085601f8301126103d357600080fd5b8151818111156103e5576103e561034c565b604051601f8201601f19908116603f0116810190838211818310171561040d5761040d61034c565b8160405282815288602084870101111561042657600080fd5b610437836020830160208801610362565b80955050505050509250929050565b60006020828403121561045857600080fd5b61030182610330565b60008251610473818460208701610362565b9190910192915050565b60805161014d61049760003960006024015261014d6000f3fe608060405261000c61000e565b005b61001e610019610020565b6100b6565b565b60007f000000000000000000000000000000000000000000000000000000000000000073ffffffffffffffffffffffffffffffffffffffff16635c60da1b6040518163ffffffff1660e01b8152600401602060405180830381865afa15801561008d573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906100b191906100da565b905090565b3660008037600080366000845af43d6000803e8080156100d5573d6000f35b3d6000fd5b6000602082840312156100ec57600080fd5b815173ffffffffffffffffffffffffffffffffffffffff8116811461011057600080fd5b939250505056fea2646970667358221220a9b9360079409ab9b8a713cc4ec05db3f3505d407d5585f4ad325c9c9f4acb1c64736f6c63430008170033",
+  "endpoints": {
+    "rpcUrls": [
+      "https://rpc.incentiv.io"
+    ],
+    "bundlerUrl": "https://bundler.incentiv.io",
+    "explorerApiUrl": "https://explorer.incentiv.io/api/v2",
+    "explorerUrl": "https://explorer.incentiv.io",
+    "remoteChains": {
+      "ethereum": {
+        "rpcUrls": [
+          "https://ethereum.publicnode.com"
+        ],
+        "explorerUrl": "https://etherscan.io"
+      },
+      "base": {
+        "rpcUrls": [
+          "https://mainnet.base.org"
+        ],
+        "explorerUrl": "https://basescan.org"
+      },
+      "arbitrum": {
+        "rpcUrls": [
+          "https://arb1.arbitrum.io/rpc"
+        ],
+        "explorerUrl": "https://arbiscan.io"
+      },
+      "optimism": {
+        "rpcUrls": [
+          "https://mainnet.optimism.io"
+        ],
+        "explorerUrl": "https://optimistic.etherscan.io"
+      },
+      "bsc": {
+        "rpcUrls": [
+          "https://bsc-dataseed.binance.org"
+        ],
+        "explorerUrl": "https://bscscan.com"
+      },
+      "polygon": {
+        "rpcUrls": [
+          "https://polygon-bor-rpc.publicnode.com"
+        ],
+        "explorerUrl": "https://polygonscan.com"
+      }
+    }
+  }
+}

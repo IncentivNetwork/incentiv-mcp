@@ -1,0 +1,44 @@
+name: Wallet platform checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  offline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run ci
+      - run: npm run build
+      - run: npm run check:package
+      - name: Native Windows/macOS credential round trip
+        if: runner.os != 'Linux'
+        run: node --import tsx scripts/check-wallet-credentials.mjs
+      - name: Native Windows/macOS complete storage integration
+        if: runner.os != 'Linux'
+        run: node --import tsx scripts/check-wallet-native.mjs
+      - name: Install Linux Secret Service test session
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gnome-keyring dbus-x11
+      - name: Native Linux credential round trip
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dbus-run-session -- bash -eu -c '
+            printf "%s" "isolated-ci-keyring" | gnome-keyring-daemon --unlock --components=secrets
+            node --import tsx scripts/check-wallet-credentials.mjs
+            node --import tsx scripts/check-wallet-native.mjs
+          '
