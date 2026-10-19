@@ -2,7 +2,7 @@
 
 A local [Model Context Protocol](https://modelcontextprotocol.io) server for the [Incentiv](https://incentiv.io) blockchain. It runs on your computer over stdio and includes an encrypted, policy-constrained wallet. Keys stay on your computer and never enter MCP inputs or outputs.
 
-Version 0.2.0. Authenticated spending policy and all transaction checks stay mandatory.
+Version 0.3.0. Authenticated spending policy and all transaction checks stay mandatory.
 
 ## Install
 

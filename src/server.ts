@@ -3,7 +3,7 @@ import type { Ctx } from "./context.js";
 import { renderMarkdown } from "./docs.js";
 import { registerPublicTools, type ToolDoc } from "./tools.js";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 export interface ServerCapabilities {
   readonly publicTools: true;

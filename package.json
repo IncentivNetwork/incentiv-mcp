@@ -1,6 +1,6 @@
 {
   "name": "incentiv-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Incentiv MCP: a local server with chain tools and an encrypted, policy-constrained wallet.",
   "main": "dist/index.js",
   "scripts": {
