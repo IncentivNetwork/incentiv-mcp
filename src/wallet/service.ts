@@ -1,3 +1,5 @@
+import { isRegistryIntent, registryCapability } from "../agent-registry.js";
+import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { type Hex } from "viem";
 import { z } from "zod";
@@ -49,15 +51,16 @@ export class WalletService {
     if (digest(validated.spend) !== digest(r.reservation)) throw new WalletError("wallet_recovery_required", "Operation reservation does not match the signed spend");
     const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
     if (ownsNonce(r.status)) for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
-    const violations = policyViolations(limits, { token: r.intent.token, tokenOut: r.intent.tokenOut, amount: r.intent.amount, to: r.intent.to, swap: r.intent.kind === "swap", slippage: r.intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
+    const violations = policyViolations(limits, { ...this.registryPolicy(r.intent), token: r.intent.token, tokenOut: r.intent.tokenOut, amount: r.intent.amount, to: r.intent.to, swap: r.intent.kind === "swap", slippage: r.intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
     if (violations.includes("exposure_limit") || (violations.length && (!this.approved(s, r) || r.approval?.liveTest))) throw new WalletError("policy_denied", "Current policy does not permit this signed operation; reservation preserved");
     if (r.approval && !this.approved(s, r)) throw new WalletError("approval_required", "Exact-operation approval expired or policy changed; reservation preserved");
     if (Object.entries(validated.spend).some(([token, amount]) => BigInt(balances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "Balance cannot cover input plus maximum gas");
     if (state.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Gas fee no longer covers the current base fee");
+    if (isRegistryIntent(r.intent)) await this.chain.verifyRegistry(s.envelope, r.intent, state);
     if (r.intent.kind === "swap") await this.chain.verifySwap(s.envelope, r.intent, limits, state);
     await this.chain.simulate(validated);
     await this.canSubmit(s, r);
-    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", "Swap deadline is too close; reconcile or review a same-nonce replacement");
+    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", "Operation deadline is too close; reconcile or review a same-nonce replacement");
   }
   private async reconcile(journal: Journal): Promise<void> {
     for (const r of journal.data.records.filter(r => ownsNonce(r.status))) {
@@ -82,6 +85,7 @@ export class WalletService {
         const gas = r.intent.gasToken === "native" ? receipt.actualGasCost : BigInt(r.reservation[r.intent.gasToken] ?? "0") - input;
         if (gas < 0n) throw new WalletError("wallet_recovery_required", "Invalid persisted gas reservation");
         addSpend(spend, r.intent.gasToken, gas);
+        if (receipt.registryError) r.lastError = receipt.registryError;
         r.consumed = spend; r.consumedAt = Date.now(); r.transactionHash = receipt.transactionHash;
         await journal.transition(r, receipt.success ? "confirmed" : "reverted");
       } catch (error) {
@@ -93,7 +97,7 @@ export class WalletService {
   private async submit(s: WalletSession, journal: Journal, r: OperationRecord): Promise<void> {
     await this.canSubmit(s, r);
     if (!r.operation || !r.userOpHash) throw new WalletError("wallet_recovery_required", "Signed operation is missing");
-    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", "Signed swap deadline expired; review a same-nonce replacement with wallet operation resolve --replace");
+    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", "Signed operation deadline expired; review a same-nonce replacement with wallet operation resolve --replace");
     await this.revalidate(s, journal, r);
     // Reconcile happened under the same cross-process lock before this retry.
     r.attempts++;
@@ -108,7 +112,7 @@ export class WalletService {
     }
     await journal.transition(r, "submitted");
   }
-  async send(kind: "transfer" | "swap", args: Record<string, unknown>, prepareOnly = false) {
+  async send(kind: Intent["kind"], args: Record<string, unknown>, prepareOnly = false) {
     const requestId = z.string().uuid().parse(args.request_id).toLowerCase();
     let response = await this.store.session(async s => {
       const limits = await this.enabled(s);
@@ -137,16 +141,18 @@ export class WalletService {
         const used = journal.used();
         // First policy evaluation precedes building; violations may build an unsigned review candidate.
         const initialSpend: Spend = {}; addSpend(initialSpend, intent.token, BigInt(intent.amount));
-        const initial = policyViolations(limits, { token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: initialSpend, used, balances, gasCost: 0n, fee: 0n, gasUnits: 0n, gasToken: intent.gasToken, gasCharge: 0n, calls: [] });
+        const initial = policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: initialSpend, used, balances, gasCost: 0n, fee: 0n, gasUnits: 0n, gasToken: intent.gasToken, gasCharge: 0n, calls: [] });
+        if (isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent, state);
         if (kind === "swap") await this.chain.verifySwap(s.envelope, intent, limits, state);
         if (r.approval && !this.approved(s, r)) delete r.approval;
         if (!r.approval) {
+          if (kind === "link_agent") r.deadline = Number(intent.registryApproval!.parent_deadline);
           if (kind === "swap") r.deadline = Math.min(Math.floor(Date.now() / 1000), state.timestamp) + SWAP_DEADLINE_SECONDS;
           const built = await this.chain.build(s.envelope, intent, state, r.deadline);
           r.operation = userOpToJson(built.op); r.userOpHash = built.userOpHash; r.nonce = built.op.nonce.toString();
         }
         const validated = validateOperation(this.ctx.config, s.envelope, intent, r.operation!, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash!, deadline: r.deadline });
-        const violations = [...new Set([...initial, ...policyViolations(limits, { token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls })])];
+        const violations = [...new Set([...initial, ...policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls })])];
         for (const [token, amount] of Object.entries(validated.spend)) if (BigInt(balances[token] ?? "0") < BigInt(amount)) throw new WalletError("policy_denied", "Insufficient input balance plus maximum gas payment");
         r.reservation = validated.spend;
         await this.chain.simulate(validated);
@@ -161,9 +167,10 @@ export class WalletService {
         const fresh = await this.chain.state(s.envelope);
         if (fresh.nonce !== state.nonce || fresh.deployed !== state.deployed) throw new WalletError("validation_failed", "Account state changed during build; use a new request ID after review");
         if (fresh.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Gas fee no longer covers the current base fee");
+        if (isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent, fresh);
         if (kind === "swap") await this.chain.verifySwap(s.envelope, intent, limits, fresh);
         const freshBalances = await this.chain.balances(s.envelope, this.balanceTokens(limits));
-        const finalViolations = policyViolations(limits, { token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used: journal.used(), balances: freshBalances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
+        const finalViolations = policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used: journal.used(), balances: freshBalances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
         if (finalViolations.includes("exposure_limit") || (finalViolations.length && (!r.approval || r.approval.liveTest))) {
           r.reasons = finalViolations; delete r.approval; await journal.transition(r, "approval_required"); return result(r);
         }
@@ -173,7 +180,7 @@ export class WalletService {
         }
         await this.canSubmit(s, r);
         if (r.approval && r.approval.expiresAt <= Date.now()) throw new WalletError("approval_required", "Exact-operation approval expired before signing");
-        if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("validation_failed", "Swap deadline is too close");
+        if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("validation_failed", "Operation deadline is too close");
         const privateKey = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
         try {
           // viem requires a hex string; V8 cannot guarantee zeroization of that temporary.
@@ -198,6 +205,23 @@ export class WalletService {
       }
     }
     return response;
+  }
+  private registryPolicy(intent: Intent) {
+    return isRegistryIntent(intent) ? { registryKind: intent.kind as "link_agent" | "unlink_agent", registryParent: intent.registryParent } : {};
+  }
+  async registryStatus(parent?: string) {
+    return this.store.session(s => this.chain.registryStatus(s.envelope, parent ? getAddress(parent) : undefined));
+  }
+  async prepareAgentLink() {
+    return this.store.session(async s => {
+      const cap = registryCapability(this.ctx.config);
+      const status = await this.chain.registryStatus(s.envelope);
+      const url = new URL(cap.portalUrl);
+      url.searchParams.set("agent", s.envelope.account);
+      url.searchParams.set("chain_id", String(this.ctx.config.identity.chainId));
+      url.searchParams.set("registry", cap.proxy.address);
+      return { ...status, portal_url: url.href, next_action: "Open Portal, review and sign the connection, then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest." };
+    });
   }
   private balanceTokens(limits: Limits): string[] {
     return ["native", ...Object.keys(limits.tokens), ...Object.values(this.ctx.config.manifest.canonicalTokens).map(p => p.address), this.ctx.config.manifest.contracts.wcent.address];
@@ -259,12 +283,13 @@ export class WalletService {
       const state = await this.chain.state(s.envelope);
       const unsigned = { ...r.operation, signature: "0x" };
       const validated = validateOperation(this.ctx.config, s.envelope, r.intent, unsigned, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash, deadline: r.deadline });
+      if (isRegistryIntent(r.intent)) await this.chain.verifyRegistry(s.envelope, r.intent, state);
       if (r.intent.kind === "swap") await this.chain.verifySwap(s.envelope, r.intent, limits, state);
       if (liveTest) {
         const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
         // An exact retry already owns this reservation; do not count it twice.
         if (ownsNonce(r.status)) for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
-        const violations = policyViolations(limits, { token: r.intent.token, amount: r.intent.amount, to: r.intent.to, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
+        const violations = policyViolations(limits, { ...this.registryPolicy(r.intent), token: r.intent.token, amount: r.intent.amount, to: r.intent.to, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
         if (violations.length || Object.entries(validated.spend).some(([token, amount]) => BigInt(balances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "A funded test must satisfy every policy and balance limit; it cannot approve exceptions");
         if (state.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Reviewed gas fee no longer covers the current base fee");
       }
@@ -346,5 +371,8 @@ export class WalletService {
 function result(r: OperationRecord) {
   const nativeGas = r.intent.gasToken === "native" && (r.status === "confirmed" || r.status === "reverted") && r.consumed?.native !== undefined
     ? (BigInt(r.consumed.native) - (r.status === "confirmed" && r.intent.token === "native" ? BigInt(r.intent.amount) : 0n)).toString() : undefined;
-  return { request_id: r.requestId, intent: r.intent, status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
+  const { registryApproval, ...publicIntent } = r.intent;
+  const intent = registryApproval ? { ...publicIntent, registryApproval: { ...registryApproval, parent_signature: "[redacted]" } } : publicIntent;
+  const registryError = r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_") ? r.lastError : undefined;
+  return { request_id: r.requestId, intent, registry_error: registryError, ...(registryError ? { next_action: "Refresh registry status. Invalid or expired parent consent requires a fresh approval in Portal and a new request UUID." } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }

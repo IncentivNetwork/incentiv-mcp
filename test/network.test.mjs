@@ -3,10 +3,11 @@ import test from "node:test";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
-import { encodeAbiParameters, keccak256, toHex, decodeFunctionData, parseAbi } from "viem";
+import { encodeAbiParameters, keccak256, toHex, decodeFunctionData, parseAbi, encodeFunctionResult } from "viem";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { agentRegistryAbi } from "../src/agent-registry.ts";
 import { MAINNET, canonicalJson, configurationId, loadConfig, parseConfig, localContractPins, remoteContractPins } from "../src/config.ts";
 import { assertWalletNetwork, deriveSmartAccount, networkStatusFields, verifyNetwork, walletDirectory } from "../src/network.ts";
 import { Ctx } from "../src/context.ts";
@@ -42,7 +43,9 @@ function mockedRpc(cfg, calls = []) {
     if (method === "eth_getBlockByNumber") return { hash: cfg.identity.genesisHash };
     if (method === "eth_blockNumber") return "0x123";
     if (method === "eth_getCode") return "0x60006000";
+    if (method === "eth_getStorageAt") return encoded(cfg.manifest.agentRegistry.implementation.address);
     if (method === "eth_call") {
+      if (params[0].to === cfg.manifest.agentRegistry?.proxy.address) return encodeFunctionResult({ abi: agentRegistryAbi, functionName: "eip712Domain", result: ["0x0f", "Incentiv Agent Registry", "1", BigInt(cfg.identity.chainId), cfg.manifest.agentRegistry.proxy.address, `0x${"00".repeat(32)}`, []] });
       if (params[0].to === cfg.identity.accountBeacon.address) return encoded(cfg.identity.accountImplementation.address);
       if (params[0].data.length === 10) return encoded(cfg.identity.accountBeacon.address);
       return encoded(deriveSmartAccount(cfg, "0x0000000000000000000000000000000000000001"));
@@ -265,7 +268,7 @@ for (const scenario of ["chain", "genesis", "code", "empty code", "beacon", "imp
 test("disabled bridge removes all four tools, remote access and matching docs in both modes", async () => {
   const cfg = structuredClone(MAINNET); cfg.manifest.bridge.enabled = false; identify(cfg);
   for (const bundle of [makeServer(new Ctx(cfg), () => []), await createLocalStdioMcpServer(new Ctx(cfg))]) {
-    assert.ok([20, 25].includes(bundle.catalog.length));
+    assert.ok([20, 29].includes(bundle.catalog.length));
     assert.ok(bundle.catalog.every((tool) => !tool.name.includes("bridge")));
     const markdown = renderMarkdown(cfg, bundle.catalog);
     const html = renderHtml(cfg, bundle.catalog);

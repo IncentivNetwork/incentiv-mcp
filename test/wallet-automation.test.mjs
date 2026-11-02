@@ -146,7 +146,7 @@ test("receipt settlement requires canonical confirmed inclusion", async t => {
     const request = JSON.parse(options.body);
     return Response.json({ jsonrpc: "2.0", id: request.id, result: { receipt: { transactionHash: tx } } });
   });
-  const record = { userOpHash: hash, nonce: "0", operation: { sender: recipient } };
+  const record = { intent: { kind: "transfer" }, userOpHash: hash, nonce: "0", operation: { sender: recipient } };
   assert.equal((await chain.receipt(record)).actualGasCost, 200n);
   canonical = `0x${"44".repeat(32)}`;
   await assert.rejects(chain.receipt(record), /canonical/);

@@ -40,6 +40,10 @@ const WALLET_TOOL_NAMES = [
   "send_transfer",
   "send_swap",
   "get_agent_operation",
+  "get_agent_registry_status",
+  "prepare_agent_link",
+  "link_agent",
+  "unlink_agent",
 ];
 
 function context() {
@@ -59,7 +63,7 @@ async function registeredToolNames(bundle) {
   }
 }
 
-test("local stdio registers exactly five local wallet tools without accessing wallet storage", async () => {
+test("local stdio registers the local wallet tools without accessing wallet storage", async () => {
   const bundle = await createLocalStdioMcpServer(context());
 
   assert.deepEqual(bundle.capabilities, { publicTools: true, walletTools: true });

@@ -30,6 +30,7 @@ export const manifestSchema = z.strictObject({
     contractRegistry: pin, transferGate: pin, bulkBalanceReader: pin, unifiedTokenPaymaster: pin,
     wcent: pin, swapRouter: pin, quoter: pin,
   }),
+  agentRegistry: z.strictObject({ proxy: pin, implementation: pin, portalUrl: url }).optional(),
   canonicalTokens: z.record(symbol, pin),
   bridge: z.strictObject({
     enabled: z.boolean(), incentivDomain: z.number().int().nonnegative().max(0xffffffff), mailbox: pin.optional(),
@@ -126,6 +127,7 @@ export function localContractPins(cfg: Config): ContractPin[] {
   const { identity: i, manifest: m } = cfg;
   return [i.entryPoint, i.accountFactory, i.accountBeacon, i.accountImplementation,
     ...Object.values(m.contracts), ...Object.values(m.canonicalTokens),
+    ...(m.agentRegistry ? [m.agentRegistry.proxy, m.agentRegistry.implementation] : []),
     ...(m.bridge.enabled ? [m.bridge.mailbox!, ...m.bridge.routes.flatMap((r) => [r.localRouter, ...(r.incentivToken ? [r.incentivToken] : [])])] : [])];
 }
 

@@ -10,6 +10,7 @@ export const limitsSchema = z.strictObject({
   tokens: z.record(tokenId, limits),
   recipients: z.discriminatedUnion("mode", [z.strictObject({ mode: z.literal("any") }), z.strictObject({ mode: z.literal("allowlist"), addresses: z.array(address) })]),
   targets: z.record(address, z.array(z.string().regex(/^0x(?:[0-9a-f]{8})?$/))),
+  agentRegistry: z.strictObject({ parents: z.array(address).max(100), allowUnlink: z.boolean() }).optional(),
   swaps: z.boolean(), maxSlippageBps: z.number().int().min(0).max(1000),
   maxQuoteDeviationBps: z.number().int().min(0).max(1000),
   // The administrator attests that these exact endpoint origins have independent operators.
@@ -65,9 +66,12 @@ export function addSpend(spend: Spend, token: string, amount: bigint): void {
 export function policyViolations(limits: Limits, input: {
   token: string; tokenOut?: string; amount: string; to?: string; swap: boolean; slippage: number;
   spend: Spend; used: Spend; balances: Spend; gasCost: bigint; fee: bigint; gasUnits: bigint;
+  registryKind?: "link_agent" | "unlink_agent"; registryParent?: string;
   gasToken: string; gasCharge: bigint; calls: { to: string; data: string }[];
 }, now = Date.now()): string[] {
   const reasons: string[] = [];
+  if (input.registryKind === "link_agent" && !limits.agentRegistry?.parents.some(a => a.toLowerCase() === input.registryParent?.toLowerCase())) reasons.push("registry_parent_not_allowed");
+  if (input.registryKind === "unlink_agent" && !limits.agentRegistry?.allowUnlink) reasons.push("registry_unlink_not_allowed");
   const token = tokenLimits(limits, input.token);
   if (!token || BigInt(input.amount) > BigInt(token.perTransaction)) reasons.push("per_transaction_limit");
   if (input.to && limits.recipients.mode === "allowlist" && !limits.recipients.addresses.some(a => a.toLowerCase() === input.to!.toLowerCase())) reasons.push("recipient_not_allowed");

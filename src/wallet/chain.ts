@@ -1,3 +1,4 @@
+import { hasRegistryEvent, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryIntent } from "../agent-registry.js";
 import { createPublicClient, decodeEventLog, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
@@ -14,7 +15,7 @@ const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() ==
 export const SWAP_DEADLINE_SECONDS = 60;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
 export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
-export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex }
+export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string }
 
 export class WalletChain {
   readonly clients: PublicClient[];
@@ -49,7 +50,15 @@ export class WalletChain {
     if (!same(decimals)) throw new WalletError("validation_failed", "Token decimals disagree");
     return { address: entry[1].address.toLowerCase() as Address, symbol: entry[0], name: entry[0], decimals: Number(decimals[0]) };
   }
-  async normalize(kind: "transfer" | "swap", args: Record<string, unknown>): Promise<Intent> {
+  async normalize(kind: Intent["kind"], args: Record<string, unknown>): Promise<Intent> {
+    if (kind === "link_agent" || kind === "unlink_agent") {
+      registryCapability(this.ctx.config);
+      const gas = await this.token(String(args.gas_token ?? "native"));
+      const approval = kind === "link_agent" ? registryApprovalSchema.parse(args.approval) : undefined;
+      const parent = getAddress(String(approval?.parent ?? args.parent)).toLowerCase();
+      return { intentSchemaVersion: 1, kind, token: gas.address, amount: "0", gasToken: gas.address, slippageBps: 0, feeTier: 3000,
+        registryParent: parent, ...(approval ? { registryApproval: { ...approval, registry: approval.registry.toLowerCase(), parent, agent: approval.agent.toLowerCase(), parent_signature: approval.parent_signature.toLowerCase() } } : {}) };
+    }
     const token = await this.token(String(kind === "transfer" ? args.token : args.token_in));
     const gas = await this.token(String(args.gas_token ?? "native"));
     const amount = exactAmount(String(kind === "transfer" ? args.amount : args.amount_in), token.decimals);
@@ -132,9 +141,18 @@ export class WalletChain {
       }
     }));
   }
+  async verifyRegistry(wallet: WalletEnvelope, intent: Intent, state: ChainState) {
+    await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, state)));
+  }
+  async registryStatus(wallet: WalletEnvelope, parent?: Address) {
+    const state = await this.state(wallet);
+    const results = await Promise.all(this.clients.map(client => registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block)));
+    if (!same(results.map(r => JSON.stringify(r)))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+    return { ...results[0], deployed: state.deployed };
+  }
   async build(wallet: WalletEnvelope, intent: Intent, state: ChainState, deadline?: number) {
     const input = await this.token(intent.token), gasToken = await this.token(intent.gasToken);
-    const calls = intent.kind === "transfer" ? (input.address === "native" ? [{ to: intent.to as Address, value: BigInt(intent.amount), data: "0x" as Hex }] : [{ to: input.address, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [intent.to as Address, BigInt(intent.amount)] }) }]) : buildSwapCalls(this.ctx, input, await this.token(intent.tokenOut!), planRoute(this.ctx, input, await this.token(intent.tokenOut!), intent.feeTier), BigInt(intent.amount), BigInt(intent.minimumOut!), wallet.account as Address, true, BigInt(deadline!));
+    const calls = isRegistryIntent(intent) ? [registryCall(this.ctx.config, wallet.account as Address, intent)] : intent.kind === "transfer" ? (input.address === "native" ? [{ to: intent.to as Address, value: BigInt(intent.amount), data: "0x" as Hex }] : [{ to: input.address, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [intent.to as Address, BigInt(intent.amount)] }) }]) : buildSwapCalls(this.ctx, input, await this.token(intent.tokenOut!), planRoute(this.ctx, input, await this.token(intent.tokenOut!), intent.feeTier), BigInt(intent.amount), BigInt(intent.minimumOut!), wallet.account as Address, true, BigInt(deadline!));
     return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, calls, gasToken, state });
   }
   async simulate(validated: ReturnType<typeof validateOperation>): Promise<void> {
@@ -180,7 +198,36 @@ export class WalletChain {
       } catch { return []; }
     }));
     if (matches.some(m => m.length !== 1) || !same(matches.map(m => `${m[0].success}:${m[0].actualGasCost}`))) throw new Error("Receipt event mismatch");
-    return matches[0][0];
+    let registryError: string | undefined;
+    if (isRegistryIntent(record.intent) && record.userOpHash !== record.replacement?.userOpHash) {
+      const errors: (string | undefined)[] = [];
+      for (const receipt of receipts) {
+        const index = receipt.logs.findIndex(log => {
+          try { return log.address.toLowerCase() === this.ctx.config.identity.entryPoint.address.toLowerCase() && decodeEventLog({ abi: [operationEvent], ...log }).args.userOpHash === record.userOpHash; } catch { return false; }
+        });
+        let start = index - 1;
+        while (start >= 0) {
+          const log = receipt.logs[start];
+          try { if (log.address.toLowerCase() === this.ctx.config.identity.entryPoint.address.toLowerCase()) { decodeEventLog({ abi: [operationEvent], ...log }); break; } } catch { /* another event */ }
+          start--;
+        }
+        const logs = receipt.logs.slice(start + 1, index);
+        if (index < 0 || (matches[0][0].success && !hasRegistryEvent(this.ctx.config, record.intent, record.operation.sender, logs))) throw new Error("Registry event missing from operation receipt");
+        const revertEvent = parseAbiItem("event UserOperationRevertReason(bytes32 indexed userOpHash,address indexed sender,uint256 nonce,bytes revertReason)");
+        let code: string | undefined;
+        for (const log of logs) {
+          if (log.address.toLowerCase() !== this.ctx.config.identity.entryPoint.address.toLowerCase()) continue;
+          try {
+            const { args } = decodeEventLog({ abi: [revertEvent], ...log });
+            if (args.userOpHash === record.userOpHash && args.sender.toLowerCase() === record.operation.sender.toLowerCase() && args.nonce === BigInt(record.nonce!)) code = registryRevertCode(args.revertReason);
+          } catch { /* unrelated log */ }
+        }
+        errors.push(code);
+      }
+      if (!same(errors)) throw new Error("Registry revert reason disagrees across RPCs");
+      registryError = errors[0];
+    }
+    return { ...matches[0][0], ...(registryError ? { registryError } : {}) };
   }
 }
 export function exactAmount(text: string, decimals: number): bigint {

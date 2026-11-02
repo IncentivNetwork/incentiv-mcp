@@ -1,3 +1,4 @@
+import { registryApprovalSchema } from "../agent-registry.js";
 import { createHmac, hkdfSync, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
@@ -11,10 +12,16 @@ import type { WalletSession } from "./store.js";
 
 const hash = z.string().regex(/^0x[0-9a-f]{64}$/);
 export const intentSchema = z.strictObject({
-  intentSchemaVersion: z.literal(1), kind: z.enum(["transfer", "swap"]),
+  intentSchemaVersion: z.literal(1), kind: z.enum(["transfer", "swap", "link_agent", "unlink_agent"]),
   token: tokenId, amount: uint, gasToken: tokenId, to: address.optional(),
   tokenOut: tokenId.optional(), minimumOut: uint.optional(), slippageBps: z.number().int().min(0).max(1000),
   feeTier: z.number().int().min(1).max(1_000_000),
+  registryParent: address.optional(), registryApproval: registryApprovalSchema.optional(),
+}).superRefine((intent, ctx) => {
+  const registry = intent.kind === "link_agent" || intent.kind === "unlink_agent";
+  if (registry ? (!intent.registryParent || intent.amount !== "0" || intent.token !== intent.gasToken || intent.to !== undefined || intent.tokenOut !== undefined || intent.minimumOut !== undefined || (intent.kind === "link_agent" ? !intent.registryApproval : !!intent.registryApproval)) : (intent.registryParent !== undefined || intent.registryApproval !== undefined)) {
+    ctx.addIssue({ code: "custom", message: "Invalid registry intent" });
+  }
 });
 export type Intent = z.infer<typeof intentSchema>;
 export const statuses = ["preparing", "approval_required", "signed", "submitting", "submitted", "submission_unknown", "superseding", "superseded", "confirmed", "reverted", "failed", "cancelled", "expired"] as const;

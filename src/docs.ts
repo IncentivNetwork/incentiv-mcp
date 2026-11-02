@@ -16,7 +16,7 @@ const GROUPS: { title: string; blurb: string; match: (t: ToolDoc) => boolean }[]
   {
     title: "Local wallet",
     blurb: "Configure policy once; permitted transfers and swaps then execute automatically within those limits.",
-    match: (t) => ["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation"].includes(t.name),
+    match: (t) => ["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation", "get_agent_registry_status", "prepare_agent_link", "link_agent", "unlink_agent"].includes(t.name),
   },
   {
     title: "Accounts & balances",
@@ -92,6 +92,10 @@ export function renderMarkdown(cfg: Config, tools: ToolDoc[]): string {
     ``,
     `Restart your app and ask: "Show the Incentiv network status, then show my Incentiv wallet balance."`,
     ``,
+    `## Agent connections`,
+    ``,
+    `Call \`prepare_agent_link\`, open the first-party Portal URL, and approve the displayed smart-account addresses. Pass Portal's approval JSON to \`link_agent\` with a new request UUID. Parent approvals expire after minutes and become invalid if the parent links or unlinks another agent. Gas and local wallet policy still apply. Use \`get_agent_registry_status\` for current state and \`unlink_agent\` with the expected parent to disconnect.`,
+    ``,
     `## How writing works`,
     ``,
     `Configure policy once in your own terminal. Permitted transfers and swaps then execute automatically within those limits. New and restored wallets start disabled. \`wallet disable\` stops new signing and rebroadcast.`,
@@ -140,7 +144,7 @@ export function renderHtml(cfg: Config, tools: ToolDoc[]): string {
   const bridgeTokens = [...new Set(ROUTES.map((r) => r.token))];
   const chainNames = Object.values(REMOTE_CHAINS).map((c) => c.name);
 
-  const walletNames = new Set(["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation"]);
+  const walletNames = new Set(["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation", "get_agent_registry_status", "prepare_agent_link", "link_agent", "unlink_agent"]);
   const chainTools = tools.filter(tool => !walletNames.has(tool.name));
   const toolHtml = grouped(chainTools)
     .map(
@@ -293,7 +297,7 @@ ${cfg.manifest.bridge.enabled ? `<section>
   <h2>${chainTools.length} chain tools.</h2>
   <p class="intro">Expand a tool to see its description and arguments. Optional arguments are labeled. Token arguments accept a symbol (<code>USDC</code>), a contract address, or <code>${esc(cfg.identity.nativeSymbol)}</code> for the native coin.</p>
   ${toolHtml}
-  <aside class="local-tools"><h3>Five wallet tools.</h3><p>These tools operate on the wallet on this computer and are available only in the local server.</p><p><code>create_agent_wallet</code> · <code>get_agent_wallet</code> · <code>send_transfer</code> · <code>send_swap</code> · <code>get_agent_operation</code></p><a href="#setup">Install and set up →</a></aside>
+  <aside class="local-tools"><h3>Nine wallet tools.</h3><p>These tools operate on the wallet on this computer and are available only in the local server.</p><p><code>create_agent_wallet</code> · <code>get_agent_wallet</code> · <code>send_transfer</code> · <code>send_swap</code> · <code>get_agent_operation</code> · <code>get_agent_registry_status</code> · <code>prepare_agent_link</code> · <code>link_agent</code> · <code>unlink_agent</code></p><a href="#setup">Install and set up →</a></aside>
 </section>
 
 ${cfg.manifest.bridge.enabled ? `<section>

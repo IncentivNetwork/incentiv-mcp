@@ -35,7 +35,7 @@ function interaction(responses, out) {
   };
   return { io, output, secrets, questions };
 }
-const freshAnswers = () => ["CENT", recipient, "n", "0.01", "100", "1000", "20", "20", "n", "y", "y", "ENABLE"];
+const freshAnswers = () => ["CENT", recipient, "n", "0.01", "100", "1000", "20", "20", "n", "n", "y", "y", "ENABLE"];
 
 test("setup amounts are exact, support zero allowances and reject lossy or ambiguous input", () => {
   assert.equal(allowance("0", 6), "0");
@@ -62,7 +62,7 @@ test("generated permissions match real transfer, paymaster, wrap and swap select
 });
 
 test("guided policy requires RPC trust, corrects invalid input and includes gas in user-entered daily budgets", async () => {
-  const replies = ["", "bad-address", recipient, "y", "y", "1", "0.5", "100", "1000", "20", "10.1234567", "10", "11", "100", "1", "20", "n"];
+  const replies = ["", "bad-address", recipient, "y", "y", "1", "0.5", "100", "1000", "20", "10.1234567", "10", "11", "100", "1", "20", "n", "n"];
   const messages = [];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, message => messages.push(message));
   assert.equal(policy.tokens[usdc.address].daily, "11000000");

@@ -1,3 +1,5 @@
+import { agentRegistryAbi, REGISTRY_IMPLEMENTATION_SLOT } from "./agent-registry.js";
+import { decodeFunctionResult } from "viem";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { concatHex, encodeAbiParameters, encodeFunctionData, getContractAddress, keccak256, parseAbi, toHex, type Address, type Hex } from "viem";
@@ -107,6 +109,14 @@ export async function verifyNetwork(cfg: Config, request: RpcRequest = rpcReques
       await verifyPins(url, pins, block as Hex, request);
       if (local) {
         const call = (to: Address, data: Hex) => request(url, "eth_call", [{ to, data }, block]);
+        if (cfg.manifest.agentRegistry) {
+          const registry = cfg.manifest.agentRegistry;
+          const implementation = await request(url, "eth_getStorageAt", [registry.proxy.address, REGISTRY_IMPLEMENTATION_SLOT, block]);
+          if (implementation !== encodeAbiParameters([{ type: "address" }], [registry.implementation.address])) throw new Error("Registry implementation mismatch");
+          const data = await call(registry.proxy.address, encodeFunctionData({ abi: agentRegistryAbi, functionName: "eip712Domain" }));
+          const domain = decodeFunctionResult({ abi: agentRegistryAbi, functionName: "eip712Domain", data: data as Hex });
+          if (domain[0] !== "0x0f" || domain[1] !== "Incentiv Agent Registry" || domain[2] !== "1" || domain[3] !== BigInt(cfg.identity.chainId) || domain[4].toLowerCase() !== registry.proxy.address.toLowerCase()) throw new Error("Registry signing domain mismatch");
+        }
         const { accountFactory, accountBeacon, accountImplementation } = cfg.identity;
         const beacon = await call(accountFactory.address, encodeFunctionData({ abi: factoryAbi, functionName: "accountBeacon" }));
         const implementation = await call(accountBeacon.address, encodeFunctionData({ abi: beaconAbi, functionName: "implementation" }));
@@ -119,7 +129,7 @@ export async function verifyNetwork(cfg: Config, request: RpcRequest = rpcReques
       }
     } catch (error) {
       // Avoid forwarding RPC bodies, URL credentials or generic serialized objects.
-      const reason = error instanceof RpcUnavailable || (error instanceof Error && /^(Chain ID|Genesis hash|Contract code|Factory beacon|Account implementation|Factory derivation|Invalid block)/.test(error.message))
+      const reason = error instanceof RpcUnavailable || (error instanceof Error && /^(Chain ID|Genesis hash|Contract code|Factory beacon|Account implementation|Factory derivation|Registry |Invalid block)/.test(error.message))
         ? error.message : "RPC verification unavailable";
       throw new NetworkError("wallet_network_mismatch", `${label}: ${reason}`);
     }
