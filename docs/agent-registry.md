@@ -46,7 +46,7 @@ Registry consent nonces are separate from EntryPoint nonces. Every link/unlink i
 
 A failed on-chain execution consumes the user-operation nonce and gas but does not consume registry consent. If abandoning the approval, use Portal's **Cancel outstanding approvals**, which sends `invalidateNonce()` from the parent and invalidates all its pending approvals. Clearing JSON or cancelling a local request does not revoke on-chain consent.
 
-An uncertain submission retains signed bytes, nonce ownership and gas reservations. Do not change its approval under the same UUID. Resolve/reconcile the original signed request before submitting a fresh one. An expired signed link can still be mined as a reverting operation, so its reservations cannot simply be discarded. Use the existing same-nonce resolution/replacement workflow when needed.
+An uncertain submission retains signed bytes, nonce ownership and gas reservations. Do not change its approval under the same UUID. Resolve/reconcile the original signed request before submitting a fresh one. An expired signed link can still be mined as a reverting operation, so its reservations cannot simply be discarded. Use the existing same-nonce resolution/replacement workflow when needed. A replacement uses the original gas token, so a token-funded wallet does not need CENT to cancel a stale link. Both gas reservations stay held until the winning receipt; settlement releases the losing operation’s reservation.
 
 Call `unlink_agent` with the expected parent to disconnect locally. Portal lists agents with individual **Disconnect** actions, and shows an account linked as an agent with its own disconnect action. Unlink needs no consent signature from the other side.
 

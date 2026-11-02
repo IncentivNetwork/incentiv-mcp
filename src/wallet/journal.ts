@@ -42,7 +42,9 @@ const recordSchema = z.strictObject({
     liveTest: z.strictObject({ requestId: z.string().uuid(), policyDigest: hash }).optional(),
   }).optional(),
   transactionHash: hash.optional(),
-  replacement: z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, signed: z.boolean(), expiresAt: z.number().int() }).optional(),
+  replacement: z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int() }).superRefine((replacement, ctx) => {
+    if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
+  }).optional(),
 });
 export type OperationRecord = z.infer<typeof recordSchema>;
 export const journalSchema = z.strictObject({

@@ -172,7 +172,7 @@ export class WalletChain {
     if (state.nonce !== old.nonce) throw new WalletError("operation_pending", "The original nonce has moved; locate its receipt before resolution");
     const bump = (n: bigint) => n * 120n / 100n + 1n;
     const fees = { ...state.fees, maxFeePerGas: state.fees.maxFeePerGas > bump(old.maxFeePerGas) ? state.fees.maxFeePerGas : bump(old.maxFeePerGas), maxPriorityFeePerGas: state.fees.maxPriorityFeePerGas > bump(old.maxPriorityFeePerGas) ? state.fees.maxPriorityFeePerGas : bump(old.maxPriorityFeePerGas) };
-    return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, state: { ...state, fees }, calls: [{ to: wallet.account as Address, value: 0n, data: "0x" }] });
+    return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, state: { ...state, fees }, calls: [{ to: wallet.account as Address, value: 0n, data: "0x" }], gasToken: await this.token(original.intent.gasToken) });
   }
   async relay(operation: Record<string, string>, beforeSubmit?: () => Promise<void>): Promise<string> {
     await beforeSubmit?.();

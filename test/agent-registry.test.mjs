@@ -216,3 +216,86 @@ test("expired signed links keep nonce ownership and reservations until resolved"
   assert.equal(f.submissions.length, 1);
   await f.store.session(async s => { const r = (await Journal.open(s)).data.records[0]; assert.ok(ownsNonce(r.status)); assert.deepEqual(r.reservation, { native: "300" }); });
 });
+
+async function tokenRegistryFixture(t) {
+  const f = await registryFixture(t), token = MAINNET.manifest.canonicalTokens.USDC.address.toLowerCase();
+  await f.store.session(async s => {
+    const policy = s.envelope.policy;
+    await s.savePolicy({ ...policy, limits: { ...policy.limits, tokens: { ...policy.limits.tokens, [token]: { perTransaction: "10000", daily: "1000000", exposure: "10000000", gasPayment: "10000" } }, targets: { ...policy.limits.targets, [token]: ["0xa9059cbb"] } } });
+  });
+  f.chain.token = async ref => ({ address: ref === "USDC" || ref === token ? token : "native", decimals: 6, symbol: ref === "USDC" || ref === token ? "USDC" : "CENT", name: "test" });
+  f.chain.balances = async (_wallet, tokens) => Object.fromEntries(tokens.map(id => [id.toLowerCase(), id.toLowerCase() === token ? "1000000" : "0"]));
+  const erc20 = (await import('../src/abi.ts')).erc20Abi;
+  const build = (wallet, i, state, replacing = false) => {
+    const built = unsigned(wallet, { to: wallet.account, amount: "0" }, state);
+    const payment = replacing ? 150n : 123n;
+    Object.assign(built.op, { paymaster: MAINNET.manifest.contracts.unifiedTokenPaymaster.address, paymasterData: "0x", paymasterVerificationGasLimit: 100n, paymasterPostOpGasLimit: 100n });
+    if (replacing) { built.op.maxFeePerGas = 2n; built.op.maxPriorityFeePerGas = 2n; }
+    built.op.callData = encodeExecuteBatch([
+      { to: token, value: 0n, data: encodeFunctionData({ abi: erc20, functionName: "transfer", args: [built.op.paymaster, payment] }) },
+      replacing ? { to: wallet.account, value: 0n, data: "0x" } : registryCall(MAINNET, wallet.account, i),
+    ]);
+    built.userOpHash = computeUserOpHash(built.op, MAINNET.identity.entryPoint.address, 24101);
+    return built;
+  };
+  f.chain.build = (wallet, i, state) => build(wallet, i, state);
+  f.chain.buildReplacement = (wallet, original, state) => build(wallet, original.intent, state, true);
+  return { ...f, token };
+}
+
+test("a stale link can be replaced and retried with USDC and zero native CENT", async t => {
+  const f = await tokenRegistryFixture(t), id = randomUUID();
+  let checks = 0;
+  f.chain.verifyRegistry = async () => { if (++checks >= 3) throw new (await import('../src/wallet/errors.ts')).WalletError("registry_approval_stale", "Parent nonce changed"); };
+  const args = { request_id: id, approval: f.approval, gas_token: "USDC" };
+  await assert.rejects(f.service.send("link_agent", args), { code: "registry_approval_stale" });
+  assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
+  await assert.rejects(f.service.send("link_agent", { ...args, request_id: randomUUID() }), { code: "operation_pending" });
+  const review = await f.service.reviewReplacement(id), record = review.records[0];
+  assert.equal(record.replacement.gasToken, f.token); assert.equal(record.replacement.gasCharge, "150");
+  assert.equal(record.replacement.operation.paymaster, MAINNET.manifest.contracts.unifiedTokenPaymaster.address);
+  assert.equal(record.replacement.operation.nonce, record.operation.nonce);
+  assert.equal((await f.service.replace(id, password, digest(record))).status, "superseding");
+  await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "273" }));
+  f.chain.receipt = async r => r.userOpHash === record.replacement.userOpHash ? { success: true, actualGasCost: 400n, transactionHash: `0x${"44".repeat(32)}` } : undefined;
+  assert.equal((await f.service.operation(id)).status, "superseded");
+  await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "150" }));
+  f.chain.receipt = async () => undefined; f.chain.verifyRegistry = async () => {};
+  const state = f.chain.state;
+  f.chain.state = async (...a) => ({ ...await state(...a), nonce: 1n });
+  assert.equal((await f.service.send("link_agent", { ...args, request_id: randomUUID(), approval: { ...f.approval, parent_nonce: "1" } })).status, "submitted");
+});
+
+test("when the original token-paid link wins, only its gas payment is consumed", async t => {
+  const f = await tokenRegistryFixture(t), id = randomUUID();
+  await f.service.send("link_agent", { request_id: id, approval: f.approval, gas_token: "USDC" });
+  const review = await f.service.reviewReplacement(id), record = review.records[0];
+  await f.service.replace(id, password, digest(record));
+  await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "273" }));
+  f.chain.receipt = async r => r.userOpHash === record.userOpHash ? { success: true, actualGasCost: 400n, transactionHash: `0x${"55".repeat(32)}` } : undefined;
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "123" }));
+});
+
+test("uncertain token-paid replacement retries exact signed bytes and retains both reservations", async t => {
+  const f = await tokenRegistryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval, gas_token: "USDC" };
+  await f.service.send("link_agent", args);
+  const review = await f.service.reviewReplacement(id), relay = f.chain.relay;
+  f.chain.relay = async (...a) => { await relay(...a); throw new Error("lost replacement response"); };
+  await f.service.replace(id, password, digest(review.records[0]));
+  f.chain.relay = relay;
+  await f.service.send("link_agent", args);
+  assert.deepEqual(f.submissions[1], f.submissions[2]);
+  await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "273" }));
+});
+
+test("replacement validation rejects a changed token payment before signing", async t => {
+  const f = await tokenRegistryFixture(t), id = randomUUID();
+  await f.service.send("link_agent", { request_id: id, approval: f.approval, gas_token: "USDC" });
+  await f.service.reviewReplacement(id);
+  await f.store.session(async s => { const journal = await Journal.open(s); journal.data.records[0].replacement.gasCharge = "151"; await journal.save(); });
+  const review = await f.service.review(id);
+  await assert.rejects(f.service.replace(id, password, digest(review.records[0])), { code: "validation_failed" });
+  assert.equal(f.submissions.length, 1);
+  await f.store.session(async s => { const record = (await Journal.open(s)).data.records[0]; assert.equal(record.replacement.signed, false); assert.deepEqual(record.reservation, { [f.token]: "123" }); });
+});

@@ -241,7 +241,7 @@ exceptions, export an encrypted backup or resolve/rebroadcast a stuck operation.
 Exception approval displays and binds the canonical intent, exact unsigned
 operation/hash, gas/payment limits, and swap minimum/deadline for at most five
 minutes. Retrying the same request ID consumes that exact approval. Replacement
-review builds a zero-value self-transfer at the original nonce with native gas;
+review builds a zero-value self-transfer at the original nonce using the original operation’s gas token;
 either original or replacement may win. Both reservations remain until a verified
 receipt resolves the nonce. Disabling prevents either from being rebroadcast.
 

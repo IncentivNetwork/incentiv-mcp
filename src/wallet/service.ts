@@ -71,7 +71,8 @@ export class WalletService {
         if (!receipt && r.replacement?.signed) {
           const replaced = await this.chain.receipt({ ...r, operation: r.replacement.operation, userOpHash: r.replacement.userOpHash });
           if (replaced) {
-            r.consumed = { native: replaced.actualGasCost.toString() }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
+            const gasToken = r.replacement!.gasToken ?? "native";
+            r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: r.replacement!.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
             // A mined replacement consumes the nonce even if its execution reverted.
             await journal.transition(r, "superseded"); continue;
           }
@@ -82,7 +83,10 @@ export class WalletService {
         // Token-paymaster refunds are not inferred from an untrusted relay. Retain the
         // full authorized token payment conservatively, including reverted operations.
         const input = r.intent.token === r.intent.gasToken ? BigInt(r.intent.amount) : 0n;
-        const gas = r.intent.gasToken === "native" ? receipt.actualGasCost : BigInt(r.reservation[r.intent.gasToken] ?? "0") - input;
+        // If the original wins, release the unused replacement's gas reservation.
+        const replacementGas = r.replacement?.signed && (r.replacement.gasToken ?? "native") === r.intent.gasToken
+          ? BigInt(r.replacement.gasCharge ?? r.replacement.maxGasCost) : 0n;
+        const gas = r.intent.gasToken === "native" ? receipt.actualGasCost : BigInt(r.reservation[r.intent.gasToken] ?? "0") - input - replacementGas;
         if (gas < 0n) throw new WalletError("wallet_recovery_required", "Invalid persisted gas reservation");
         addSpend(spend, r.intent.gasToken, gas);
         if (receipt.registryError) r.lastError = receipt.registryError;
@@ -319,15 +323,15 @@ export class WalletService {
       const state = await this.chain.state(s.envelope);
       const built = await this.chain.buildReplacement(s.envelope, r, state);
       const wire = userOpToJson(built.op);
-      const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s), wire, { nonce: BigInt(r.nonce!), deployed: state.deployed, hash: built.userOpHash });
+      const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s, r.intent.gasToken), wire, { nonce: BigInt(r.nonce!), deployed: state.deployed, hash: built.userOpHash });
       await this.chain.simulate(validated);
-      r.replacement = { operation: wire, userOpHash: validated.hash, maxGasCost: validated.gasCost.toString(), signed: false, expiresAt: Date.now() + 300_000 };
+      r.replacement = { operation: wire, userOpHash: validated.hash, maxGasCost: validated.gasCost.toString(), ...(r.intent.gasToken !== "native" ? { gasToken: r.intent.gasToken, gasCharge: validated.gasCharge.toString() } : {}), signed: false, expiresAt: Date.now() + 300_000 };
       r.sequence = ++journal.data.sequence; await journal.save();
       return { wallet: publicWallet(s.envelope), records: [structuredClone(r)] };
     });
   }
-  private replacementIntent(s: WalletSession): Intent {
-    return { intentSchemaVersion: 1, kind: "transfer", token: "native", amount: "0", gasToken: "native", to: s.envelope.account, slippageBps: 0, feeTier: 3000 };
+  private replacementIntent(s: WalletSession, gasToken = "native"): Intent {
+    return { intentSchemaVersion: 1, kind: "transfer", token: "native", amount: "0", gasToken, to: s.envelope.account, slippageBps: 0, feeTier: 3000 };
   }
   async replace(id: string, passphrase: Buffer, reviewedDigest: Hex) {
     return this.store.session(async s => {
@@ -338,11 +342,13 @@ export class WalletService {
       const state = await this.chain.state(s.envelope);
       if (state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "Original nonce has already moved; reconcile before replacing");
       const replacement = r.replacement;
-      const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s), replacement.operation, { nonce: state.nonce, deployed: state.deployed, hash: replacement.userOpHash });
+      const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s, replacement.gasToken ?? "native"), replacement.operation, { nonce: state.nonce, deployed: state.deployed, hash: replacement.userOpHash });
       if (validated.gasCost.toString() !== replacement.maxGasCost) throw new WalletError("validation_failed", "Replacement gas ceiling changed");
+      const gasToken = replacement.gasToken ?? "native";
+      if (gasToken !== "native" && validated.gasCharge.toString() !== replacement.gasCharge) throw new WalletError("validation_failed", "Replacement token gas payment changed");
       await this.chain.simulate(validated);
-      const balances = await this.chain.balances(s.envelope, ["native"]);
-      if (BigInt(balances.native ?? "0") < validated.gasCost) throw new WalletError("policy_denied", "Native balance cannot cover the reviewed replacement gas");
+      const balances = await this.chain.balances(s.envelope, [gasToken]);
+      if (BigInt(balances[gasToken] ?? "0") < validated.gasCharge) throw new WalletError("policy_denied", "Balance cannot cover the reviewed replacement gas payment");
       await this.canSubmit(s);
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");
       const key = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
@@ -350,7 +356,7 @@ export class WalletService {
       finally { key.fill(0); }
       replacement.signed = true;
       // Keep the original reservation as well: either signed operation might win.
-      addSpend(r.reservation, "native", validated.gasCost);
+      addSpend(r.reservation, gasToken, validated.gasCharge);
       await journal.transition(r, "superseding");
       await this.submitReplacement(s, journal, r);
       return result(r);
