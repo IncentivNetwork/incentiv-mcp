@@ -40,7 +40,7 @@ Approval preserves wallet identity, addresses, keys and journal history. It refu
 
 If your wallet is on the older account implementation, run `wallet upgrade-implementation` first, then the commands above. Implementation upgrades cannot also change capabilities. Backups from before the registry restore with `wallet restore --in`, followed by the same steps.
 
-The manifest pins the proxy and implementation bytecode, implementation slot and EIP-712 domain. A registry upgrade requires a reviewed capability update. No retired registry is used.
+The manifest pins the proxy and implementation bytecode, implementation slot and EIP-712 domain. These are checked before every registry operation and at capability approval, not at startup. After a registry upgrade, registry tools return `registry_verification_failed` until a reviewed capability update, while transfers, swaps and reconciliation continue. No retired registry is used.
 
 ## Expiry, cancellation and unlink
 

@@ -1,4 +1,4 @@
-import { hasRegistryEvent, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryIntent } from "../agent-registry.js";
+import { hasRegistryEvent, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
 import { createPublicClient, decodeEventLog, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
@@ -153,7 +153,10 @@ export class WalletChain {
   }
   async registryStatus(wallet: WalletEnvelope, parent?: Address) {
     const state = await this.state(wallet);
-    const results = await Promise.all(this.clients.map(client => registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block)));
+    const results = await Promise.all(this.clients.map(async client => {
+      await verifyRegistryDeployment(client, this.ctx.config, state.block);
+      return registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block);
+    }));
     if (!same(results.map(r => JSON.stringify(r)))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
     return { ...results[0], deployed: state.deployed };
   }

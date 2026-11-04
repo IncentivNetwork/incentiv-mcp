@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { agentRegistryAbi } from "../src/agent-registry.ts";
-import { MAINNET, canonicalJson, configurationId, loadConfig, parseConfig, localContractPins, remoteContractPins } from "../src/config.ts";
+import { MAINNET, canonicalJson, configurationId, loadConfig, parseConfig, localContractPins, registryContractPins, remoteContractPins } from "../src/config.ts";
 import { assertWalletNetwork, deriveSmartAccount, networkStatusFields, verifyNetwork, walletDirectory } from "../src/network.ts";
 import { Ctx } from "../src/context.ts";
 import { makeServer, createLocalStdioMcpServer } from "../src/server.ts";
@@ -26,7 +26,7 @@ function identify(cfg) {
 
 function fixture() {
   const cfg = structuredClone(MAINNET);
-  for (const pin of [...localContractPins(cfg), ...Object.keys(cfg.manifest.bridge.remoteChains).flatMap((chain) => remoteContractPins(cfg, chain))]) {
+  for (const pin of [...localContractPins(cfg), ...registryContractPins(cfg), ...Object.keys(cfg.manifest.bridge.remoteChains).flatMap((chain) => remoteContractPins(cfg, chain))]) {
     pin.codeHash = keccak256("0x60006000");
   }
   cfg.endpoints.rpcUrls = ["https://rpc-a.example.test", "https://rpc-b.example.test"];
@@ -139,6 +139,21 @@ test("verification checks every RPC and every enabled pin at a fixed block", asy
   }
   for (const call of calls.filter((c) => c.method === "eth_getCode" || c.method === "eth_call")) assert.equal(call.params[1], "0x123");
   for (const pin of localContractPins(cfg)) assert.ok(calls.some((c) => c.method === "eth_getCode" && c.params[0] === pin.address));
+});
+
+test("a registry upgrade stops capability approval but not startup or ordinary wallet sessions", async () => {
+  const cfg = fixture(), good = mockedRpc(cfg, []), other = "0x0000000000000000000000000000000000000009";
+  const upgraded = (url, method, params) => method === "eth_getStorageAt" ? encodeAbiParameters([{ type: "address" }], [other]) : good(url, method, params);
+  await verifyNetwork(cfg, upgraded, "local");
+  await verifyNetwork(cfg, upgraded);
+  await assert.rejects(verifyNetwork(cfg, upgraded, "capability"), /Registry implementation or signing domain mismatch/);
+  await verifyNetwork(cfg, good, "capability");
+  const calls = [];
+  await verifyNetwork(cfg, mockedRpc(cfg, calls), "local");
+  assert.ok(!calls.some(c => c.params[0] === cfg.manifest.agentRegistry.proxy.address));
+  const pinned = [];
+  await verifyNetwork(cfg, mockedRpc(cfg, pinned), "capability");
+  for (const pin of registryContractPins(cfg)) assert.ok(pinned.some(c => c.method === "eth_getCode" && c.params[0] === pin.address));
 });
 
 test("local verification retains every Incentiv pin without depending on remote bridge RPCs", async () => {

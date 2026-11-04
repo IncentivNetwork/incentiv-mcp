@@ -133,7 +133,7 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   const recover = args.length === 1 && args[0] === "recover";
   const capabilities = args[0] === "capabilities" && args[1] === "approve" && (args.length === 2 || (args.length === 4 && args[2] === "--previous"));
   const implementation = args.length === 1 && args[0] === "upgrade-implementation";
-  if (!configure && !approve && !resolveOperation && !backup && !restore && !initialize && !recover && !capabilities && !implementation) throw new WalletError("validation_failed", "Commands: wallet doctor | init | policy configure | test-transfer --request <file> | capabilities approve --previous <config.json> | upgrade-implementation | recover | approve <uuid> | disable | operation resolve <uuid> [--replace] | backup --out <file> | restore --in <file> [--upgrade-implementation] | migrate [1]");
+  if (!configure && !approve && !resolveOperation && !backup && !restore && !initialize && !recover && !capabilities && !implementation) throw new WalletError("validation_failed", "Commands: wallet doctor | init | policy configure | test-transfer --request <file> | capabilities approve [--previous <config.json>] | upgrade-implementation | recover | approve <uuid> | disable | operation resolve <uuid> [--replace] | backup --out <file> | restore --in <file> [--upgrade-implementation] | migrate [1]");
   requireTerminal();
   if (initialize) {
     console.error(`Wallet profile: ${profile}; directory: ${walletProfile(profile).root}`);

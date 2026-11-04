@@ -112,7 +112,7 @@ export function parseConfig(input: unknown): Config {
   if (canonicalJson(remoteNames) !== canonicalJson(Object.keys(endpoints.remoteChains).sort())) {
     throw new Error("Remote endpoints must match the declared remote chains");
   }
-  for (const pins of [localContractPins(cfg), ...remoteNames.map((name) => remoteContractPins(cfg, name))]) {
+  for (const pins of [[...localContractPins(cfg), ...registryContractPins(cfg)], ...remoteNames.map((name) => remoteContractPins(cfg, name))]) {
     const seen = new Map<string, Hex>();
     for (const p of pins) {
       const previous = seen.get(p.address.toLowerCase());
@@ -127,8 +127,13 @@ export function localContractPins(cfg: Config): ContractPin[] {
   const { identity: i, manifest: m } = cfg;
   return [i.entryPoint, i.accountFactory, i.accountBeacon, i.accountImplementation,
     ...Object.values(m.contracts), ...Object.values(m.canonicalTokens),
-    ...(m.agentRegistry ? [m.agentRegistry.proxy, m.agentRegistry.implementation] : []),
     ...(m.bridge.enabled ? [m.bridge.mailbox!, ...m.bridge.routes.flatMap((r) => [r.localRouter, ...(r.incentivToken ? [r.incentivToken] : [])])] : [])];
+}
+
+/** Checked before registry operations and capability approval, so a registry upgrade cannot stop unrelated wallet use. */
+export function registryContractPins(cfg: Config): ContractPin[] {
+  const registry = cfg.manifest.agentRegistry;
+  return registry ? [registry.proxy, registry.implementation] : [];
 }
 
 export function remoteContractPins(cfg: Config, chain: string): ContractPin[] {

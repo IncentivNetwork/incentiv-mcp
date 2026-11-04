@@ -46,6 +46,12 @@ export function registryCapability(cfg: Config) {
   if (!capability) throw new WalletError("registry_unavailable", "Agent Registry is not enabled in this network's approved manifest");
   return capability;
 }
+export function registryPinsMatch(cfg: Config, slot: string | undefined, domain: readonly [string, string, string, bigint, string, ...unknown[]]): boolean {
+  const cap = registryCapability(cfg);
+  return !!slot && /^0x[0-9a-fA-F]+$/.test(slot) && BigInt(slot) === BigInt(cap.implementation.address)
+    && domain[0] === "0x0f" && domain[1] === "Incentiv Agent Registry" && domain[2] === "1"
+    && domain[3] === BigInt(cfg.identity.chainId) && sameAddress(domain[4], cap.proxy.address);
+}
 export async function verifyRegistryDeployment(client: PublicClient, cfg: Config, blockNumber: bigint) {
   const cap = registryCapability(cfg);
   const [proxy, implementation, slot, domain] = await Promise.all([
@@ -53,10 +59,7 @@ export async function verifyRegistryDeployment(client: PublicClient, cfg: Config
     client.getStorageAt({ address: cap.proxy.address, slot: REGISTRY_IMPLEMENTATION_SLOT, blockNumber }),
     client.readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "eip712Domain", blockNumber }),
   ]);
-  if (!proxy || !implementation || keccak256(proxy) !== cap.proxy.codeHash || keccak256(implementation) !== cap.implementation.codeHash
-    || !slot || !sameAddress(`0x${slot.slice(-40)}`, cap.implementation.address)
-    || domain[0] !== "0x0f" || domain[1] !== "Incentiv Agent Registry" || domain[2] !== "1"
-    || domain[3] !== BigInt(cfg.identity.chainId) || !sameAddress(domain[4], cap.proxy.address)) {
+  if (!proxy || !implementation || keccak256(proxy) !== cap.proxy.codeHash || keccak256(implementation) !== cap.implementation.codeHash || !registryPinsMatch(cfg, slot, domain)) {
     throw new WalletError("registry_verification_failed", "Registry implementation or signing domain changed");
   }
 }

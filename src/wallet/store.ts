@@ -2,7 +2,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { readdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { canonicalJson, parseConfig, type Config } from "../config.js";
-import { assertWalletNetwork, NetworkError, verifyWalletSession } from "../network.js";
+import { assertWalletNetwork, NetworkError, verifyWalletSession, type NetworkScope } from "../network.js";
 import { walletProfile } from "../wallet-profile.js";
 import { assertImplementationUpgrade } from "../account-upgrade.js";
 import { nativeCredentials, type CredentialStore } from "./credentials.js";
@@ -128,7 +128,7 @@ export class WalletStore {
     }
   }
 
-  private async run<T>(work?: (session: WalletSession) => Promise<T>, restoring?: RestoreSnapshot, previous?: Config, initialPolicy?: Extract<Policy, { configured: true }>, transitionScope: "local" | "all" = "all"): Promise<T | ReturnType<typeof publicWallet>> {
+  private async run<T>(work?: (session: WalletSession) => Promise<T>, restoring?: RestoreSnapshot, previous?: Config, initialPolicy?: Extract<Policy, { configured: true }>, transitionScope: NetworkScope = "capability"): Promise<T | ReturnType<typeof publicWallet>> {
     const { root } = this.deps;
     await prepareRoot(root);
     const lock = await creationLock(root, this.deps.lockTimeoutMs);
