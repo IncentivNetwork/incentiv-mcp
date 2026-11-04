@@ -9,7 +9,7 @@ import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
 import { Journal, digest, intentSchema, ownsNonce, terminal, type Intent, type OperationRecord } from "./journal.js";
 import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, type Limits, type Spend } from "./policy.js";
-import { MIN_SWAP_REMAINING_SECONDS, SWAP_DEADLINE_SECONDS, WalletChain } from "./chain.js";
+import { MIN_SWAP_REMAINING_SECONDS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure } from "./chain.js";
 import { validateOperation } from "./validate.js";
 
 // Source-controlled local candidate signing, explicitly authorized for acceptance testing.
@@ -136,9 +136,16 @@ export class WalletService {
       if (journal.data.records.some(r => ownsNonce(r.status))) throw new WalletError("operation_pending", "An unresolved operation owns the account nonce; reconcile it first");
       // Rejected new registry requests must not consume journal capacity. An existing record is checked below, where a failure closes it.
       const existing = !!r;
+      if (!existing && intent.kind === "link_agent") {
+        // Reusing one Portal approval under new request IDs must not be able to fill the journal.
+        const attempts = journal.data.records.filter(o => o.intentHash === digest(intent));
+        const open = attempts.find(o => !terminal(o.status));
+        if (open) throw new WalletError("operation_pending", `Request ${open.requestId} already holds this Portal approval; retry with that request ID`);
+        if (attempts.length >= MAX_LINK_ATTEMPTS) throw new WalletError("policy_denied", "This Portal approval has been tried too many times; obtain a fresh approval");
+      }
       if (!existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
       if (r?.status === "approval_required") {
-        if (r.lastError === "registry_rpc_unavailable") delete r.lastError;
+        if (TEMPORARY_ERRORS.includes(r.lastError ?? "")) delete r.lastError;
         if (r.approval && r.approval.expiresAt <= Date.now()) { await journal.transition(r, "expired"); return result(r); }
         await journal.transition(r, "preparing");
       }
@@ -197,10 +204,11 @@ export class WalletService {
         await this.canSubmit(s, r);
         await journal.transition(r, "signed"); // fsync completes before any submission.
       } catch (error) {
-        // An RPC outage says nothing about the consent, so the same request ID and any local approval stay usable.
-        if (r.status === "preparing" && error instanceof WalletError && error.code === "registry_rpc_unavailable") { r.lastError = error.code; await journal.transition(r, "approval_required"); }
-        else if (r.status === "preparing") { r.lastError = error instanceof WalletError ? error.code : "validation_failed"; await journal.transition(r, "failed"); }
-        if (error instanceof WalletError) throw error;
+        // An RPC outage says nothing about the request, so its ID and any local approval stay usable.
+        const failure = error instanceof WalletError ? error : isTransportFailure(error) ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : undefined;
+        if (r.status === "preparing" && TEMPORARY_ERRORS.includes(failure?.code ?? "")) { r.lastError = failure!.code; await journal.transition(r, "approval_required"); }
+        else if (r.status === "preparing") { r.lastError = failure?.code ?? "validation_failed"; await journal.transition(r, "failed"); }
+        if (failure) throw failure;
         throw new WalletError("validation_failed", "Local operation preparation failed");
       }
       await this.submit(s, journal, r);
@@ -332,14 +340,21 @@ export class WalletService {
       const state = await this.chain.state(s.envelope);
       // Native gas clears the nonce when the token balance or paymaster cannot.
       const gasToken = nativeGas ? "native" : r.intent.gasToken;
-      const built = await this.chain.buildReplacement(s.envelope, r, state, gasToken);
+      const built = await this.replacementStep(gasToken, () => this.chain.buildReplacement(s.envelope, r, state, gasToken));
       const wire = userOpToJson(built.op);
       const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s, gasToken), wire, { nonce: BigInt(r.nonce!), deployed: state.deployed, hash: built.userOpHash });
-      await this.chain.simulate(validated);
+      await this.replacementStep(gasToken, () => this.chain.simulate(validated));
       r.replacement = { operation: wire, userOpHash: validated.hash, maxGasCost: validated.gasCost.toString(), ...(gasToken !== "native" ? { gasToken, gasCharge: validated.gasCharge.toString() } : {}), signed: false, expiresAt: Date.now() + 300_000 };
       r.sequence = ++journal.data.sequence; await journal.save();
       return { wallet: publicWallet(s.envelope), records: [structuredClone(r)] };
     });
+  }
+  /** A stuck nonce is urgent: say what to do next rather than suggesting storage damage. */
+  private async replacementStep<T>(gasToken: string, step: () => Promise<T> | T): Promise<T> {
+    try { return await step(); } catch (error) {
+      if (error instanceof WalletError) throw new WalletError(error.code, `${error.message.slice(error.code.length + 2)}.${nativeGasHint(gasToken)}`);
+      throw new WalletError("validation_failed", `Could not prepare this replacement; retry.${nativeGasHint(gasToken)}`);
+    }
   }
   private replacementIntent(s: WalletSession, gasToken = "native"): Intent {
     return { intentSchemaVersion: 1, kind: "transfer", token: "native", amount: "0", gasToken, to: s.envelope.account, slippageBps: 0, feeTier: 3000 };
@@ -357,9 +372,9 @@ export class WalletService {
       if (validated.gasCost.toString() !== replacement.maxGasCost) throw new WalletError("validation_failed", "Replacement gas ceiling changed");
       const gasToken = replacement.gasToken ?? "native";
       if (gasToken !== "native" && validated.gasCharge.toString() !== replacement.gasCharge) throw new WalletError("validation_failed", "Replacement token gas payment changed");
-      await this.chain.simulate(validated);
+      await this.replacementStep(gasToken, () => this.chain.simulate(validated));
       const balances = await this.chain.balances(s.envelope, [gasToken]);
-      if (BigInt(balances[gasToken] ?? "0") < validated.gasCharge) throw new WalletError("policy_denied", "Balance cannot cover the reviewed replacement gas payment");
+      if (BigInt(balances[gasToken] ?? "0") < validated.gasCharge) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment.${nativeGasHint(gasToken)}`);
       await this.canSubmit(s);
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");
       const key = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
@@ -385,6 +400,10 @@ export class WalletService {
     r.sequence = ++journal.data.sequence; await journal.save();
   }
 }
+const MAX_LINK_ATTEMPTS = 8;
+const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable"];
+const nativeGasHint = (gasToken: string) => gasToken === "native" ? "" : " To pay gas in CENT instead, review again with --native-gas.";
+
 /** Every policy exception records its reasons. Without any, a retry re-evaluates the request, so there is nothing to approve. */
 export function assertNeedsApproval(r: OperationRecord) {
   if (r.status === "approval_required" && !r.reasons?.length) throw new WalletError("validation_failed", "This request does not need terminal approval; retry it with the same request ID");
@@ -395,7 +414,8 @@ function result(r: OperationRecord) {
     ? (BigInt(r.consumed.native) - (r.status === "confirmed" && r.intent.token === "native" ? BigInt(r.intent.amount) : 0n)).toString() : undefined;
   const { registryApproval, ...publicIntent } = r.intent;
   const intent = registryApproval ? { ...publicIntent, registryApproval: { ...registryApproval, parent_signature: "[redacted]" } } : publicIntent;
-  const registryError = r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_") ? r.lastError : undefined;
-  const interrupted = r.status === "approval_required" && r.lastError === "registry_rpc_unavailable";
-  return { request_id: r.requestId, intent, registry_error: registryError, ...(registryError ? { next_action: "Refresh registry status. Invalid or expired parent consent requires a fresh approval in Portal and a new request UUID." } : interrupted ? { next_action: `A temporary RPC failure interrupted this request. Retry with the same request ID${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
+  const eventMissing = r.status === "confirmed" && r.lastError === "registry_event_missing";
+  const registryError = eventMissing || (r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_")) ? r.lastError : undefined;
+  const interrupted = r.status === "approval_required" && TEMPORARY_ERRORS.includes(r.lastError ?? "");
+  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: "Refresh registry status. Invalid or expired parent consent requires a fresh approval in Portal and a new request UUID." } : interrupted ? { next_action: `A temporary RPC failure interrupted this request. Retry with the same request ID${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }

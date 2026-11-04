@@ -1,4 +1,4 @@
-import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
+import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, InternalRpcError, decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Intent } from "./wallet/journal.js";
@@ -40,6 +40,14 @@ export function registryRevertCode(data: Hex): string | undefined {
   } catch { return undefined; }
 }
 export const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+/** The contract itself refused the call. viem also reports a node's -32603 internal error as a revert, which says nothing about the contract. */
+export function isContractRejection(error: unknown): boolean {
+  if (!(error instanceof BaseError)) return false;
+  if (error.walk(cause => cause instanceof ContractFunctionZeroDataError)) return true;
+  const reverted = error.walk(cause => cause instanceof ContractFunctionRevertedError) as ContractFunctionRevertedError | null;
+  if (!reverted) return false;
+  return !error.walk(cause => cause instanceof InternalRpcError) || !!reverted.data || !!reverted.signature || /revert/i.test(reverted.reason ?? "");
+}
 export const isRegistryIntent = (intent: Intent) => intent.kind === "link_agent" || intent.kind === "unlink_agent";
 export function registryCapability(cfg: Config) {
   const capability = cfg.manifest.agentRegistry;
@@ -73,12 +81,12 @@ export async function registryStatus(client: PublicClient, cfg: Config, agent: A
   const { read } = getContract({ address: cap.proxy.address, abi: agentRegistryAbi, client });
   const opts = { blockNumber };
   const [agentParent, agentChildren, agentEligible, factoryAllowed, maximum] = await Promise.all([
-    read.parentOf([agent], opts), read.agentsOf([agent], opts), read.isIncentivAccount([agent], opts),
+    read.parentOf([agent], opts), read.agentCount([agent], opts), read.isIncentivAccount([agent], opts),
     read.isAccountFactory([cfg.identity.accountFactory.address], opts), read.maxAgentsPerParent(opts),
   ]);
   const parentState = parent ? await Promise.all([read.isIncentivAccount([parent], opts), read.parentOf([parent], opts), read.agentCount([parent], opts), read.nonces([parent], opts)]) : undefined;
   return { chain_id: cfg.identity.chainId, registry: cap.proxy.address, agent, parent: agentParent as Address,
-    agent_is_parent: agentChildren.length > 0, agent_eligible: Boolean(agentEligible), factory_allowed: Boolean(factoryAllowed),
+    agent_is_parent: agentChildren > 0n, agent_eligible: Boolean(agentEligible), factory_allowed: Boolean(factoryAllowed),
     max_agents: maximum.toString(), requested_parent: parent, parent_eligible: parentState ? Boolean(parentState[0]) : undefined,
     parent_is_agent: parentState ? !/^0x0{40}$/i.test(parentState[1]) : undefined,
     parent_agent_count: parentState?.[2].toString(), parent_nonce: parentState?.[3].toString() };
@@ -100,8 +108,9 @@ export function registryCall(cfg: Config, agent: Address, intent: Intent) {
 export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wallet: { account: string }, intent: Intent, state: { block: bigint; timestamp: number; deployed: boolean }) {
   await verifyRegistryDeployment(client, cfg, state.block);
   registryCall(cfg, wallet.account as Address, intent);
-  const status = await registryStatus(client, cfg, wallet.account as Address, intent.registryParent as Address, state.block);
+  const status = await registryStatus(client, cfg, wallet.account as Address, intent.kind === "unlink_agent" ? undefined : intent.registryParent as Address, state.block);
   if (intent.kind === "unlink_agent") {
+    if (/^0x0{40}$/i.test(status.parent)) throw new WalletError("registry_link_changed", "The agent is not linked; refresh status");
     if (!intent.registryParent || !sameAddress(status.parent, intent.registryParent)) throw new WalletError("registry_link_changed", "The agent's parent changed; refresh status before unlinking");
     return;
   }
@@ -119,7 +128,7 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
   const digest = await client.readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "parentLinkDigest", args: [a.parent as Address, wallet.account as Address, BigInt(a.parent_deadline)], blockNumber: state.block });
   const magic = await client.readContract({ address: a.parent as Address, abi: accountSignatureAbi, functionName: "isValidSignature", args: [digest, a.parent_signature as Hex], blockNumber: state.block }).catch((error: unknown) => {
     // A rejecting or codeless parent is an invalid signature; an RPC failure says nothing about it.
-    if (error instanceof BaseError && error.walk(cause => cause instanceof ContractFunctionRevertedError || cause instanceof ContractFunctionZeroDataError)) return "0x";
+    if (isContractRejection(error)) return "0x";
     throw error;
   });
   if (magic !== "0x1626ba7e") throw new WalletError("registry_approval_invalid", "Parent signature is invalid; obtain a fresh Portal approval");

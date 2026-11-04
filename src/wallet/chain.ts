@@ -1,5 +1,5 @@
-import { assertRegistryApproved, hasRegistryEvent, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
-import { createPublicClient, decodeEventLog, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
+import { assertRegistryApproved, hasRegistryEvent, isContractRejection, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
+import { BaseError, createPublicClient, decodeEventLog, HttpRequestError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError, TimeoutError, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
 import { accountAbi, accountFactoryAbi, dexFactoryAbi, dexPoolAbi, entryPointAbi, erc20Abi, quoterAbi, swapRouterAbi, transferGateAbi } from "../abi.js";
@@ -12,6 +12,12 @@ import type { validateOperation } from "./validate.js";
 
 const operationEvent = parseAbiItem("event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)");
 const beforeExecutionEvent = parseAbiItem("event BeforeExecution()");
+const revertReasonEvent = parseAbiItem("event UserOperationRevertReason(bytes32 indexed userOpHash,address indexed sender,uint256 nonce,bytes revertReason)");
+
+/** A node or network problem that a retry can clear, as opposed to an answer from the chain. */
+export function isTransportFailure(error: unknown): boolean {
+  return error instanceof BaseError && !!error.walk(cause => [HttpRequestError, TimeoutError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError].some(type => cause instanceof type));
+}
 const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() === String(values[0]).toLowerCase());
 export const SWAP_DEADLINE_SECONDS = 60;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
@@ -146,6 +152,7 @@ export class WalletChain {
     assertRegistryApproved(this.ctx.config, wallet);
     try { return await read(); } catch (error) {
       if (error instanceof WalletError) throw error;
+      if (isContractRejection(error)) throw new WalletError("registry_verification_failed", "The registry refused a read, so it may have changed");
       throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry this request");
     }
   }
@@ -230,13 +237,12 @@ export class WalletChain {
         if (start < 0) throw new Error("EntryPoint execution boundary missing from receipt");
         // Exclude validation/setup logs before BeforeExecution, including for the first operation.
         const logs = receipt.logs.slice(start + 1, index);
-        if (index < 0 || (matches[0][0].success && !hasRegistryEvent(this.ctx.config, record.intent, record.operation.sender, logs))) throw new Error("Registry event missing from operation receipt");
-        const revertEvent = parseAbiItem("event UserOperationRevertReason(bytes32 indexed userOpHash,address indexed sender,uint256 nonce,bytes revertReason)");
-        let code: string | undefined;
+        // The EntryPoint result settles the nonce either way, so a missing event is reported rather than blocking the wallet.
+        let code = matches[0][0].success && !hasRegistryEvent(this.ctx.config, record.intent, record.operation.sender, logs) ? "registry_event_missing" : undefined;
         for (const log of logs) {
           if (log.address.toLowerCase() !== this.ctx.config.identity.entryPoint.address.toLowerCase()) continue;
           try {
-            const { args } = decodeEventLog({ abi: [revertEvent], ...log });
+            const { args } = decodeEventLog({ abi: [revertReasonEvent], ...log });
             if (args.userOpHash === record.userOpHash && args.sender.toLowerCase() === record.operation.sender.toLowerCase() && args.nonce === BigInt(record.nonce!)) code = registryRevertCode(args.revertReason);
           } catch { /* unrelated log */ }
         }

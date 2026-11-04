@@ -20,13 +20,15 @@ export function walletDirectory(): string {
 export function assertWalletNetwork(cfg: Config, wallet: {
   networkIdentity: WalletNetworkIdentity;
   approvedCapabilityManifestId: Hex;
+  registryFreeManifestId?: Hex;
 }): void {
   if (canonicalJson(wallet.networkIdentity) !== canonicalJson(cfg.identity)) {
     throw new NetworkError("wallet_network_mismatch", "The existing wallet belongs to a different network identity. For the supported Incentiv account upgrade, use wallet upgrade-implementation in your local terminal");
   }
-  // The registry is an optional addition: a wallet that has not approved it keeps every capability it did
-  // approve. Registry operations require approval themselves (assertRegistryApproved).
-  if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId && wallet.approvedCapabilityManifestId !== withoutAgentRegistry(cfg).manifest.manifestId) {
+  // The registry is optional: a wallet that has not approved these registry pins keeps every other capability
+  // it did approve. Registry operations require approval themselves (assertRegistryApproved).
+  const registryFree = withoutAgentRegistry(cfg).manifest.manifestId;
+  if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId && wallet.approvedCapabilityManifestId !== registryFree && wallet.registryFreeManifestId !== registryFree) {
     throw new NetworkError("capability_manifest_unapproved", "The wallet has not approved this capability manifest. Review it with wallet capabilities approve in your local terminal");
   }
 }

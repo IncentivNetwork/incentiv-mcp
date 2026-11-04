@@ -41,7 +41,6 @@ function client(overrides = {}) {
       assert.equal(blockNumber, 123n);
       if (functionName === "eip712Domain") return ["0x0f", "Incentiv Agent Registry", "1", 24101n, cap.proxy.address, `0x${"00".repeat(32)}`, []];
       if (functionName === "parentOf") return zero;
-      if (functionName === "agentsOf") return [];
       if (functionName === "isIncentivAccount") return args[0].toLowerCase() === parent.toLowerCase();
       if (functionName === "isAccountFactory") return true;
       if (functionName === "maxAgentsPerParent") return 5n;
@@ -74,7 +73,8 @@ test("preflight permits first-operation deployment but rejects stale approvals, 
   await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(a), { ...state(), deployed: true }), { code: "registry_ineligible" });
   for (const [functionName, answer, expected] of [["nonces", 1n, "registry_approval_stale"], ["agentCount", 5n, "registry_limit_reached"], ["isAccountFactory", false, "registry_ineligible"], ["parentOf", parent, "registry_already_linked"], ["isValidSignature", "0xffffffff", "registry_approval_invalid"]]) {
     const c = client(), good = c.readContract;
-    c.readContract = args => args.functionName === functionName ? Promise.resolve(answer) : good(args);
+    // agentCount is per address: a full parent, not an agent that is itself a parent.
+    c.readContract = args => args.functionName === functionName && (functionName !== "agentCount" || args.args[0].toLowerCase() === parent.toLowerCase()) ? Promise.resolve(answer) : good(args);
     await assert.rejects(verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), state()), { code: expected });
   }
   await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(await approval({ parent_deadline: "1" })), state()), { code: "registry_approval_expired" });
@@ -175,13 +175,14 @@ test("receipt cannot borrow a registry event from another user operation in the 
   chain.clients.splice(0, chain.clients.length, { getTransactionReceipt: async () => ({ status: "success", transactionHash: tx, blockNumber: 10n, blockHash, logs }), getBlock: async () => ({ hash: blockHash }), getBlockNumber: async () => 12n });
   t.mock.method(globalThis, "fetch", async () => Response.json({ result: { receipt: { transactionHash: tx } } }));
   const record = { userOpHash: hash, nonce: "0", operation: { sender: agent }, intent: intent(await approval()) };
-  await assert.rejects(chain.receipt(record), /Registry event missing/);
+  assert.equal((await chain.receipt(record)).registryError, "registry_event_missing");
   logs = [registryLog("AgentLinked"), beforeExecution, opLog(hash)];
-  await assert.rejects(chain.receipt(record), /Registry event missing/);
+  assert.equal((await chain.receipt(record)).registryError, "registry_event_missing");
   logs = [registryLog("AgentLinked"), opLog(hash)];
   await assert.rejects(chain.receipt(record), /execution boundary missing/);
   logs = [beforeExecution, registryLog("AgentLinked"), opLog(hash)];
-  assert.equal((await chain.receipt(record)).success, true);
+  const settled = await chain.receipt(record);
+  assert.equal(settled.success, true); assert.equal(settled.registryError, undefined);
 });
 
 test("registry capability approval preserves wallet identity and legacy journal MACs", async t => {
@@ -357,6 +358,102 @@ test("an RPC failure keeps a link request and its local approval retryable", asy
   assert.equal(sent.status, "submitted"); assert.equal(sent.last_error, undefined);
 });
 
+test("a wallet that approved older registry pins keeps working and approves new pins without a config file", async t => {
+  const next = structuredClone(MAINNET), code = "capability_manifest_unapproved", id = randomUUID(), base = withoutAgentRegistry(MAINNET);
+  next.manifest.agentRegistry.implementation.codeHash = `0x${"12".repeat(32)}`;
+  next.manifest.manifestId = configurationId(next.manifest, "manifestId");
+  const old = await fixture(t);
+  assert.equal((await old.service.send("transfer", transfer(id))).status, "submitted");
+  const f = await fixture(t, { root: old.root, existing: true, config: next }), approval = store => store.session(async s => [s.envelope.approvedCapabilityManifestId, s.envelope.registryFreeManifestId]);
+  const held = [MAINNET.manifest.manifestId, base.manifest.manifestId];
+
+  // The pending operation stays reachable, and resolves, under the new release.
+  assert.equal((await f.service.operation(id)).status, "submission_unknown");
+  await assert.rejects(f.service.registryStatus(), { code });
+  const previous = withoutAgentRegistry(next);
+  await assert.rejects(approveCapabilities(f.store, previous, next, password, digest(await reviewCapabilities(f.store, previous, next))), { code: "operation_pending" });
+  f.setReceipt({ success: true, actualGasCost: 200n, transactionHash: `0x${"11".repeat(32)}` });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  assert.equal((await f.service.send("transfer", transfer(randomUUID()))).status, "submitted");
+  f.setReceipt({ success: true, actualGasCost: 200n, transactionHash: `0x${"22".repeat(32)}` });
+  await f.service.review();
+
+  // Neither saving a policy nor restoring a backup approves the new pins.
+  await f.service.configure(limits, password, false, digest([]));
+  assert.deepEqual(await approval(f.store), held);
+  await assert.rejects(f.service.registryStatus(), { code });
+  const recovery = Buffer.from("recovery passphrase for test"), out = join(old.parent, "backup.json"), target = await fixture(t, { existing: true, config: next });
+  await backupWallet(next, f.store, out, password, recovery);
+  await restoreWallet(next, target.store, out, recovery);
+  assert.deepEqual(await approval(target.store), held);
+
+  // An unrelated previous manifest is still refused; the derived one is the reviewed route.
+  const other = structuredClone(previous);
+  other.manifest.contracts.swapRouter.codeHash = `0x${"34".repeat(32)}`;
+  other.manifest.manifestId = configurationId(other.manifest, "manifestId");
+  await assert.rejects(reviewCapabilities(f.store, other, next), { code });
+  await approveCapabilities(f.store, previous, next, password, digest(await reviewCapabilities(f.store, previous, next)));
+  assert.deepEqual(await approval(f.store), [next.manifest.manifestId, base.manifest.manifestId]);
+  f.chain.clients.splice(0, f.chain.clients.length);
+  assert.equal((await f.service.registryStatus()).deployed, false);
+});
+
+test("a changed base manifest is still refused even with a registry-free approval on record", async t => {
+  const f = await fixture(t), changed = structuredClone(MAINNET);
+  changed.manifest.contracts.swapRouter.codeHash = `0x${"56".repeat(32)}`;
+  changed.manifest.manifestId = configurationId(changed.manifest, "manifestId");
+  await assert.rejects(new WalletStore(changed, f.deps).createOrLoad(), { code: "capability_manifest_unapproved" });
+});
+
+test("a mined link with no registry event settles and says so instead of holding the nonce", async t => {
+  const f = await registryFixture(t), id = randomUUID();
+  assert.equal((await f.service.send("link_agent", { request_id: id, approval: f.approval })).status, "submitted");
+  f.chain.receipt = async () => ({ success: true, actualGasCost: 200n, transactionHash: `0x${"11".repeat(32)}`, registryError: "registry_event_missing" });
+  const settled = await f.service.operation(id);
+  assert.equal(settled.status, "confirmed"); assert.equal(settled.registry_error, "registry_event_missing");
+  assert.match(settled.next_action, /get_agent_registry_status/);
+  await f.store.session(async s => assert.ok(!(await Journal.open(s)).data.records.some(r => ownsNonce(r.status))));
+});
+
+test("one Portal approval cannot fill the journal under new request IDs", async t => {
+  const f = await registryFixture(t, false), args = id => ({ request_id: id, approval: f.approval }), first = randomUUID();
+  assert.equal((await f.service.send("link_agent", args(first))).status, "approval_required");
+  await assert.rejects(f.service.send("link_agent", args(randomUUID())), error => error.code === "operation_pending" && error.message.includes(first));
+  const close = () => f.store.session(async s => { const journal = await Journal.open(s), open = journal.data.records.find(r => r.status === "approval_required"); await journal.transition(open, "preparing"); await journal.transition(open, "failed"); });
+  await close();
+  for (let i = 1; i < 8; i++) { assert.equal((await f.service.send("link_agent", args(randomUUID()))).status, "approval_required"); await close(); }
+  await assert.rejects(f.service.send("link_agent", args(randomUUID())), { code: "policy_denied" });
+  await f.store.session(async s => assert.equal((await Journal.open(s)).data.records.length, 8));
+  const fresh = { ...f.approval, parent_deadline: String(Number(f.approval.parent_deadline) + 60) };
+  assert.equal((await f.service.send("link_agent", { request_id: randomUUID(), approval: fresh })).status, "approval_required");
+});
+
+test("an RPC outage elsewhere in preparation keeps a request retryable; other errors still close it", async t => {
+  const f = await fixture(t), id = randomUUID(), balances = f.chain.balances;
+  f.chain.balances = async () => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); };
+  await assert.rejects(f.service.send("transfer", transfer(id)), { code: "rpc_unavailable" });
+  const interrupted = await f.service.operation(id);
+  assert.equal(interrupted.status, "approval_required"); assert.equal(interrupted.last_error, "rpc_unavailable"); assert.match(interrupted.next_action, /same request ID/);
+  f.chain.balances = balances;
+  const sent = await f.service.send("transfer", transfer(id));
+  assert.equal(sent.status, "submitted"); assert.equal(sent.last_error, undefined);
+
+  const g = await fixture(t), other = randomUUID();
+  g.chain.balances = async () => { throw new Error("local bug"); };
+  await assert.rejects(g.service.send("transfer", transfer(other)), { code: "validation_failed" });
+  assert.equal((await g.service.operation(other)).status, "failed");
+});
+
+test("unlink refuses an unlinked agent up front and skips parent reads, and agent role uses the count", async () => {
+  const a = await approval(), unlink = { ...intent(a), kind: "unlink_agent", registryApproval: undefined }, good = client();
+  await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, { ...unlink, registryParent: zero }, state()), { code: "registry_link_changed" });
+  const reads = [], linked = client({ readContract: async opts => { reads.push(opts.functionName); return opts.functionName === "parentOf" ? parent : good.readContract(opts); } });
+  await verifyRegistryIntent(linked, MAINNET, { account: agent }, unlink, state());
+  assert.ok(!reads.includes("nonces"));
+  const isParent = client({ readContract: async opts => opts.functionName === "agentCount" && opts.args[0].toLowerCase() === agent.toLowerCase() ? 1n : good.readContract(opts) });
+  await assert.rejects(verifyRegistryIntent(isParent, MAINNET, { account: agent }, intent(a), state()), { code: "registry_ineligible" });
+});
+
 test("a temporary RPC error does not outlive the record state it explained", async t => {
   const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval }, now = Date.now();
   assert.equal((await f.service.send("link_agent", args)).status, "approval_required");
@@ -415,10 +512,20 @@ test("an RPC failure during signature validation is not reported as an invalid s
   const check = c => verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), state());
   await assert.rejects(check(parentCall(() => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); })), error => !(error instanceof WalletError) && /429|HTTP/.test(error.message));
   await assert.rejects(check(parentCall(() => { throw Object.assign(new Error("execution reverted"), { code: 3, data: "0x" }); })), { code: "registry_approval_invalid" });
+  for (const message of ["internal error", "missing trie node"]) await assert.rejects(check(parentCall(() => { throw Object.assign(new Error(message), { code: -32603 }); })), error => !(error instanceof WalletError));
+  await assert.rejects(check(parentCall(() => { throw Object.assign(new Error("execution reverted"), { code: -32603 }); })), { code: "registry_approval_invalid" });
   await assert.rejects(check(parentCall(() => "0x")), { code: "registry_approval_invalid" });
   const chain = new WalletChain(new Ctx(MAINNET));
   chain.clients.splice(0, chain.clients.length, parentCall(() => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); }));
-  await assert.rejects(chain.verifyRegistry({ account: agent, approvedCapabilityManifestId: MAINNET.manifest.manifestId }, intent(a), state()), { code: "registry_rpc_unavailable" });
+  const approved = { account: agent, approvedCapabilityManifestId: MAINNET.manifest.manifestId };
+  await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_rpc_unavailable" });
+
+  // A contract that refuses a read will keep refusing, so "retry" would be wrong.
+  const domainCall = respond => client({ readContract: async opts => opts.functionName !== "eip712Domain" ? good.readContract(opts) : createPublicClient({ transport: custom({ request: async () => respond() }, { retryCount: 0 }) }).readContract(opts) });
+  chain.clients.splice(0, 1, domainCall(() => { throw Object.assign(new Error("execution reverted"), { code: 3, data: "0x" }); }));
+  await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_verification_failed" });
+  chain.clients.splice(0, 1, domainCall(() => { throw Object.assign(new Error("internal error"), { code: -32603 }); }));
+  await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_rpc_unavailable" });
 });
 
 test("a link retried near its deadline gets recovery guidance instead of a tampering error", async t => {
@@ -498,10 +605,22 @@ test("a stale link can be replaced and retried with USDC and zero native CENT", 
   await assert.rejects(f.service.send("link_agent", args), { code: "registry_approval_stale" });
   assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
   await assert.rejects(f.service.send("link_agent", { ...args, request_id: randomUUID() }), { code: "operation_pending" });
+  const buildReplacement = f.chain.buildReplacement, simulate = f.chain.simulate;
+  f.chain.buildReplacement = () => { throw new Error("paymaster quote failed"); };
+  await assert.rejects(f.service.reviewReplacement(id), error => error.code === "validation_failed" && /--native-gas/.test(error.message));
+  await assert.rejects(f.service.reviewReplacement(id, true), error => error.code === "validation_failed" && !/--native-gas/.test(error.message));
+  f.chain.buildReplacement = buildReplacement;
+  f.chain.simulate = async () => { throw new WalletError("simulation_failed", "Simulation failed"); };
+  await assert.rejects(f.service.reviewReplacement(id), error => error.code === "simulation_failed" && /Simulation failed\..*--native-gas/.test(error.message));
+  f.chain.simulate = simulate;
   const review = await f.service.reviewReplacement(id), record = review.records[0];
   assert.equal(record.replacement.gasToken, f.token); assert.equal(record.replacement.gasCharge, "150");
   assert.equal(record.replacement.operation.paymaster, MAINNET.manifest.contracts.unifiedTokenPaymaster.address);
   assert.equal(record.replacement.operation.nonce, record.operation.nonce);
+  const balances = f.chain.balances;
+  f.chain.balances = async () => ({ [f.token]: "0" });
+  await assert.rejects(f.service.replace(id, password, digest(record)), error => error.code === "policy_denied" && /--native-gas/.test(error.message));
+  f.chain.balances = balances;
   assert.equal((await f.service.replace(id, password, digest(record))).status, "superseding");
   await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "273" }));
   f.chain.receipt = async r => r.userOpHash === record.replacement.userOpHash ? { success: true, actualGasCost: 400n, transactionHash: `0x${"44".repeat(32)}` } : undefined;

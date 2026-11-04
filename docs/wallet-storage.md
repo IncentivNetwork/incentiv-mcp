@@ -171,7 +171,7 @@ waiting for this lock; sign and relay paths recheck it.
 | `unsupported_wallet_version` | An explicit format migration is required. |
 | `keystore_authentication_failed` | Authentication tag or locally rederived addresses disagree. |
 | `wallet_network_mismatch` | Wallet identity differs from configured/pinned identity. |
-| `capability_manifest_unapproved` | Capabilities differ from the wallet's approved manifest. A wallet that only lacks approval of the optional Agent Registry opens normally and gets this error from registry tools only. |
+| `capability_manifest_unapproved` | Capabilities differ from the wallet's approved manifest. A wallet that only lacks approval of the current Agent Registry pins opens normally and gets this error from registry tools only. The authenticated `registryFreeManifestId` records what an approval covers apart from the registry. |
 | `wallet_recovery_required` | Other malformed, conflicting, incomplete, or inaccessible evidence. |
 
 Storage errors do not include raw credential-provider or filesystem error payloads.
