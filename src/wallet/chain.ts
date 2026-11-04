@@ -142,8 +142,14 @@ export class WalletChain {
       }
     }));
   }
-  async verifyRegistry(wallet: WalletEnvelope, intent: Intent, state: ChainState) {
-    await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, state)));
+  async verifyRegistry(wallet: WalletEnvelope, intent: Intent, state?: ChainState) {
+    try {
+      const current = state ?? await this.state(wallet);
+      await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, current)));
+    } catch (error) {
+      if (error instanceof WalletError) throw error;
+      throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry this request");
+    }
   }
   async registryStatus(wallet: WalletEnvelope, parent?: Address) {
     const state = await this.state(wallet);

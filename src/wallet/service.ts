@@ -134,6 +134,8 @@ export class WalletService {
         return result(r);
       }
       if (journal.data.records.some(r => ownsNonce(r.status))) throw new WalletError("operation_pending", "An unresolved operation owns the account nonce; reconcile it first");
+      // Rejected registry requests must not consume journal capacity.
+      if (isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
       if (r?.status === "approval_required") {
         if (r.approval && r.approval.expiresAt <= Date.now()) { await journal.transition(r, "expired"); return result(r); }
         await journal.transition(r, "preparing");
@@ -146,7 +148,6 @@ export class WalletService {
         // First policy evaluation precedes building; violations may build an unsigned review candidate.
         const initialSpend: Spend = {}; addSpend(initialSpend, intent.token, BigInt(intent.amount));
         const initial = policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: initialSpend, used, balances, gasCost: 0n, fee: 0n, gasUnits: 0n, gasToken: intent.gasToken, gasCharge: 0n, calls: [] });
-        if (isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent, state);
         if (kind === "swap") await this.chain.verifySwap(s.envelope, intent, limits, state);
         if (r.approval && !this.approved(s, r)) delete r.approval;
         if (!r.approval) {

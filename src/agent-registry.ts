@@ -1,4 +1,4 @@
-import { decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
+import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Intent } from "./wallet/journal.js";
@@ -29,7 +29,8 @@ export const registryApprovalSchema = z.strictObject({
   version: z.literal(1), chain_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), registry: addr,
   parent: addr, agent: addr, parent_nonce: uint,
   parent_deadline: uint.refine(s => BigInt(s) <= BigInt(Number.MAX_SAFE_INTEGER)),
-  parent_signature: z.string().max(32770).regex(/^0x(?:[0-9a-fA-F]{2})+$/),
+  // Generous for EOA and passkey signatures; every accepted request occupies the capped journal.
+  parent_signature: z.string().max(8194).regex(/^0x(?:[0-9a-fA-F]{2})+$/),
 });
 export type RegistryApproval = z.infer<typeof registryApprovalSchema>;
 export function registryRevertCode(data: Hex): string | undefined {
@@ -102,7 +103,11 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
   if (status.parent_nonce !== a.parent_nonce) throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval");
   const cap = registryCapability(cfg);
   const digest = await client.readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "parentLinkDigest", args: [a.parent as Address, wallet.account as Address, BigInt(a.parent_deadline)], blockNumber: state.block });
-  const magic = await client.readContract({ address: a.parent as Address, abi: accountSignatureAbi, functionName: "isValidSignature", args: [digest, a.parent_signature as Hex], blockNumber: state.block }).catch(() => "0x");
+  const magic = await client.readContract({ address: a.parent as Address, abi: accountSignatureAbi, functionName: "isValidSignature", args: [digest, a.parent_signature as Hex], blockNumber: state.block }).catch((error: unknown) => {
+    // A rejecting or codeless parent is an invalid signature; an RPC failure says nothing about it.
+    if (error instanceof BaseError && error.walk(cause => cause instanceof ContractFunctionRevertedError || cause instanceof ContractFunctionZeroDataError)) return "0x";
+    throw error;
+  });
   if (magic !== "0x1626ba7e") throw new WalletError("registry_approval_invalid", "Parent signature is invalid; obtain a fresh Portal approval");
 }
 // Only inspect the log interval belonging to this operation within an EntryPoint bundle.

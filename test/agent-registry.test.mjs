@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { encodeAbiParameters, encodeEventTopics, recoverMessageAddress, decodeFunctionData, encodeFunctionData, encodeErrorResult } from "viem";
+import { createPublicClient, custom, encodeAbiParameters, encodeEventTopics, HttpRequestError, recoverMessageAddress, decodeFunctionData, encodeFunctionData, encodeErrorResult } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { MAINNET, configurationId, parseConfig } from "../src/config.ts";
 import { deriveSmartAccount } from "../src/network.ts";
@@ -20,6 +20,7 @@ import { previousImplementationConfig, withoutAgentRegistry } from "../src/accou
 import { approveImplementation, reviewImplementation } from "../src/wallet/implementation.ts";
 import { backupWallet, restoreCurrentOrPreRegistry } from "../src/wallet/backup.ts";
 import { WalletStore } from "../src/wallet/store.ts";
+import { WalletError } from "../src/wallet/errors.ts";
 
 const zero = `0x${"00".repeat(20)}`, parent = "0x0000000000000000000000000000000000000002";
 const owner = privateKeyToAccount(`0x${"01".padStart(64, "0")}`), agent = deriveSmartAccount(MAINNET, owner.address);
@@ -231,6 +232,40 @@ test("a backup from before the registry restores under its approved manifest, th
   await approveCapabilities(store, base, MAINNET, password, digest(await reviewCapabilities(store, base, MAINNET)));
   assert.equal((await store.createOrLoad()).account, before.account);
   await assert.rejects(restoreCurrentOrPreRegistry(MAINNET, store, out, Buffer.from("wrong recovery passphrase")), { code: "backup_authentication_failed" });
+});
+
+test("a rejected link request leaves no journal record and oversized signatures are refused", async t => {
+  const f = await registryFixture(t), id = randomUUID();
+  await assert.rejects(f.service.send("link_agent", { request_id: id, approval: { ...f.approval, parent_signature: `0x${"ab".repeat(4097)}` } }));
+  f.chain.verifyRegistry = async () => { throw new WalletError("registry_approval_invalid", "Parent signature is invalid"); };
+  await assert.rejects(f.service.send("link_agent", { request_id: id, approval: { ...f.approval, parent_signature: `0x${"ab".repeat(4096)}` } }), { code: "registry_approval_invalid" });
+  await f.store.session(async s => assert.equal((await Journal.open(s)).data.records.length, 0));
+});
+
+test("an RPC failure during signature validation is not reported as an invalid signature", async () => {
+  const a = await approval(), good = client();
+  const parentCall = respond => client({ readContract: async opts => {
+    if (opts.functionName !== "isValidSignature") return good.readContract(opts);
+    return createPublicClient({ transport: custom({ request: async () => respond() }, { retryCount: 0 }) }).readContract(opts);
+  } });
+  const check = c => verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), state());
+  await assert.rejects(check(parentCall(() => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); })), error => !(error instanceof WalletError) && /429|HTTP/.test(error.message));
+  await assert.rejects(check(parentCall(() => { throw Object.assign(new Error("execution reverted"), { code: 3, data: "0x" }); })), { code: "registry_approval_invalid" });
+  await assert.rejects(check(parentCall(() => "0x")), { code: "registry_approval_invalid" });
+  const chain = new WalletChain(new Ctx(MAINNET));
+  chain.clients.splice(0, chain.clients.length, parentCall(() => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); }));
+  await assert.rejects(chain.verifyRegistry({ account: agent }, intent(a), state()), { code: "registry_rpc_unavailable" });
+});
+
+test("a link retried near its deadline gets recovery guidance instead of a tampering error", async t => {
+  const f = await registryFixture(t), id = randomUUID(), now = Date.now(), relay = f.chain.relay;
+  f.chain.verifyRegistry = async () => {};
+  const args = { request_id: id, approval: { ...f.approval, parent_deadline: String(Math.floor(now / 1000) + 15) } };
+  f.chain.relay = async () => { throw new Error("lost response"); };
+  assert.equal((await f.service.send("link_agent", args)).status, "submission_unknown");
+  f.chain.relay = relay;
+  t.mock.method(Date, "now", () => now + 8_000);
+  await assert.rejects(f.service.send("link_agent", args), { code: "operation_pending" });
 });
 
 test("registry errors produce bounded actionable codes without forwarding raw revert data", () => {

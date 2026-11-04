@@ -64,7 +64,7 @@ export function validateOperation(cfg: Config, wallet: WalletEnvelope, intent: I
       requireValue(business.length === 1 && intent.registryParent && intent.amount === "0" && intent.token === intent.gasToken);
       const call = business[0], expectedCall = registryCall(cfg, wallet.account as Address, intent);
       requireValue(equal(call.to, expectedCall.to) && call.value === 0n && equal(call.data, expectedCall.data));
-      if (intent.kind === "link_agent") requireValue(expected.deadline === Number(intent.registryApproval!.parent_deadline) && expected.deadline! > Math.floor(Date.now() / 1000) + 10);
+      if (intent.kind === "link_agent") requireValue(expected.deadline === Number(intent.registryApproval!.parent_deadline));
     } else if (intent.kind === "transfer") {
       requireValue(business.length === 1 && intent.to);
       const call = business[0];
