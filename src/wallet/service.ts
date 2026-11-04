@@ -138,6 +138,7 @@ export class WalletService {
       const existing = !!r;
       if (!existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
       if (r?.status === "approval_required") {
+        if (r.lastError === "registry_rpc_unavailable") delete r.lastError;
         if (r.approval && r.approval.expiresAt <= Date.now()) { await journal.transition(r, "expired"); return result(r); }
         await journal.transition(r, "preparing");
       }
@@ -197,7 +198,7 @@ export class WalletService {
         await journal.transition(r, "signed"); // fsync completes before any submission.
       } catch (error) {
         // An RPC outage says nothing about the consent, so the same request ID and any local approval stay usable.
-        if (r.status === "preparing" && error instanceof WalletError && error.code === "registry_rpc_unavailable") await journal.transition(r, "approval_required");
+        if (r.status === "preparing" && error instanceof WalletError && error.code === "registry_rpc_unavailable") { r.lastError = error.code; await journal.transition(r, "approval_required"); }
         else if (r.status === "preparing") { r.lastError = error instanceof WalletError ? error.code : "validation_failed"; await journal.transition(r, "failed"); }
         if (error instanceof WalletError) throw error;
         throw new WalletError("validation_failed", "Local operation preparation failed");
@@ -289,6 +290,7 @@ export class WalletService {
       const r = journal.data.records.find(r => r.requestId === id);
       const retry = liveTest && !!r?.approval?.liveTest && (r.status === "signed" || r.status === "submission_unknown");
       if (!r || (r.status !== "approval_required" && !retry) || !r.operation || !r.userOpHash || digest(r) !== reviewedDigest) throw new WalletError("approval_required", "Review the current locally validated operation first");
+      assertNeedsApproval(r);
       if (r.reasons?.includes("exposure_limit")) throw new WalletError("policy_denied", "Change exposure limits interactively or reduce wallet funding first");
       if (liveTest && (r.intent.kind !== "transfer" || r.intent.gasToken !== "native" || r.replacement)) throw new WalletError("policy_denied", "Funded test approval only permits a transfer with native gas and no replacement");
       const state = await this.chain.state(s.envelope);
@@ -383,11 +385,17 @@ export class WalletService {
     r.sequence = ++journal.data.sequence; await journal.save();
   }
 }
+/** Every policy exception records its reasons. Without any, a retry re-evaluates the request, so there is nothing to approve. */
+export function assertNeedsApproval(r: OperationRecord) {
+  if (r.status === "approval_required" && !r.reasons?.length) throw new WalletError("validation_failed", "This request does not need terminal approval; retry it with the same request ID");
+}
+
 function result(r: OperationRecord) {
   const nativeGas = r.intent.gasToken === "native" && (r.status === "confirmed" || r.status === "reverted") && r.consumed?.native !== undefined
     ? (BigInt(r.consumed.native) - (r.status === "confirmed" && r.intent.token === "native" ? BigInt(r.intent.amount) : 0n)).toString() : undefined;
   const { registryApproval, ...publicIntent } = r.intent;
   const intent = registryApproval ? { ...publicIntent, registryApproval: { ...registryApproval, parent_signature: "[redacted]" } } : publicIntent;
   const registryError = r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_") ? r.lastError : undefined;
-  return { request_id: r.requestId, intent, registry_error: registryError, ...(registryError ? { next_action: "Refresh registry status. Invalid or expired parent consent requires a fresh approval in Portal and a new request UUID." } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
+  const interrupted = r.status === "approval_required" && r.lastError === "registry_rpc_unavailable";
+  return { request_id: r.requestId, intent, registry_error: registryError, ...(registryError ? { next_action: "Refresh registry status. Invalid or expired parent consent requires a fresh approval in Portal and a new request UUID." } : interrupted ? { next_action: `A temporary RPC failure interrupted this request. Retry with the same request ID${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }

@@ -336,16 +336,36 @@ test("an RPC failure keeps a link request and its local approval retryable", asy
   await f.service.approve(id, password, digest((await f.service.review(id)).records[0]));
   f.chain.verifyRegistry = down;
   await assert.rejects(f.service.send("link_agent", args), { code: "registry_rpc_unavailable" });
-  assert.equal((await f.service.operation(id)).status, "approval_required");
+  const interrupted = await f.service.operation(id);
+  assert.equal(interrupted.status, "approval_required"); assert.equal(interrupted.last_error, "registry_rpc_unavailable");
+  assert.ok(interrupted.reasons.length, "a real policy exception keeps its reasons");
+  assert.doesNotMatch(interrupted.next_action, /not needed/);
   f.chain.verifyRegistry = async () => {};
-  assert.equal((await f.service.send("link_agent", args)).status, "submitted");
+  const recovered = await f.service.send("link_agent", args);
+  assert.equal(recovered.status, "submitted"); assert.equal(recovered.last_error, undefined); assert.equal(recovered.next_action, undefined);
 
   const g = await registryFixture(t), fresh = randomUUID(), freshArgs = { request_id: fresh, approval: g.approval };
   let checks = 0;
   g.chain.verifyRegistry = async () => { if (++checks === 2) await down(); };
   await assert.rejects(g.service.send("link_agent", freshArgs), { code: "registry_rpc_unavailable" });
-  assert.equal((await g.service.operation(fresh)).status, "approval_required");
-  assert.equal((await g.service.send("link_agent", freshArgs)).status, "submitted");
+  const permitted = await g.service.operation(fresh);
+  assert.equal(permitted.status, "approval_required"); assert.equal(permitted.reasons, undefined); assert.equal(permitted.last_error, "registry_rpc_unavailable");
+  assert.match(permitted.next_action, /same request ID.*not needed/);
+  const review = await g.service.review(fresh);
+  await assert.rejects(g.service.approve(fresh, password, digest(review.records[0])), { code: "validation_failed" });
+  const sent = await g.service.send("link_agent", freshArgs);
+  assert.equal(sent.status, "submitted"); assert.equal(sent.last_error, undefined);
+});
+
+test("a temporary RPC error does not outlive the record state it explained", async t => {
+  const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval }, now = Date.now();
+  assert.equal((await f.service.send("link_agent", args)).status, "approval_required");
+  await f.service.approve(id, password, digest((await f.service.review(id)).records[0]));
+  f.chain.verifyRegistry = async () => { throw new WalletError("registry_rpc_unavailable", "RPC down"); };
+  await assert.rejects(f.service.send("link_agent", args), { code: "registry_rpc_unavailable" });
+  t.mock.method(Date, "now", () => now + 3_600_000);
+  const expired = await f.service.send("link_agent", args);
+  assert.equal(expired.status, "expired"); assert.equal(expired.last_error, undefined);
 });
 
 test("registry reads report RPC failures as temporary", async t => {
