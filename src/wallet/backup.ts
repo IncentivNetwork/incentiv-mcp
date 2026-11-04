@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { canonicalJson, type Config } from "../config.js";
 import { previousImplementationConfig, withoutAgentRegistry } from "../account-upgrade.js";
-import { authenticateWallet, parseEnvelope, sealWallet, unlockWallet, WalletError } from "./keystore.js";
+import { authenticateWallet, parseEnvelope, sealWallet, unlockWallet, WalletError, type WalletEnvelope } from "./keystore.js";
 import { authorize, scrypt } from "./policy.js";
 import { digest, Journal, journalApprovesManifest, journalApprovesNetwork, journalSchema, ownsNonce, type JournalData } from "./journal.js";
 import { implementationReview, prepareImplementationUpgrade } from "./implementation.js";
@@ -14,7 +14,7 @@ const b64 = (size: number) => z.string().refine(s => Buffer.from(s, "base64").le
 const headerSchema = z.strictObject({ schemaVersion: z.literal(1), kdf: z.strictObject({ name: z.literal("scrypt"), N: z.literal(131072), r: z.literal(8), p: z.literal(1), dkLen: z.literal(32), salt: b64(16) }), cipher: z.strictObject({ name: z.literal("AES-256-GCM"), nonce: b64(12) }) });
 const bundleSchema = z.strictObject({ header: headerSchema, ciphertext: z.string().max(24 * 1024 * 1024).regex(/^[A-Za-z0-9+/]+={0,2}$/), tag: b64(16) });
 
-async function decrypt(config: Config, bundle: unknown, passphrase: Buffer) {
+async function decrypt(config: Config, bundle: unknown, passphrase: Buffer, fallback?: Config) {
   let key: Buffer | undefined, plaintext: Buffer | undefined, wrappingKey: Buffer | undefined;
   try {
     const parsed = bundleSchema.parse(bundle);
@@ -25,9 +25,12 @@ async function decrypt(config: Config, bundle: unknown, passphrase: Buffer) {
     const data = z.strictObject({ envelope: z.unknown(), wrappingKey: b64(32), journal: journalSchema }).parse(JSON.parse(plaintext.toString("utf8")));
     const envelope = parseEnvelope(data.envelope);
     wrappingKey = Buffer.from(data.wrappingKey, "base64");
-    authenticateWallet(config, envelope, wrappingKey);
+    const matched = [config, ...(fallback ? [fallback] : [])].find(candidate => {
+      try { authenticateWallet(candidate, envelope, wrappingKey!); return true; } catch { return false; }
+    });
+    if (!matched) throw new Error();
     if (data.journal.walletId !== envelope.walletId || !journalApprovesNetwork(data.journal, envelope.networkIdentity.networkId) || !journalApprovesManifest(data.journal, envelope.approvedCapabilityManifestId) || data.journal.records.some(r => ownsNonce(r.status))) throw new Error();
-    return { envelope, wrappingKey: Buffer.from(wrappingKey), journal: data.journal };
+    return { config: matched, envelope, wrappingKey: Buffer.from(wrappingKey), journal: data.journal };
   } catch { throw new WalletError("backup_authentication_failed", "Backup, recovery passphrase, network identity or history is invalid"); }
   finally { key?.fill(0); plaintext?.fill(0); wrappingKey?.fill(0); }
 }
@@ -55,12 +58,12 @@ export async function backupWallet(config: Config, store: WalletStore, out: stri
   });
 }
 
-async function readBackup(config: Config, input: string, recovery: Buffer) {
+async function readBackup(config: Config, input: string, recovery: Buffer, fallback?: Config) {
   const bytes = await readPrivate(input, 24 * 1024 * 1024);
   try {
     let bundle: unknown;
     try { bundle = JSON.parse(bytes.toString("utf8")); } catch { throw new WalletError("backup_authentication_failed", "Invalid encrypted backup"); }
-    return await decrypt(config, bundle, recovery);
+    return await decrypt(config, bundle, recovery, fallback);
   } finally { bytes.fill(0); }
 }
 
@@ -86,27 +89,28 @@ export async function restoreWallet(config: Config, store: WalletStore, input: s
         snapshot.journal = prepared.journal;
       } finally { ownerKey.fill(0); }
     }
-    return await store.restore({ ...snapshot, initialize: async (directory, wrappingKey, envelope) => {
-      const data: JournalData = structuredClone(snapshot.journal);
-      // Unsigned approvals are not portable authorizations. Retain their request IDs as cancelled history.
-      for (const r of data.records) if (r.status === "preparing" || r.status === "approval_required") {
-        r.status = "cancelled"; delete r.approval; r.sequence = ++data.sequence; r.updatedAt = Date.now();
-      }
-      const session = { directory, wrappingKey, envelope } as WalletSession;
-      await writeNew(join(directory, "operations", "journal.json"), canonicalJson({ data, mac: Journal.mac(session, data) }));
-      await Journal.open(session);
-    } });
+    return await installSnapshot(store, snapshot);
   } finally { snapshot.wrappingKey.fill(0); }
+}
+
+function installSnapshot(store: WalletStore, snapshot: { envelope: WalletEnvelope; wrappingKey: Buffer; journal: JournalData }) {
+  return store.restore({ envelope: snapshot.envelope, wrappingKey: snapshot.wrappingKey, initialize: async (directory, wrappingKey, envelope) => {
+    const data: JournalData = structuredClone(snapshot.journal);
+    // Unsigned approvals are not portable authorizations. Retain their request IDs as cancelled history.
+    for (const r of data.records) if (r.status === "preparing" || r.status === "approval_required") {
+      r.status = "cancelled"; delete r.approval; r.sequence = ++data.sequence; r.updatedAt = Date.now();
+    }
+    const session = { directory, wrappingKey, envelope } as WalletSession;
+    await writeNew(join(directory, "operations", "journal.json"), canonicalJson({ data, mac: Journal.mac(session, data) }));
+    await Journal.open(session);
+  } });
 }
 
 /** Ordinary restore; a backup from before the registry capability restores under the manifest it approved. */
 export async function restoreCurrentOrPreRegistry(config: Config, store: WalletStore, input: string, recovery: Buffer) {
-  try { return await restoreWallet(config, store, input, recovery); }
-  catch (error) {
-    if (!(error instanceof WalletError) || error.code !== "backup_authentication_failed" || !config.manifest.agentRegistry) throw error;
-    const base = withoutAgentRegistry(config);
-    return await restoreWallet(base, store.withConfig(base), input, recovery);
-  }
+  const snapshot = await readBackup(config, input, recovery, config.manifest.agentRegistry ? withoutAgentRegistry(config) : undefined);
+  try { return await installSnapshot(snapshot.config === config ? store : store.withConfig(snapshot.config), snapshot); }
+  finally { snapshot.wrappingKey.fill(0); }
 }
 
 export async function migrateWallet(store: WalletStore, target: number) {

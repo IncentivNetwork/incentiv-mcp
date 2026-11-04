@@ -134,8 +134,9 @@ export class WalletService {
         return result(r);
       }
       if (journal.data.records.some(r => ownsNonce(r.status))) throw new WalletError("operation_pending", "An unresolved operation owns the account nonce; reconcile it first");
-      // Rejected registry requests must not consume journal capacity.
-      if (isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
+      // Rejected new registry requests must not consume journal capacity. An existing record is checked below, where a failure closes it.
+      const existing = !!r;
+      if (!existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
       if (r?.status === "approval_required") {
         if (r.approval && r.approval.expiresAt <= Date.now()) { await journal.transition(r, "expired"); return result(r); }
         await journal.transition(r, "preparing");
@@ -143,6 +144,7 @@ export class WalletService {
       r ??= await journal.create(requestId, intent);
       try {
         const state = await this.chain.state(s.envelope);
+        if (existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent, state);
         const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits));
         const used = journal.used();
         // First policy evaluation precedes building; violations may build an unsigned review candidate.

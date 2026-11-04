@@ -21,6 +21,7 @@ import { approveImplementation, reviewImplementation } from "../src/wallet/imple
 import { backupWallet, restoreCurrentOrPreRegistry } from "../src/wallet/backup.ts";
 import { WalletStore } from "../src/wallet/store.ts";
 import { WalletError } from "../src/wallet/errors.ts";
+import { reviewUpgrade } from "../src/wallet/cli.ts";
 
 const zero = `0x${"00".repeat(20)}`, parent = "0x0000000000000000000000000000000000000002";
 const owner = privateKeyToAccount(`0x${"01".padStart(64, "0")}`), agent = deriveSmartAccount(MAINNET, owner.address);
@@ -240,6 +241,65 @@ test("a rejected link request leaves no journal record and oversized signatures 
   f.chain.verifyRegistry = async () => { throw new WalletError("registry_approval_invalid", "Parent signature is invalid"); };
   await assert.rejects(f.service.send("link_agent", { request_id: id, approval: { ...f.approval, parent_signature: `0x${"ab".repeat(4096)}` } }), { code: "registry_approval_invalid" });
   await f.store.session(async s => assert.equal((await Journal.open(s)).data.records.length, 0));
+});
+
+test("bad consent closes an existing link record on retry", async t => {
+  const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval };
+  assert.equal((await f.service.send("link_agent", args)).status, "approval_required");
+  f.chain.verifyRegistry = async () => { throw new WalletError("registry_approval_expired", "Portal approval expired"); };
+  await assert.rejects(f.service.send("link_agent", args), { code: "registry_approval_expired" });
+  const closed = await f.service.operation(id);
+  assert.equal(closed.status, "failed"); assert.equal(closed.last_error, "registry_approval_expired");
+  assert.equal((await f.service.send("link_agent", args)).status, "failed");
+
+  // A record left in preparing by a crash closes the same way.
+  const crashed = randomUUID(), crashedArgs = { request_id: crashed, approval: { ...f.approval, parent_nonce: "1" } };
+  f.chain.verifyRegistry = async () => {};
+  assert.equal((await f.service.send("link_agent", crashedArgs)).status, "approval_required");
+  await f.store.session(async s => { const journal = await Journal.open(s); await journal.transition(journal.data.records.find(r => r.requestId === crashed), "preparing"); });
+  f.chain.verifyRegistry = async () => { throw new WalletError("registry_already_linked", "Already linked"); };
+  await assert.rejects(f.service.send("link_agent", crashedArgs), { code: "registry_already_linked" });
+  assert.equal((await f.service.operation(crashed)).status, "failed");
+});
+
+test("an expired terminal approval still expires its link record", async t => {
+  const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval }, now = Date.now();
+  assert.equal((await f.service.send("link_agent", args)).status, "approval_required");
+  await f.service.approve(id, password, digest((await f.service.review(id)).records[0]));
+  f.chain.verifyRegistry = async () => { throw new WalletError("registry_approval_expired", "Portal approval expired"); };
+  t.mock.method(Date, "now", () => now + 3_600_000);
+  assert.equal((await f.service.send("link_agent", args)).status, "expired");
+});
+
+test("restore authenticates one decrypted backup without retrying a wrong passphrase", async t => {
+  const recovery = Buffer.from("recovery passphrase for test"), noFallback = { withConfig: () => assert.fail("must not retry under another config") };
+  const base = withoutAgentRegistry(MAINNET), source = await fixture(t, { config: base }), out = join(source.parent, "pre-registry-backup.json");
+  await source.store.createOrLoad();
+  await backupWallet(base, source.store, out, password, recovery);
+  await assert.rejects(restoreCurrentOrPreRegistry(MAINNET, noFallback, out, Buffer.from("wrong recovery passphrase")), { code: "backup_authentication_failed" });
+
+  const previous = previousImplementationConfig(base), old = await fixture(t, { existing: true }), oldStore = new WalletStore(previous, old.deps), oldOut = join(old.parent, "old-backup.json");
+  await oldStore.initialize(limits, password);
+  await backupWallet(previous, oldStore, oldOut, password, recovery);
+  await assert.rejects(restoreCurrentOrPreRegistry(MAINNET, noFallback, oldOut, recovery), { code: "backup_authentication_failed" });
+
+  const current = await fixture(t), currentOut = join(current.parent, "current-backup.json"), target = await fixture(t, { existing: true });
+  const wallet = await current.store.createOrLoad();
+  await backupWallet(MAINNET, current.store, currentOut, password, recovery);
+  const store = new WalletStore(MAINNET, target.deps);
+  await restoreCurrentOrPreRegistry(MAINNET, Object.assign(store, { withConfig: noFallback.withConfig }), currentOut, recovery);
+  assert.equal((await store.createOrLoad()).account, wallet.account);
+});
+
+test("the upgrade command only points a current wallet to capability approval when it is pending", async t => {
+  const base = withoutAgentRegistry(MAINNET), f = await fixture(t, { config: base }), store = new WalletStore(MAINNET, f.deps);
+  await f.store.createOrLoad();
+  assert.equal((await reviewUpgrade(f.store, base)).registryPending, false);
+  const pending = await reviewUpgrade(store, MAINNET);
+  assert.equal(pending.review.wallet.network_id, MAINNET.identity.networkId); assert.equal(pending.registryPending, true);
+  await approveCapabilities(store, base, MAINNET, password, digest(await reviewCapabilities(store, base, MAINNET)));
+  const approved = await reviewUpgrade(store, MAINNET);
+  assert.equal(approved.review.wallet.network_id, MAINNET.identity.networkId); assert.equal(approved.registryPending, false);
 });
 
 test("an RPC failure during signature validation is not reported as an invalid signature", async () => {

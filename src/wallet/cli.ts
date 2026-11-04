@@ -4,7 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { timingSafeEqual } from "node:crypto";
 import { formatUnits } from "viem";
 import { z } from "zod";
-import { loadConfig, parseConfig } from "../config.js";
+import { loadConfig, parseConfig, type Config } from "../config.js";
 import { Ctx } from "../context.js";
 import { WalletError } from "./keystore.js";
 import { WALLET_CANDIDATE_SIGNING_ENABLED, WalletService } from "./service.js";
@@ -16,7 +16,7 @@ import { withoutAgentRegistry } from "../account-upgrade.js";
 import { backupWallet, migrateWallet, restoreCurrentOrPreRegistry, restoreWallet, reviewImplementationBackup } from "./backup.js";
 import { approveCapabilities, reviewCapabilities } from "./capabilities.js";
 import { approveImplementation, reviewImplementation, type implementationReview } from "./implementation.js";
-import { localWalletStore } from "./store.js";
+import { localWalletStore, type WalletStore } from "./store.js";
 import { walletProfile } from "../wallet-profile.js";
 
 export function requireTerminal() {
@@ -59,6 +59,17 @@ async function policyPrompt() {
   const path = await textPrompt("Policy JSON path (see docs/wallet-policy.example.json; amounts are raw token units): ");
   try { return limitsSchema.parse(JSON.parse(await readFile(resolve(path), "utf8"))); }
   catch { throw new WalletError("policy_denied", "Invalid policy JSON; no policy changed"); }
+}
+
+/** Upgrades keep capabilities unchanged, so review against the manifest without the registry. */
+export async function reviewUpgrade(current: WalletStore, config: Config) {
+  const target = withoutAgentRegistry(config), store = current.withConfig(target);
+  try { return { target, store, review: await reviewImplementation(store, target), registryPending: !!config.manifest.agentRegistry }; }
+  catch (error) {
+    // Only a wallet already on the current implementation can have approved the registry.
+    if ((error as { code?: string }).code !== "capability_manifest_unapproved") throw error;
+    return { target, store, review: await reviewImplementation(current, config), registryPending: false };
+  }
 }
 
 function displayImplementationReview(review: ReturnType<typeof implementationReview>) {
@@ -172,14 +183,11 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
     return;
   }
   if (implementation) {
-    // Upgrades keep capabilities unchanged, so target the manifest without the registry.
-    const target = withoutAgentRegistry(config), store = service.store.withConfig(target);
-    const review = await reviewImplementation(store, target).catch(error => {
-      // Only a wallet already on the current implementation can have approved the registry.
-      if ((error as { code?: string }).code !== "capability_manifest_unapproved") throw error;
-      return reviewImplementation(service.store, config);
-    });
-    if (review.wallet.network_id === config.identity.networkId) { console.error("This wallet already uses the current implementation. Use setup to review its policy."); return; }
+    const { target, store, review, registryPending } = await reviewUpgrade(service.store, config);
+    if (review.wallet.network_id === config.identity.networkId) {
+      console.error(`This wallet already uses the current implementation. ${registryPending ? "To use the Agent Registry, run wallet capabilities approve next." : "Use setup to review its policy."}`);
+      return;
+    }
     displayImplementationReview(review);
     const initialLimits = review.wallet.policy.configured ? undefined : await policyPrompt();
     if (initialLimits) console.error(JSON.stringify(initialLimits, null, 2));

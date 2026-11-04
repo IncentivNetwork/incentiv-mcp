@@ -148,7 +148,7 @@ export class WalletChain {
       await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, current)));
     } catch (error) {
       if (error instanceof WalletError) throw error;
-      throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry this request");
+      throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry, using a new request UUID if this request now shows failed");
     }
   }
   async registryStatus(wallet: WalletEnvelope, parent?: Address) {
