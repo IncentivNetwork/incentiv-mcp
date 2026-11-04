@@ -207,7 +207,9 @@ test("a released default-config wallet approves the registry without a previous 
   const base = withoutAgentRegistry(MAINNET), f = await fixture(t, { config: base }), before = await f.store.createOrLoad();
   const store = new WalletStore(MAINNET, f.deps);
   assert.equal((await store.createOrLoad()).manifest_id, base.manifest.manifestId);
-  await approveCapabilities(store, base, MAINNET, password, digest(await reviewCapabilities(store, base, MAINNET)));
+  const review = await reviewCapabilities(store, base, MAINNET);
+  assert.equal(review.note, undefined);
+  await approveCapabilities(store, base, MAINNET, password, digest(review));
   const after = await store.createOrLoad();
   assert.equal(after.account, before.account); assert.equal(after.manifest_id, MAINNET.manifest.manifestId);
 });
@@ -392,8 +394,12 @@ test("a wallet that approved older registry pins keeps working and approves new 
   other.manifest.contracts.swapRouter.codeHash = `0x${"34".repeat(32)}`;
   other.manifest.manifestId = configurationId(other.manifest, "manifestId");
   await assert.rejects(reviewCapabilities(f.store, other, next), { code });
-  await approveCapabilities(f.store, previous, next, password, digest(await reviewCapabilities(f.store, previous, next)));
+  // The review says these pins replace older ones; once approved there is nothing left to say.
+  const pinReview = await reviewCapabilities(f.store, previous, next);
+  assert.match(pinReview.note, /previously approved different Agent Registry pins/);
+  await approveCapabilities(f.store, previous, next, password, digest(pinReview));
   assert.deepEqual(await approval(f.store), [next.manifest.manifestId, base.manifest.manifestId]);
+  assert.equal((await reviewCapabilities(f.store, previous, next)).note, undefined);
   f.chain.clients.splice(0, f.chain.clients.length);
   assert.equal((await f.service.registryStatus()).deployed, false);
 });

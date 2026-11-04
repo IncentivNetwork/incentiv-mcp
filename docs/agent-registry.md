@@ -40,7 +40,7 @@ Approval preserves wallet identity, addresses, keys and journal history. It refu
 
 If your wallet is on the older account implementation, run `wallet upgrade-implementation` first, then the commands above. Implementation upgrades cannot also change capabilities. Backups from before the registry restore with `wallet restore --in`, followed by the same steps.
 
-The manifest pins the proxy and implementation bytecode, implementation slot and EIP-712 domain. These are checked before every registry operation and at capability approval, not at startup. After a registry upgrade, registry tools return `registry_verification_failed` and capability approval fails until a reviewed capability update, while transfers, swaps and reconciliation continue. A release with new registry pins does not stop other wallet use either: registry tools report `capability_manifest_unapproved` until you run `wallet capabilities approve`, with no config file needed. `registry_rpc_unavailable` is temporary: retry the same request. No retired registry is used.
+The manifest pins the proxy and implementation bytecode, implementation slot and EIP-712 domain. These are checked before every registry operation and at capability approval, not at startup. After a registry upgrade, registry tools return `registry_verification_failed` and capability approval fails until a reviewed capability update, while transfers, swaps and reconciliation continue. A release with new registry pins does not stop other wallet use either: registry tools report `capability_manifest_unapproved` until you run `wallet capabilities approve`, with no config file needed. The wallet stores only manifest IDs, so that review can't show the old pins: it notes that different pins were approved before and shows the new ones as added. `registry_rpc_unavailable` is temporary: retry the same request. No retired registry is used.
 
 ## Expiry, cancellation and unlink
 
@@ -52,7 +52,7 @@ An uncertain submission retains signed bytes, nonce ownership and gas reservatio
 
 Call `unlink_agent` with the expected parent to disconnect locally. Portal lists agents with individual **Disconnect** actions, and shows an account linked as an agent with its own disconnect action. Unlink needs no consent signature from the other side.
 
-Confirmation requires a canonical confirmed receipt, its matching EntryPoint event and the expected registry event inside that user operation's execution log interval, after `BeforeExecution` or the previous operation event. A different operation in the same bundle cannot supply confirmation. All writes use `executeBatch`, so TransferGate rejection reverts execution.
+Confirmation requires a canonical confirmed receipt and its matching EntryPoint event. The expected registry event is then looked for inside that user operation's execution log interval, after `BeforeExecution` or the previous operation event. If it isn't there, the operation still settles and reports `registry_event_missing` rather than blocking the wallet. A different operation in the same bundle cannot supply the event. All writes use `executeBatch`, so TransferGate rejection reverts execution.
 
 ## Validation
 
