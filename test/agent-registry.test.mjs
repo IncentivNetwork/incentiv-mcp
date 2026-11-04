@@ -372,6 +372,27 @@ test("uncertain token-paid replacement retries exact signed bytes and retains bo
   await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "273" }));
 });
 
+test("a stuck token-paid link can be replaced with native gas when requested", async t => {
+  const f = await tokenRegistryFixture(t), id = randomUUID(), balances = f.chain.balances;
+  await f.service.send("link_agent", { request_id: id, approval: f.approval, gas_token: "USDC" });
+  f.chain.balances = async (...a) => ({ ...await balances(...a), native: "1000000" });
+  f.chain.buildReplacement = (wallet, original, state, gasToken) => {
+    assert.equal(gasToken, "native");
+    const built = unsigned(wallet, { to: wallet.account, amount: "0" }, state);
+    built.op.maxFeePerGas = 2n; built.op.maxPriorityFeePerGas = 2n;
+    built.userOpHash = computeUserOpHash(built.op, MAINNET.identity.entryPoint.address, 24101);
+    return built;
+  };
+  const record = (await f.service.reviewReplacement(id, true)).records[0];
+  assert.equal(record.replacement.gasToken, undefined); assert.equal(record.replacement.operation.paymaster, undefined);
+  assert.equal(record.replacement.operation.nonce, record.operation.nonce);
+  assert.equal((await f.service.replace(id, password, digest(record))).status, "superseding");
+  await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "123", native: record.replacement.maxGasCost }));
+  f.chain.receipt = async r => r.userOpHash === record.replacement.userOpHash ? { success: true, actualGasCost: 400n, transactionHash: `0x${"66".repeat(32)}` } : undefined;
+  assert.equal((await f.service.operation(id)).status, "superseded");
+  await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { native: "400" }));
+});
+
 test("replacement validation rejects a changed token payment before signing", async t => {
   const f = await tokenRegistryFixture(t), id = randomUUID();
   await f.service.send("link_agent", { request_id: id, approval: f.approval, gas_token: "USDC" });

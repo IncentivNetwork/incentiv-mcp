@@ -32,6 +32,7 @@ if (args[0] === "--help" || args[0] === "-h" || (args[0] === "setup" && args[1] 
   incentiv-mcp --wallet-profile NAME setup   Set up a separate named wallet
   incentiv-mcp wallet doctor                 Check network and bundler without opening a wallet
   incentiv-mcp wallet upgrade-implementation Approve the supported account upgrade (starts disabled)
+  incentiv-mcp wallet capabilities approve   Approve the Agent Registry capability (starts disabled)
   incentiv-mcp wallet disable                Stop new signing and rebroadcast
   incentiv-mcp wallet backup --out FILE      Create a verified encrypted backup
   incentiv-mcp wallet restore --in FILE      Restore into an empty profile (starts disabled)

@@ -125,7 +125,8 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   const configure = args.join(" ") === "policy configure";
   const approve = args[0] === "approve" && args.length === 2;
   const replacing = args[3] === "--replace";
-  const resolveOperation = args[0] === "operation" && args[1] === "resolve" && (args.length === 3 || (args.length === 4 && replacing));
+  const nativeGas = args[4] === "--native-gas";
+  const resolveOperation = args[0] === "operation" && args[1] === "resolve" && (args.length === 3 || (args.length === 4 && replacing) || (args.length === 5 && replacing && nativeGas));
   const backup = args[0] === "backup" && args[1] === "--out" && args.length === 3;
   const restoreUpgrade = args.length === 4 && args[3] === "--upgrade-implementation";
   const restore = args[0] === "restore" && args[1] === "--in" && (args.length === 3 || restoreUpgrade);
@@ -133,7 +134,7 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   const recover = args.length === 1 && args[0] === "recover";
   const capabilities = args[0] === "capabilities" && args[1] === "approve" && (args.length === 2 || (args.length === 4 && args[2] === "--previous"));
   const implementation = args.length === 1 && args[0] === "upgrade-implementation";
-  if (!configure && !approve && !resolveOperation && !backup && !restore && !initialize && !recover && !capabilities && !implementation) throw new WalletError("validation_failed", "Commands: wallet doctor | init | policy configure | test-transfer --request <file> | capabilities approve [--previous <config.json>] | upgrade-implementation | recover | approve <uuid> | disable | operation resolve <uuid> [--replace] | backup --out <file> | restore --in <file> [--upgrade-implementation] | migrate [1]");
+  if (!configure && !approve && !resolveOperation && !backup && !restore && !initialize && !recover && !capabilities && !implementation) throw new WalletError("validation_failed", "Commands: wallet doctor | init | policy configure | test-transfer --request <file> | capabilities approve [--previous <config.json>] | upgrade-implementation | recover | approve <uuid> | disable | operation resolve <uuid> [--replace [--native-gas]] | backup --out <file> | restore --in <file> [--upgrade-implementation] | migrate [1]");
   requireTerminal();
   if (initialize) {
     console.error(`Wallet profile: ${profile}; directory: ${walletProfile(profile).root}`);
@@ -207,7 +208,7 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
     return;
   }
   const id = approve ? args[1].toLowerCase() : resolveOperation ? args[2].toLowerCase() : undefined;
-  const review = resolveOperation && replacing ? await service.reviewReplacement(id!) : await service.review(id);
+  const review = resolveOperation && replacing ? await service.reviewReplacement(id!, nativeGas) : await service.review(id);
   if (replacing) console.error("The displayed replacement sends zero value to this account at the SAME nonce and uses the displayed gas token and payment (native gas up to maxGasCost, or gasToken/gasCharge for token gas). Either the original or replacement can win; no reservation is released until a receipt is verified.");
   console.error(JSON.stringify(review, null, 2));
   if (review.wallet.storage === "file") console.error("File-key mode does not protect against a shell-capable agent running as this OS user.");

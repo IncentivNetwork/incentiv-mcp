@@ -177,12 +177,12 @@ export class WalletChain {
       for (const key of ["callGasLimit", "verificationGasLimit", "preVerificationGas"] as const) if (BigInt(estimate[key]) > op[key] || BigInt(estimate[key]) <= 0n) throw new Error();
     } catch { throw new WalletError("simulation_failed", "The exact validated operation failed simulation or exceeds its gas allocation"); }
   }
-  async buildReplacement(wallet: WalletEnvelope, original: OperationRecord, state: ChainState) {
+  async buildReplacement(wallet: WalletEnvelope, original: OperationRecord, state: ChainState, gasToken = original.intent.gasToken) {
     const old = userOpFromWire(original.operation!);
     if (state.nonce !== old.nonce) throw new WalletError("operation_pending", "The original nonce has moved; locate its receipt before resolution");
     const bump = (n: bigint) => n * 120n / 100n + 1n;
     const fees = { ...state.fees, maxFeePerGas: state.fees.maxFeePerGas > bump(old.maxFeePerGas) ? state.fees.maxFeePerGas : bump(old.maxFeePerGas), maxPriorityFeePerGas: state.fees.maxPriorityFeePerGas > bump(old.maxPriorityFeePerGas) ? state.fees.maxPriorityFeePerGas : bump(old.maxPriorityFeePerGas) };
-    return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, state: { ...state, fees }, calls: [{ to: wallet.account as Address, value: 0n, data: "0x" }], gasToken: await this.token(original.intent.gasToken) });
+    return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, state: { ...state, fees }, calls: [{ to: wallet.account as Address, value: 0n, data: "0x" }], gasToken: await this.token(gasToken) });
   }
   async relay(operation: Record<string, string>, beforeSubmit?: () => Promise<void>): Promise<string> {
     await beforeSubmit?.();

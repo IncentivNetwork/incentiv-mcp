@@ -315,18 +315,20 @@ export class WalletService {
     });
   }
 
-  async reviewReplacement(id: string) {
+  async reviewReplacement(id: string, nativeGas = false) {
     return this.store.session(async s => {
       await this.enabled(s);
       const journal = await Journal.open(s); await this.reconcile(journal);
       const r = journal.data.records.find(r => r.requestId === id);
       if (!r || !ownsNonce(r.status) || r.replacement?.signed) throw new WalletError("operation_pending", "Replacement requires an unresolved original operation without a signed replacement");
       const state = await this.chain.state(s.envelope);
-      const built = await this.chain.buildReplacement(s.envelope, r, state);
+      // Native gas clears the nonce when the token balance or paymaster cannot.
+      const gasToken = nativeGas ? "native" : r.intent.gasToken;
+      const built = await this.chain.buildReplacement(s.envelope, r, state, gasToken);
       const wire = userOpToJson(built.op);
-      const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s, r.intent.gasToken), wire, { nonce: BigInt(r.nonce!), deployed: state.deployed, hash: built.userOpHash });
+      const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s, gasToken), wire, { nonce: BigInt(r.nonce!), deployed: state.deployed, hash: built.userOpHash });
       await this.chain.simulate(validated);
-      r.replacement = { operation: wire, userOpHash: validated.hash, maxGasCost: validated.gasCost.toString(), ...(r.intent.gasToken !== "native" ? { gasToken: r.intent.gasToken, gasCharge: validated.gasCharge.toString() } : {}), signed: false, expiresAt: Date.now() + 300_000 };
+      r.replacement = { operation: wire, userOpHash: validated.hash, maxGasCost: validated.gasCost.toString(), ...(gasToken !== "native" ? { gasToken, gasCharge: validated.gasCharge.toString() } : {}), signed: false, expiresAt: Date.now() + 300_000 };
       r.sequence = ++journal.data.sequence; await journal.save();
       return { wallet: publicWallet(s.envelope), records: [structuredClone(r)] };
     });
