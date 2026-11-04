@@ -3,8 +3,8 @@ import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { MAINNET, configurationId } from "../src/config.ts";
-import { assertImplementationUpgrade, previousImplementationConfig } from "../src/account-upgrade.ts";
+import { MAINNET as PACKAGED, configurationId } from "../src/config.ts";
+import { assertImplementationUpgrade, previousImplementationConfig, withoutAgentRegistry } from "../src/account-upgrade.ts";
 import { Ctx } from "../src/context.ts";
 import { deriveSmartAccount, NetworkError } from "../src/network.ts";
 import { WalletStore } from "../src/wallet/store.ts";
@@ -17,6 +17,8 @@ import { parseEnvelope, unlockWallet } from "../src/wallet/keystore.ts";
 import { exists } from "../src/wallet/files.ts";
 import { fixture, args, password, limits } from "../scripts/wallet-pipeline-fixture.mjs";
 
+// Implementation upgrades target the current manifest without the registry capability.
+const MAINNET = withoutAgentRegistry(PACKAGED);
 const previous = previousImplementationConfig(MAINNET);
 const snapshot = root => Promise.all(["wallet.json", "operations/journal.json"].map(async path => {
   try { return await readFile(join(root, "wallet", path)); }

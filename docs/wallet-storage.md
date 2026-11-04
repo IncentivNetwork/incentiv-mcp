@@ -171,7 +171,7 @@ waiting for this lock; sign and relay paths recheck it.
 | `unsupported_wallet_version` | An explicit format migration is required. |
 | `keystore_authentication_failed` | Authentication tag or locally rederived addresses disagree. |
 | `wallet_network_mismatch` | Wallet identity differs from configured/pinned identity. |
-| `capability_manifest_unapproved` | Capabilities differ from the wallet's approved manifest. |
+| `capability_manifest_unapproved` | Capabilities differ from the wallet's approved manifest. A wallet that only lacks approval of the current Agent Registry pins opens normally and gets this error from registry tools only. The authenticated `registryFreeManifestId` records what an approval covers apart from the registry. |
 | `wallet_recovery_required` | Other malformed, conflicting, incomplete, or inaccessible evidence. |
 
 Storage errors do not include raw credential-provider or filesystem error payloads.
@@ -182,12 +182,12 @@ Storage errors do not include raw credential-provider or filesystem error payloa
 incentiv-mcp wallet policy configure
 incentiv-mcp wallet doctor
 incentiv-mcp wallet init
-incentiv-mcp wallet capabilities approve --previous <config.json>
+incentiv-mcp wallet capabilities approve [--previous <config.json>]
 incentiv-mcp wallet recover
 incentiv-mcp wallet approve <request-id>
 incentiv-mcp wallet disable
 incentiv-mcp wallet operation resolve <request-id>
-incentiv-mcp wallet operation resolve <request-id> --replace
+incentiv-mcp wallet operation resolve <request-id> --replace [--native-gas]
 incentiv-mcp wallet backup --out <file>
 incentiv-mcp wallet restore --in <file>
 incentiv-mcp wallet migrate [1]
@@ -241,7 +241,8 @@ exceptions, export an encrypted backup or resolve/rebroadcast a stuck operation.
 Exception approval displays and binds the canonical intent, exact unsigned
 operation/hash, gas/payment limits, and swap minimum/deadline for at most five
 minutes. Retrying the same request ID consumes that exact approval. Replacement
-review builds a zero-value self-transfer at the original nonce with native gas;
+review builds a zero-value self-transfer at the original nonce using the original operation’s gas token,
+or native gas with `--native-gas` when the token balance or paymaster cannot cover it;
 either original or replacement may win. Both reservations remain until a verified
 receipt resolves the nonce. Disabling prevents either from being rebroadcast.
 

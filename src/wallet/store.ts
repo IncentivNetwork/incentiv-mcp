@@ -2,13 +2,13 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { readdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { canonicalJson, parseConfig, type Config } from "../config.js";
-import { assertWalletNetwork, NetworkError, verifyWalletSession } from "../network.js";
+import { assertWalletNetwork, NetworkError, verifyWalletSession, type NetworkScope } from "../network.js";
 import { walletProfile } from "../wallet-profile.js";
 import { assertImplementationUpgrade } from "../account-upgrade.js";
 import { nativeCredentials, type CredentialStore } from "./credentials.js";
 import { exists, isMissing, prepareRoot, privateDirectory, readJson, readPrivate, replacePublic, syncDirectory, verifyTree, writeNew } from "./files.js";
 import { creationLock } from "./lock.js";
-import { authenticateWallet, bindingSchema, generateOwnerKey, parseEnvelope, publicWallet, sealWallet, unlockWallet, WalletError, type WalletBinding, type WalletEnvelope } from "./keystore.js";
+import { authenticateWallet, bindingSchema, generateOwnerKey, manifestApproval, parseEnvelope, publicWallet, sealWallet, unlockWallet, WalletError, type WalletBinding, type WalletEnvelope } from "./keystore.js";
 import { replacePrivate, removeOwned } from "./files.js";
 import { limitsSchema, newAdministration, type Limits, type Policy } from "./policy.js";
 import { Journal, type JournalData } from "./journal.js";
@@ -72,6 +72,9 @@ export class WalletStore {
     }
   }
 
+  /** The same wallet storage under another configuration, for reviewed CLI transitions. */
+  withConfig(config: Config) { return new WalletStore(config, this.deps); }
+
   reviewOrphan() { return orphanRecovery(this.deps); }
   recoverOrphan(passphrase: Buffer, reviewedDigest: string) { return orphanRecovery(this.deps, { passphrase, reviewedDigest }); }
 
@@ -125,7 +128,7 @@ export class WalletStore {
     }
   }
 
-  private async run<T>(work?: (session: WalletSession) => Promise<T>, restoring?: RestoreSnapshot, previous?: Config, initialPolicy?: Extract<Policy, { configured: true }>, transitionScope: "local" | "all" = "all"): Promise<T | ReturnType<typeof publicWallet>> {
+  private async run<T>(work?: (session: WalletSession) => Promise<T>, restoring?: RestoreSnapshot, previous?: Config, initialPolicy?: Extract<Policy, { configured: true }>, transitionScope: NetworkScope = "capability"): Promise<T | ReturnType<typeof publicWallet>> {
     const { root } = this.deps;
     await prepareRoot(root);
     const lock = await creationLock(root, this.deps.lockTimeoutMs);
@@ -178,7 +181,7 @@ export class WalletStore {
         try {
           ownerKey = restoring ? unlockWallet(this.config, restoring.envelope, restoring.wrappingKey) : generateOwnerKey();
           const policy: Policy | undefined = restoring?.envelope.policy.configured ? { ...restoring.envelope.policy, enabled: false, restored: true } : initialPolicy;
-          const envelope = sealWallet(this.config, binding, ownerKey, wrappingKey, policy);
+          const envelope = sealWallet(this.config, binding, ownerKey, wrappingKey, policy, restoring ? manifestApproval(restoring.envelope) : undefined);
           const staging = join(root, `wallet.tmp-${binding.walletId}`);
           if (binding.storage === "credential-store") {
             await (await getCredentials()).create(credentialNames(binding).pending, wrappingKey);
@@ -222,6 +225,9 @@ export class WalletStore {
       // Never obtain a wrapping key before network/manifest verification.
       let authenticationConfig = previous && envelope.approvedCapabilityManifestId === previous.manifest.manifestId ? previous : this.config;
       if (previous) {
+        // A transition starts from the reviewed previous manifest, from the proposed one, or from older
+        // registry pins over the reviewed registry-free manifest.
+        if (authenticationConfig === this.config && envelope.approvedCapabilityManifestId !== this.config.manifest.manifestId && envelope.registryFreeManifestId !== previous.manifest.manifestId) throw new NetworkError("capability_manifest_unapproved", "The wallet's approved manifest is not the reviewed previous manifest. Review it with wallet capabilities approve in your local terminal");
         assertWalletNetwork(authenticationConfig, envelope);
         await this.deps.verify(this.config, undefined, transitionScope);
       } else await this.deps.verify(this.config, envelope);
@@ -301,7 +307,7 @@ export class WalletStore {
               await lock.assertOwned();
               const owner = unlockWallet(authenticationConfig, session.envelope, key);
               try {
-                const updated = sealWallet(this.config, binding, owner, key, policy);
+                const updated = sealWallet(this.config, binding, owner, key, policy, previous ? undefined : manifestApproval(session.envelope));
                 if (updated.account !== session.envelope.account || updated.owner !== session.envelope.owner || updated.walletId !== session.envelope.walletId) throw new WalletError("wallet_recovery_required", "Wallet update would change its owner or account");
                 await replacePrivate(join(target, "wallet.json"), canonicalJson(updated));
                 authenticateWallet(this.config, parseEnvelope(await readJson(join(target, "wallet.json"))), key);

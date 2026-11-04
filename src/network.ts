@@ -1,7 +1,9 @@
+import { agentRegistryAbi, registryPinsMatch, REGISTRY_IMPLEMENTATION_SLOT } from "./agent-registry.js";
+import { decodeFunctionResult } from "viem";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { concatHex, encodeAbiParameters, encodeFunctionData, getContractAddress, keccak256, parseAbi, toHex, type Address, type Hex } from "viem";
-import { canonicalJson, localContractPins, parseConfig, remoteContractPins, type Config, type ContractPin, type WalletNetworkIdentity } from "./config.js";
+import { canonicalJson, localContractPins, parseConfig, registryContractPins, remoteContractPins, withoutAgentRegistry, type Config, type ContractPin, type WalletNetworkIdentity } from "./config.js";
 
 export class NetworkError extends Error {
   constructor(readonly code: "wallet_network_mismatch" | "capability_manifest_unapproved" | "network_verification_failed", message: string) {
@@ -18,12 +20,16 @@ export function walletDirectory(): string {
 export function assertWalletNetwork(cfg: Config, wallet: {
   networkIdentity: WalletNetworkIdentity;
   approvedCapabilityManifestId: Hex;
+  registryFreeManifestId?: Hex;
 }): void {
   if (canonicalJson(wallet.networkIdentity) !== canonicalJson(cfg.identity)) {
     throw new NetworkError("wallet_network_mismatch", "The existing wallet belongs to a different network identity. For the supported Incentiv account upgrade, use wallet upgrade-implementation in your local terminal");
   }
-  if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId) {
-    throw new NetworkError("capability_manifest_unapproved", "The wallet has not approved this capability manifest");
+  // The registry is optional: a wallet that has not approved these registry pins keeps every other capability
+  // it did approve. Registry operations require approval themselves (assertRegistryApproved).
+  const registryFree = withoutAgentRegistry(cfg).manifest.manifestId;
+  if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId && wallet.approvedCapabilityManifestId !== registryFree && wallet.registryFreeManifestId !== registryFree) {
+    throw new NetworkError("capability_manifest_unapproved", "The wallet has not approved this capability manifest. Review it with wallet capabilities approve in your local terminal");
   }
 }
 
@@ -91,9 +97,12 @@ async function verifyPins(url: string, pins: ContractPin[], block: Hex, request:
   }));
 }
 
-/** Always verify all local pins; bridge use and capability approval also verify remotes. */
-export async function verifyNetwork(cfg: Config, request: RpcRequest = rpcRequest, scope: "local" | "all" = "all"): Promise<void> {
+export type NetworkScope = "local" | "all" | "capability";
+
+/** Always verify all local pins; bridge use also verifies remotes; capability approval also verifies the registry. */
+export async function verifyNetwork(cfg: Config, request: RpcRequest = rpcRequest, scope: NetworkScope = "all"): Promise<void> {
   parseConfig(cfg);
+  const checkRegistry = scope === "capability" && !!cfg.manifest.agentRegistry;
   const verifyChain = async (url: string, expectedChain: number, pins: ContractPin[], local: boolean, label: string) => {
     try {
       const chain = await request(url, "eth_chainId", []);
@@ -107,6 +116,13 @@ export async function verifyNetwork(cfg: Config, request: RpcRequest = rpcReques
       await verifyPins(url, pins, block as Hex, request);
       if (local) {
         const call = (to: Address, data: Hex) => request(url, "eth_call", [{ to, data }, block]);
+        if (checkRegistry) {
+          const proxy = cfg.manifest.agentRegistry!.proxy.address;
+          const slot = await request(url, "eth_getStorageAt", [proxy, REGISTRY_IMPLEMENTATION_SLOT, block]);
+          const data = await call(proxy, encodeFunctionData({ abi: agentRegistryAbi, functionName: "eip712Domain" }));
+          const domain = decodeFunctionResult({ abi: agentRegistryAbi, functionName: "eip712Domain", data: data as Hex });
+          if (!registryPinsMatch(cfg, slot as string, domain)) throw new Error("Registry implementation or signing domain mismatch");
+        }
         const { accountFactory, accountBeacon, accountImplementation } = cfg.identity;
         const beacon = await call(accountFactory.address, encodeFunctionData({ abi: factoryAbi, functionName: "accountBeacon" }));
         const implementation = await call(accountBeacon.address, encodeFunctionData({ abi: beaconAbi, functionName: "implementation" }));
@@ -119,14 +135,14 @@ export async function verifyNetwork(cfg: Config, request: RpcRequest = rpcReques
       }
     } catch (error) {
       // Avoid forwarding RPC bodies, URL credentials or generic serialized objects.
-      const reason = error instanceof RpcUnavailable || (error instanceof Error && /^(Chain ID|Genesis hash|Contract code|Factory beacon|Account implementation|Factory derivation|Invalid block)/.test(error.message))
+      const reason = error instanceof RpcUnavailable || (error instanceof Error && /^(Chain ID|Genesis hash|Contract code|Factory beacon|Account implementation|Factory derivation|Registry |Invalid block)/.test(error.message))
         ? error.message : "RPC verification unavailable";
       throw new NetworkError("wallet_network_mismatch", `${label}: ${reason}`);
     }
   };
   await Promise.all([
-    ...cfg.endpoints.rpcUrls.map((url, index) => verifyChain(url, cfg.identity.chainId, localContractPins(cfg), true, `local RPC ${index + 1}`)),
-    ...(scope === "all" && cfg.manifest.bridge.enabled ? Object.entries(cfg.manifest.bridge.remoteChains).flatMap(([name, chain]) =>
+    ...cfg.endpoints.rpcUrls.map((url, index) => verifyChain(url, cfg.identity.chainId, [...localContractPins(cfg), ...(checkRegistry ? registryContractPins(cfg) : [])], true, `local RPC ${index + 1}`)),
+    ...(scope !== "local" && cfg.manifest.bridge.enabled ? Object.entries(cfg.manifest.bridge.remoteChains).flatMap(([name, chain]) =>
       cfg.endpoints.remoteChains[name].rpcUrls.map((url, index) => verifyChain(url, chain.chainId, remoteContractPins(cfg, name), false, `${name} RPC ${index + 1}`))) : []),
   ]);
 }
@@ -141,7 +157,7 @@ export function networkStatusFields(cfg: Config) {
 }
 
 /** Phase 3 calls this before wallet creation/loading and every signing session. */
-export async function verifyWalletSession(cfg: Config, wallet?: Parameters<typeof assertWalletNetwork>[1], scope: "local" | "all" = "local"): Promise<void> {
+export async function verifyWalletSession(cfg: Config, wallet?: Parameters<typeof assertWalletNetwork>[1], scope: NetworkScope = "local"): Promise<void> {
   if (wallet) assertWalletNetwork(cfg, wallet);
   await verifyNetwork(cfg, undefined, scope);
 }

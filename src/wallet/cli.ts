@@ -4,18 +4,19 @@ import { createInterface } from "node:readline/promises";
 import { timingSafeEqual } from "node:crypto";
 import { formatUnits } from "viem";
 import { z } from "zod";
-import { loadConfig, parseConfig } from "../config.js";
+import { loadConfig, parseConfig, type Config } from "../config.js";
 import { Ctx } from "../context.js";
 import { WalletError } from "./keystore.js";
-import { WALLET_CANDIDATE_SIGNING_ENABLED, WalletService } from "./service.js";
+import { assertNeedsApproval, WALLET_CANDIDATE_SIGNING_ENABLED, WalletService } from "./service.js";
 import { NetworkError, verifyNetwork } from "../network.js";
 import { bundlerRpc } from "../userop.js";
 import { address, authorize, limitsSchema } from "./policy.js";
 import { digest, terminal } from "./journal.js";
+import { withoutAgentRegistry } from "../account-upgrade.js";
 import { backupWallet, migrateWallet, restoreWallet, reviewImplementationBackup } from "./backup.js";
 import { approveCapabilities, reviewCapabilities } from "./capabilities.js";
 import { approveImplementation, reviewImplementation, type implementationReview } from "./implementation.js";
-import { localWalletStore } from "./store.js";
+import { localWalletStore, type WalletStore } from "./store.js";
 import { walletProfile } from "../wallet-profile.js";
 
 export function requireTerminal() {
@@ -58,6 +59,17 @@ async function policyPrompt() {
   const path = await textPrompt("Policy JSON path (see docs/wallet-policy.example.json; amounts are raw token units): ");
   try { return limitsSchema.parse(JSON.parse(await readFile(resolve(path), "utf8"))); }
   catch { throw new WalletError("policy_denied", "Invalid policy JSON; no policy changed"); }
+}
+
+/** Upgrades keep capabilities unchanged, so review against the manifest without the registry. */
+export async function reviewUpgrade(current: WalletStore, config: Config) {
+  const target = withoutAgentRegistry(config), store = current.withConfig(target);
+  try { return { target, store, review: await reviewImplementation(store, target), registryPending: !!config.manifest.agentRegistry }; }
+  catch (error) {
+    // Only a wallet already on the current implementation can have approved the registry.
+    if ((error as { code?: string }).code !== "capability_manifest_unapproved") throw error;
+    return { target, store, review: await reviewImplementation(current, config), registryPending: false };
+  }
 }
 
 function displayImplementationReview(review: ReturnType<typeof implementationReview>) {
@@ -124,15 +136,16 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   const configure = args.join(" ") === "policy configure";
   const approve = args[0] === "approve" && args.length === 2;
   const replacing = args[3] === "--replace";
-  const resolveOperation = args[0] === "operation" && args[1] === "resolve" && (args.length === 3 || (args.length === 4 && replacing));
+  const nativeGas = args[4] === "--native-gas";
+  const resolveOperation = args[0] === "operation" && args[1] === "resolve" && (args.length === 3 || (args.length === 4 && replacing) || (args.length === 5 && replacing && nativeGas));
   const backup = args[0] === "backup" && args[1] === "--out" && args.length === 3;
   const restoreUpgrade = args.length === 4 && args[3] === "--upgrade-implementation";
   const restore = args[0] === "restore" && args[1] === "--in" && (args.length === 3 || restoreUpgrade);
   const initialize = args.length === 1 && args[0] === "init";
   const recover = args.length === 1 && args[0] === "recover";
-  const capabilities = args.length === 4 && args[0] === "capabilities" && args[1] === "approve" && args[2] === "--previous";
+  const capabilities = args[0] === "capabilities" && args[1] === "approve" && (args.length === 2 || (args.length === 4 && args[2] === "--previous"));
   const implementation = args.length === 1 && args[0] === "upgrade-implementation";
-  if (!configure && !approve && !resolveOperation && !backup && !restore && !initialize && !recover && !capabilities && !implementation) throw new WalletError("validation_failed", "Commands: wallet doctor | init | policy configure | test-transfer --request <file> | capabilities approve --previous <config.json> | upgrade-implementation | recover | approve <uuid> | disable | operation resolve <uuid> [--replace] | backup --out <file> | restore --in <file> [--upgrade-implementation] | migrate [1]");
+  if (!configure && !approve && !resolveOperation && !backup && !restore && !initialize && !recover && !capabilities && !implementation) throw new WalletError("validation_failed", "Commands: wallet doctor | init | policy configure | test-transfer --request <file> | capabilities approve [--previous <config.json>] | upgrade-implementation | recover | approve <uuid> | disable | operation resolve <uuid> [--replace [--native-gas]] | backup --out <file> | restore --in <file> [--upgrade-implementation] | migrate [1]");
   requireTerminal();
   if (initialize) {
     console.error(`Wallet profile: ${profile}; directory: ${walletProfile(profile).root}`);
@@ -154,8 +167,14 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   }
   if (capabilities) {
     let previous;
-    try { previous = parseConfig(JSON.parse(await readFile(resolve(args[3]), "utf8"))); }
-    catch { throw new WalletError("validation_failed", "Previous configuration must be a complete valid configuration file"); }
+    if (args.length === 2) {
+      // Without --previous, the only derivable transition is adding the registry capability.
+      if (!config.manifest.agentRegistry) throw new WalletError("validation_failed", "This configuration adds no Agent Registry capability; use --previous <config.json>");
+      previous = withoutAgentRegistry(config);
+    } else {
+      try { previous = parseConfig(JSON.parse(await readFile(resolve(args[3]), "utf8"))); }
+      catch { throw new WalletError("validation_failed", "Previous configuration must be a complete valid configuration file"); }
+    }
     const review = await reviewCapabilities(service.store, previous, config); console.error(JSON.stringify(review, null, 2));
     if (await textPrompt("Type APPROVE CAPABILITIES to preserve this account, approve the displayed manifest and disable signing until policy review: ") !== "APPROVE CAPABILITIES") throw new WalletError("policy_denied", "Action cancelled");
     const administration = await secretPrompt("Administration passphrase: ");
@@ -164,15 +183,19 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
     return;
   }
   if (implementation) {
-    const review = await reviewImplementation(service.store, config);
-    if (review.wallet.network_id === config.identity.networkId) { console.error("This wallet already uses the current implementation. Use setup to review its policy."); return; }
+    const { target, store, review, registryPending } = await reviewUpgrade(service.store, config);
+    if (review.wallet.network_id === config.identity.networkId) {
+      console.error(`This wallet already uses the current implementation. Use setup to review its policy.${registryPending ? " To use the Agent Registry, run wallet capabilities approve first." : ""}`);
+      return;
+    }
     displayImplementationReview(review);
     const initialLimits = review.wallet.policy.configured ? undefined : await policyPrompt();
     if (initialLimits) console.error(JSON.stringify(initialLimits, null, 2));
     if (await textPrompt("Type UPGRADE IMPLEMENTATION to approve this local wallet update: ") !== "UPGRADE IMPLEMENTATION") throw new WalletError("policy_denied", "Action cancelled");
     const administration = review.wallet.policy.configured ? await secretPrompt("Existing administration passphrase: ") : await confirmedSecret("Choose administration passphrase (at least 12 bytes): ");
-    try { console.error(JSON.stringify(await approveImplementation(service.store, config, administration, digest(review), initialLimits), null, 2)); }
+    try { console.error(JSON.stringify(await approveImplementation(store, target, administration, digest(review), initialLimits), null, 2)); }
     finally { administration.fill(0); }
+    if (config.manifest.agentRegistry) console.error("To use the Agent Registry, run wallet capabilities approve next.");
     console.error("Review wallet policy before enabling sending. Pending operations can be checked without enabling sending.");
     return;
   }
@@ -181,10 +204,11 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
     const recovery = await secretPrompt("Recovery passphrase: ");
     try {
       if (restoreUpgrade) {
-        const review = await reviewImplementationBackup(config, resolve(args[2]), recovery); displayImplementationReview(review);
+        const target = withoutAgentRegistry(config);
+        const review = await reviewImplementationBackup(target, resolve(args[2]), recovery); displayImplementationReview(review);
         if (await textPrompt("Type RESTORE AND UPGRADE to restore this old backup with the reviewed implementation: ") !== "RESTORE AND UPGRADE") throw new WalletError("policy_denied", "Action cancelled");
         const administration = await secretPrompt("Existing wallet administration passphrase: ");
-        try { console.error(JSON.stringify(await restoreWallet(config, service.store, resolve(args[2]), recovery, { administration, reviewedDigest: digest(review) }), null, 2)); }
+        try { console.error(JSON.stringify(await restoreWallet(target, service.store.withConfig(target), resolve(args[2]), recovery, { administration, reviewedDigest: digest(review) }), null, 2)); }
         finally { administration.fill(0); }
       } else console.error(JSON.stringify(await restoreWallet(config, service.store, resolve(args[2]), recovery), null, 2));
     }
@@ -192,9 +216,10 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
     return;
   }
   const id = approve ? args[1].toLowerCase() : resolveOperation ? args[2].toLowerCase() : undefined;
-  const review = resolveOperation && replacing ? await service.reviewReplacement(id!) : await service.review(id);
-  if (replacing) console.error("The displayed replacement sends zero value to this account at the SAME nonce and pays native gas up to maxGasCost. Either the original or replacement can win; no reservation is released until a receipt is verified.");
+  const review = resolveOperation && replacing ? await service.reviewReplacement(id!, nativeGas) : await service.review(id);
+  if (replacing) console.error("The displayed replacement sends zero value to this account at the SAME nonce and uses the displayed gas token and payment (native gas up to maxGasCost, or gasToken/gasCharge for token gas). Either the original or replacement can win; no reservation is released until a receipt is verified.");
   console.error(JSON.stringify(review, null, 2));
+  if (approve && review.records[0]) assertNeedsApproval(review.records[0]);
   if (review.wallet.storage === "file") console.error("File-key mode does not protect against a shell-capable agent running as this OS user.");
   let limits;
   if (configure) {

@@ -18,6 +18,7 @@ export function implementationReview(config: Config, envelope: WalletEnvelope, j
 
 export async function prepareImplementationUpgrade(config: Config, envelope: WalletEnvelope, data: JournalData, administration: Buffer, initialLimits?: Limits) {
   const previous = previousImplementationConfig(config);
+  if (config.manifest.agentRegistry) throw new WalletError("policy_denied", "Implementation upgrades cannot add the Agent Registry capability; approve it separately afterward");
   assertWalletNetwork(previous, envelope);
   if (deriveSmartAccount(config, envelope.owner as `0x${string}`) !== envelope.account) throw new WalletError("wallet_recovery_required", "Implementation upgrade would change the account address");
   let policy: Policy;

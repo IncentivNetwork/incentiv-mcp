@@ -6,7 +6,10 @@ import type { WalletSession, WalletStore } from "./store.js";
 
 async function review(session: WalletSession, previous: Config, proposed: Config) {
   const journal = await Journal.open(session, !session.envelope.policy.configured);
-  return { wallet: publicWallet(session.envelope), previous_manifest: previous.manifest, proposed_manifest: proposed.manifest, records: journal.data.records, journal_sequence: journal.data.sequence };
+  const approved = session.envelope.approvedCapabilityManifestId;
+  // The envelope keeps only manifest IDs, so a registry pin update is diffed against the registry-free manifest.
+  const pinUpdate = approved !== previous.manifest.manifestId && approved !== proposed.manifest.manifestId;
+  return { wallet: publicWallet(session.envelope), ...(pinUpdate ? { note: "This wallet previously approved different Agent Registry pins. They are stored only as an ID and cannot be shown, so the registry block below replaces them even though it appears as newly added." } : {}), previous_manifest: previous.manifest, proposed_manifest: proposed.manifest, records: journal.data.records, journal_sequence: journal.data.sequence };
 }
 
 export function reviewCapabilities(store: WalletStore, previous: Config, proposed: Config) {

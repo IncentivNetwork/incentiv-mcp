@@ -30,6 +30,7 @@ export const manifestSchema = z.strictObject({
     contractRegistry: pin, transferGate: pin, bulkBalanceReader: pin, unifiedTokenPaymaster: pin,
     wcent: pin, swapRouter: pin, quoter: pin,
   }),
+  agentRegistry: z.strictObject({ proxy: pin, implementation: pin, portalUrl: url }).optional(),
   canonicalTokens: z.record(symbol, pin),
   bridge: z.strictObject({
     enabled: z.boolean(), incentivDomain: z.number().int().nonnegative().max(0xffffffff), mailbox: pin.optional(),
@@ -111,7 +112,7 @@ export function parseConfig(input: unknown): Config {
   if (canonicalJson(remoteNames) !== canonicalJson(Object.keys(endpoints.remoteChains).sort())) {
     throw new Error("Remote endpoints must match the declared remote chains");
   }
-  for (const pins of [localContractPins(cfg), ...remoteNames.map((name) => remoteContractPins(cfg, name))]) {
+  for (const pins of [[...localContractPins(cfg), ...registryContractPins(cfg)], ...remoteNames.map((name) => remoteContractPins(cfg, name))]) {
     const seen = new Map<string, Hex>();
     for (const p of pins) {
       const previous = seen.get(p.address.toLowerCase());
@@ -129,12 +130,26 @@ export function localContractPins(cfg: Config): ContractPin[] {
     ...(m.bridge.enabled ? [m.bridge.mailbox!, ...m.bridge.routes.flatMap((r) => [r.localRouter, ...(r.incentivToken ? [r.incentivToken] : [])])] : [])];
 }
 
+/** Checked before registry operations and capability approval, so a registry upgrade cannot stop unrelated wallet use. */
+export function registryContractPins(cfg: Config): ContractPin[] {
+  const registry = cfg.manifest.agentRegistry;
+  return registry ? [registry.proxy, registry.implementation] : [];
+}
+
 export function remoteContractPins(cfg: Config, chain: string): ContractPin[] {
   return cfg.manifest.bridge.enabled
     ? cfg.manifest.bridge.routes.filter((r) => r.remoteChain === chain).flatMap((r) => [r.remoteToken, r.remoteRouter]) : [];
 }
 
 export const MAINNET = parseConfig(mainnet);
+
+/** This configuration as earlier releases approved it, before the optional Agent Registry capability. */
+export function withoutAgentRegistry(config: Config): Config {
+  const base = parseConfig(config);
+  delete base.manifest.agentRegistry;
+  base.manifest.manifestId = configurationId(base.manifest, "manifestId");
+  return parseConfig(base);
+}
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config {
   const partialOverrides = ["CHAIN_ID", "ENTRY_POINT", "ACCOUNT_FACTORY", "CONTRACT_REGISTRY", "TRANSFER_GATE",
