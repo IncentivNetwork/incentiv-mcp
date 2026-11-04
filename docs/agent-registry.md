@@ -50,7 +50,7 @@ An uncertain submission retains signed bytes, nonce ownership and gas reservatio
 
 Call `unlink_agent` with the expected parent to disconnect locally. Portal lists agents with individual **Disconnect** actions, and shows an account linked as an agent with its own disconnect action. Unlink needs no consent signature from the other side.
 
-Confirmation requires a canonical confirmed receipt, its matching EntryPoint event and the expected registry event inside that user operation's log interval. A different operation in the same bundle cannot supply confirmation. All writes use `executeBatch`, so TransferGate rejection reverts execution.
+Confirmation requires a canonical confirmed receipt, its matching EntryPoint event and the expected registry event inside that user operation's execution log interval, after `BeforeExecution` or the previous operation event. A different operation in the same bundle cannot supply confirmation. All writes use `executeBatch`, so TransferGate rejection reverts execution.
 
 ## Validation
 
@@ -63,4 +63,4 @@ anvil --fork-url https://rpc.incentiv.io --chain-id 24101 --port 18545
 node --import tsx scripts/test-agent-registry-fork.mjs
 ```
 
-The script verifies loopback and Anvil before sending, and tests deployment/link, unlink and stale approval through the real EntryPoint on the local fork. A real browser passkey ceremony remains a prod-staging acceptance check; an Anvil fork does not reproduce Incentiv's passkey precompile.
+The script verifies loopback and Anvil before sending, and tests deployment/link, unlink and stale approval through the real EntryPoint on the local fork. The stale-consent case bypasses preflight deliberately and checks the canonical failed-operation receipt decoder; unit tests also verify the exposed `registry_error` and fresh-approval guidance. A real browser passkey ceremony remains a prod-staging acceptance check; an Anvil fork does not reproduce Incentiv's passkey precompile.

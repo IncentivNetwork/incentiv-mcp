@@ -163,12 +163,17 @@ test("receipt cannot borrow a registry event from another user operation in the 
   const chain = new WalletChain(new Ctx(MAINNET)), hash = `0x${"11".repeat(32)}`, tx = `0x${"22".repeat(32)}`, blockHash = `0x${"33".repeat(32)}`;
   const operationEvent = (await import('viem')).parseAbiItem('event UserOperationEvent(bytes32 indexed userOpHash,address indexed sender,address indexed paymaster,uint256 nonce,bool success,uint256 actualGasCost,uint256 actualGasUsed)');
   const opLog = h => ({ address: MAINNET.identity.entryPoint.address, topics: encodeEventTopics({ abi: [operationEvent], eventName: "UserOperationEvent", args: { userOpHash: h, sender: agent, paymaster: zero } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [0n, true, 200n, 100n]) });
-  let logs = [registryLog("AgentLinked"), opLog(`0x${"44".repeat(32)}`), opLog(hash)];
+  const beforeExecution = { address: MAINNET.identity.entryPoint.address, topics: encodeEventTopics({ abi: (await import("viem")).parseAbi(["event BeforeExecution()"]), eventName: "BeforeExecution" }), data: "0x" };
+  let logs = [beforeExecution, registryLog("AgentLinked"), opLog(`0x${"44".repeat(32)}`), opLog(hash)];
   chain.clients.splice(0, chain.clients.length, { getTransactionReceipt: async () => ({ status: "success", transactionHash: tx, blockNumber: 10n, blockHash, logs }), getBlock: async () => ({ hash: blockHash }), getBlockNumber: async () => 12n });
   t.mock.method(globalThis, "fetch", async () => Response.json({ result: { receipt: { transactionHash: tx } } }));
   const record = { userOpHash: hash, nonce: "0", operation: { sender: agent }, intent: intent(await approval()) };
   await assert.rejects(chain.receipt(record), /Registry event missing/);
+  logs = [registryLog("AgentLinked"), beforeExecution, opLog(hash)];
+  await assert.rejects(chain.receipt(record), /Registry event missing/);
   logs = [registryLog("AgentLinked"), opLog(hash)];
+  await assert.rejects(chain.receipt(record), /execution boundary missing/);
+  logs = [beforeExecution, registryLog("AgentLinked"), opLog(hash)];
   assert.equal((await chain.receipt(record)).success, true);
 });
 
@@ -186,7 +191,7 @@ test("registry capability approval preserves wallet identity and legacy journal 
 
 
 test("registry errors produce bounded actionable codes without forwarding raw revert data", () => {
-  for (const [errorName, args, expected] of [["InvalidParentSignature", [], "registry_approval_invalid"], ["SignatureExpired", [1n], "registry_approval_expired"], ["AgentLimitReached", [parent, 5n], "registry_limit_reached"]]) {
+  for (const [errorName, args, expected] of [["NotLinked", [agent], "registry_link_changed"], ["SelfLink", [], "registry_ineligible"], ["InvalidAgentSignature", [], "registry_agent_signature_invalid"], ["InvalidParentSignature", [], "registry_approval_invalid"], ["SignatureExpired", [1n], "registry_approval_expired"], ["AgentLimitReached", [parent, 5n], "registry_limit_reached"]]) {
     assert.equal(registryRevertCode(encodeErrorResult({ abi: agentRegistryAbi, errorName, args })), expected);
   }
   assert.equal(registryRevertCode("0x1234"), undefined);
@@ -298,4 +303,15 @@ test("replacement validation rejects a changed token payment before signing", as
   await assert.rejects(f.service.replace(id, password, digest(review.records[0])), { code: "validation_failed" });
   assert.equal(f.submissions.length, 1);
   await f.store.session(async s => { const record = (await Journal.open(s)).data.records[0]; assert.equal(record.replacement.signed, false); assert.deepEqual(record.reservation, { [f.token]: "123" }); });
+});
+
+
+test("registry reverts expose actionable error and fresh-consent guidance through the wallet service", async t => {
+  const f = await registryFixture(t), id = randomUUID();
+  await f.service.send("link_agent", { request_id: id, approval: f.approval });
+  f.setReceipt({ success: false, actualGasCost: 200n, transactionHash: `0x${"11".repeat(32)}`, registryError: "registry_approval_invalid" });
+  const result = await f.service.operation(id);
+  assert.equal(result.status, "reverted");
+  assert.equal(result.registry_error, "registry_approval_invalid");
+  assert.match(result.next_action, /fresh approval in Portal/);
 });

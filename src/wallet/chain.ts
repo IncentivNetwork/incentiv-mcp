@@ -11,6 +11,7 @@ import { type Limits, type Spend } from "./policy.js";
 import type { validateOperation } from "./validate.js";
 
 const operationEvent = parseAbiItem("event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)");
+const beforeExecutionEvent = parseAbiItem("event BeforeExecution()");
 const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() === String(values[0]).toLowerCase());
 export const SWAP_DEADLINE_SECONDS = 60;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
@@ -208,9 +209,11 @@ export class WalletChain {
         let start = index - 1;
         while (start >= 0) {
           const log = receipt.logs[start];
-          try { if (log.address.toLowerCase() === this.ctx.config.identity.entryPoint.address.toLowerCase()) { decodeEventLog({ abi: [operationEvent], ...log }); break; } } catch { /* another event */ }
+          try { if (log.address.toLowerCase() === this.ctx.config.identity.entryPoint.address.toLowerCase()) { decodeEventLog({ abi: [operationEvent, beforeExecutionEvent], ...log }); break; } } catch { /* another event */ }
           start--;
         }
+        if (start < 0) throw new Error("EntryPoint execution boundary missing from receipt");
+        // Exclude validation/setup logs before BeforeExecution, including for the first operation.
         const logs = receipt.logs.slice(start + 1, index);
         if (index < 0 || (matches[0][0].success && !hasRegistryEvent(this.ctx.config, record.intent, record.operation.sender, logs))) throw new Error("Registry event missing from operation receipt");
         const revertEvent = parseAbiItem("event UserOperationRevertReason(bytes32 indexed userOpHash,address indexed sender,uint256 nonce,bytes revertReason)");

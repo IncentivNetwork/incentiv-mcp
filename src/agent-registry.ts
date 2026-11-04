@@ -19,6 +19,7 @@ export const agentRegistryAbi = parseAbi([
   "error AgentLimitReached(address parent,uint256 maxAgents)", "error AgentAlreadyHasParent(address agent)",
   "error ParentIsAgent(address parent)", "error AgentIsParent(address agent)",
   "error ParentNotIncentivAccount(address parent)", "error AgentNotIncentivAccount(address agent)",
+  "error NotLinked(address account)", "error SelfLink()",
   "error InvalidParentSignature()", "error InvalidAgentSignature()", "error SignatureExpired(uint256 deadline)",
 ]);
 const accountSignatureAbi = parseAbi(["function isValidSignature(bytes32 hash,bytes signature) view returns(bytes4)"]);
@@ -34,7 +35,7 @@ export type RegistryApproval = z.infer<typeof registryApprovalSchema>;
 export function registryRevertCode(data: Hex): string | undefined {
   try {
     const { errorName } = decodeErrorResult({ abi: agentRegistryAbi, data });
-    return ({ InvalidParentSignature: "registry_approval_invalid", SignatureExpired: "registry_approval_expired", AgentLimitReached: "registry_limit_reached", AgentAlreadyHasParent: "registry_already_linked", ParentIsAgent: "registry_ineligible", AgentIsParent: "registry_ineligible", ParentNotIncentivAccount: "registry_ineligible", AgentNotIncentivAccount: "registry_ineligible" } as Record<string, string>)[errorName];
+    return ({ NotLinked: "registry_link_changed", SelfLink: "registry_ineligible", InvalidAgentSignature: "registry_agent_signature_invalid", InvalidParentSignature: "registry_approval_invalid", SignatureExpired: "registry_approval_expired", AgentLimitReached: "registry_limit_reached", AgentAlreadyHasParent: "registry_already_linked", ParentIsAgent: "registry_ineligible", AgentIsParent: "registry_ineligible", ParentNotIncentivAccount: "registry_ineligible", AgentNotIncentivAccount: "registry_ineligible" } as Record<string, string>)[errorName];
   } catch { return undefined; }
 }
 export const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();

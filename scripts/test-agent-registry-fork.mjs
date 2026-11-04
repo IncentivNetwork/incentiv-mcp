@@ -8,7 +8,10 @@ import { MAINNET } from '../src/config.ts';
 import { deriveSmartAccount } from '../src/network.ts';
 import { accountFactoryAbi } from '../src/abi.ts';
 import { agentRegistryAbi, hasRegistryEvent, registryCall, verifyRegistryIntent } from '../src/agent-registry.ts';
-import { computeUserOpHash, encodeExecuteBatch } from '../src/userop.ts';
+import { computeUserOpHash, userOpToJson, encodeExecuteBatch } from '../src/userop.ts';
+
+import { Ctx } from '../src/context.ts';
+import { WalletChain } from '../src/wallet/chain.ts';
 
 const rpc = process.env.INCENTIV_REGISTRY_FORK_RPC ?? 'http://127.0.0.1:18545';
 assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(new URL(rpc).hostname), 'Use a loopback Anvil fork only');
@@ -18,6 +21,10 @@ await client.request({ method: 'anvil_nodeInfo' });
 assert.equal(await client.getChainId(), 24101);
 const snapshot = await client.request({ method: 'evm_snapshot' });
 try {
+// A pinned fork can be older than preflight's freshness window. Mine our first local
+// transaction at the current time without changing the public chain.
+const forkHead = await client.getBlock();
+await client.request({ method: 'evm_setNextBlockTimestamp', params: [Math.max(Math.floor(Date.now() / 1000), Number(forkHead.timestamp) + 1)] });
 const sender = privateKeyToAccount(generatePrivateKey());
 const parentOwner = privateKeyToAccount(generatePrivateKey());
 const agentOwner = privateKeyToAccount(generatePrivateKey());
@@ -51,19 +58,36 @@ async function submit(i, deploy) {
   const tx = await wallet.writeContract({ address: entryPoint, abi: entryAbi, functionName: 'handleOps', args: [[packed], sender.address], gas: 5000000n });
   const receipt = await client.waitForTransactionReceipt({ hash: tx });
   assert.equal(receipt.status, 'success');
-  return receipt;
+  return { receipt, op, hash };
 }
 const linked = await submit(intent, true);
-assert.ok(hasRegistryEvent(MAINNET, intent, agent, linked.logs));
+assert.ok(hasRegistryEvent(MAINNET, intent, agent, linked.receipt.logs));
 assert.equal((await client.readContract({ address: registry, abi: agentRegistryAbi, functionName: 'parentOf', args: [agent] })).toLowerCase(), parent.toLowerCase());
 console.log('PASS: Portal-format EOA approval + deployment + link through a real EntryPoint user operation');
 const unlink = { ...intent, kind: 'unlink_agent', registryApproval: undefined };
 const unlinked = await submit(unlink, false);
-assert.ok(hasRegistryEvent(MAINNET, unlink, agent, unlinked.logs));
+assert.ok(hasRegistryEvent(MAINNET, unlink, agent, unlinked.receipt.logs));
 assert.equal(await client.readContract({ address: registry, abi: agentRegistryAbi, functionName: 'parentOf', args: [agent] }), `0x${'00'.repeat(20)}`);
 console.log('PASS: agent unlink through a real EntryPoint user operation');
 const fresh = await client.getBlock();
 await assert.rejects(verifyRegistryIntent(client, MAINNET, { account: agent }, intent, { block: fresh.number, timestamp: Number(fresh.timestamp), deployed: true }), { code: 'registry_approval_stale' });
 console.log('PASS: old parent approval rejected after link/unlink consumed registry nonces');
+// Deliberately bypass preflight to exercise a nonce race through the real account and EntryPoint.
+const failed = await submit(intent, false);
+await client.request({ method: 'anvil_mine', params: ['0x2'] });
+const receiptChain = new WalletChain(new Ctx(MAINNET));
+receiptChain.clients.splice(0, receiptChain.clients.length, client);
+const originalFetch = globalThis.fetch;
+try {
+  // Discovery alone is stubbed: receipt/logs, canonical block and confirmations come from Anvil.
+  globalThis.fetch = async (input, init) => String(input) === MAINNET.endpoints.bundlerUrl
+    ? Response.json({ result: { receipt: { transactionHash: failed.receipt.transactionHash } } })
+    : originalFetch(input, init);
+  const result = await receiptChain.receipt({ userOpHash: failed.hash, nonce: failed.op.nonce.toString(), operation: userOpToJson(failed.op), intent });
+  assert.equal(result.success, false);
+  assert.equal(result.registryError, 'registry_approval_invalid');
+  console.log('PASS: stale link reverts through real executeBatch; canonical receipt decodes registry_approval_invalid');
+} finally { globalThis.fetch = originalFetch; }
+
 
 } finally { await client.request({ method: 'evm_revert', params: [snapshot] }); }

@@ -116,7 +116,7 @@ export async function promptPolicy(config: Config, resolveToken: (ref: string) =
     const parents = await answer(ask, tell, "Allowed Portal smart-account addresses, comma-separated: ", value => {
       const values = [...new Set(value.split(",").map(v => v.trim()))];
       if (!values.length || !values.every(v => isAddress(v) && !/^0x0{40}$/i.test(v))) throw new WalletError("validation_failed", "Enter Portal smart-account addresses");
-      return values.map(value => getAddress(value));
+      return [...new Set(values.map(value => getAddress(value)))];
     });
     agentRegistry = { parents, allowUnlink: await yesNo(ask, tell, "Allow the agent to unlink itself?") };
     const registry = config.manifest.agentRegistry.proxy.address.toLowerCase();

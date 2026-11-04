@@ -188,3 +188,11 @@ test("saving disabled policy preserves restored-copy acknowledgement and existin
   await service.configure(limits, password, true, digest(review.records));
   assert.equal((await service.review()).wallet.policy.enabled, true);
 });
+
+
+test("registry setup deduplicates parent addresses after case normalization", async () => {
+  const parent = "0x16e43840d8D79896A389a3De85aB0B0210C05685";
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "y", `${parent.toLowerCase()},${parent}`, "y"];
+  const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, () => {});
+  assert.deepEqual(policy.agentRegistry.parents, [parent]);
+});
