@@ -1,4 +1,4 @@
-import { hasRegistryEvent, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
+import { assertRegistryApproved, hasRegistryEvent, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
 import { createPublicClient, decodeEventLog, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
@@ -142,23 +142,29 @@ export class WalletChain {
       }
     }));
   }
-  async verifyRegistry(wallet: WalletEnvelope, intent: Intent, state?: ChainState) {
-    try {
-      const current = state ?? await this.state(wallet);
-      await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, current)));
-    } catch (error) {
+  private async registryRead<T>(wallet: WalletEnvelope, read: () => Promise<T>): Promise<T> {
+    assertRegistryApproved(this.ctx.config, wallet);
+    try { return await read(); } catch (error) {
       if (error instanceof WalletError) throw error;
-      throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry, using a new request UUID if this request now shows failed");
+      throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry this request");
     }
   }
+  async verifyRegistry(wallet: WalletEnvelope, intent: Intent, state?: ChainState) {
+    await this.registryRead(wallet, async () => {
+      const current = state ?? await this.state(wallet);
+      await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, current)));
+    });
+  }
   async registryStatus(wallet: WalletEnvelope, parent?: Address) {
-    const state = await this.state(wallet);
-    const results = await Promise.all(this.clients.map(async client => {
-      await verifyRegistryDeployment(client, this.ctx.config, state.block);
-      return registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block);
-    }));
-    if (!same(results.map(r => JSON.stringify(r)))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
-    return { ...results[0], deployed: state.deployed };
+    return this.registryRead(wallet, async () => {
+      const state = await this.state(wallet);
+      const results = await Promise.all(this.clients.map(async client => {
+        await verifyRegistryDeployment(client, this.ctx.config, state.block);
+        return registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block);
+      }));
+      if (!same(results.map(r => JSON.stringify(r)))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+      return { ...results[0], deployed: state.deployed };
+    });
   }
   async build(wallet: WalletEnvelope, intent: Intent, state: ChainState, deadline?: number) {
     const input = await this.token(intent.token), gasToken = await this.token(intent.gasToken);

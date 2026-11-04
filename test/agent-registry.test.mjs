@@ -14,11 +14,11 @@ import { limitsSchema, policyViolations } from "../src/wallet/policy.ts";
 import { WalletChain } from "../src/wallet/chain.ts";
 import { Ctx } from "../src/context.ts";
 import { computeUserOpHash, encodeExecuteBatch, userOpToJson } from "../src/userop.ts";
-import { fixture, limits, password, unsigned } from "../scripts/wallet-pipeline-fixture.mjs";
+import { args as transfer, fixture, limits, password, unsigned } from "../scripts/wallet-pipeline-fixture.mjs";
 import { join } from "node:path";
 import { previousImplementationConfig, withoutAgentRegistry } from "../src/account-upgrade.ts";
 import { approveImplementation, reviewImplementation } from "../src/wallet/implementation.ts";
-import { backupWallet, restoreCurrentOrPreRegistry } from "../src/wallet/backup.ts";
+import { backupWallet, restoreWallet } from "../src/wallet/backup.ts";
 import { WalletStore } from "../src/wallet/store.ts";
 import { WalletError } from "../src/wallet/errors.ts";
 import { reviewUpgrade } from "../src/wallet/cli.ts";
@@ -82,7 +82,7 @@ test("preflight permits first-operation deployment but rejects stale approvals, 
 
 test("semantic validation binds registry, parent, agent, zero value, deadline and complete batch", async () => {
   const a = await approval(), i = intentSchema.parse(intent(a));
-  const wallet = { account: agent, owner: owner.address };
+  const wallet = { account: agent, owner: owner.address, approvedCapabilityManifestId: MAINNET.manifest.manifestId };
   const built = unsigned(wallet, { to: parent, amount: "0" }, { deployed: false, nonce: 0n });
   const expectedCall = registryCall(MAINNET, agent, i);
   const check = calls => {
@@ -205,9 +205,10 @@ test("derived configurations reproduce the manifest IDs that released wallets ap
 test("a released default-config wallet approves the registry without a previous configuration file", async t => {
   const base = withoutAgentRegistry(MAINNET), f = await fixture(t, { config: base }), before = await f.store.createOrLoad();
   const store = new WalletStore(MAINNET, f.deps);
-  await assert.rejects(store.createOrLoad(), { code: "capability_manifest_unapproved" });
+  assert.equal((await store.createOrLoad()).manifest_id, base.manifest.manifestId);
   await approveCapabilities(store, base, MAINNET, password, digest(await reviewCapabilities(store, base, MAINNET)));
-  assert.equal((await store.createOrLoad()).account, before.account);
+  const after = await store.createOrLoad();
+  assert.equal(after.account, before.account); assert.equal(after.manifest_id, MAINNET.manifest.manifestId);
 });
 
 test("a previous-implementation wallet upgrades, then approves the registry as a separate step", async t => {
@@ -216,23 +217,23 @@ test("a previous-implementation wallet upgrades, then approves the registry as a
   await assert.rejects(approveImplementation(full, MAINNET, password, digest(await reviewImplementation(full, MAINNET))), { code: "policy_denied" });
   await approveImplementation(upgrade, base, password, digest(await reviewImplementation(upgrade, base)));
   await upgrade.session(async s => { assert.equal(s.envelope.approvedCapabilityManifestId, base.manifest.manifestId); assert.equal(s.envelope.networkIdentity.networkId, MAINNET.identity.networkId); });
-  await assert.rejects(full.createOrLoad(), { code: "capability_manifest_unapproved" });
+  assert.equal((await full.createOrLoad()).manifest_id, base.manifest.manifestId);
   await approveCapabilities(full, base, MAINNET, password, digest(await reviewCapabilities(full, base, MAINNET)));
   const after = await full.createOrLoad();
   assert.equal(after.account, before.account); assert.equal(after.owner, before.owner);
 });
 
-test("a backup from before the registry restores under its approved manifest, then approves the registry", async t => {
+test("a backup from before the registry restores without approving it, then approves the registry", async t => {
   const base = withoutAgentRegistry(MAINNET), source = await fixture(t, { config: base }), target = await fixture(t, { existing: true });
   const recovery = Buffer.from("recovery passphrase for test"), before = await source.store.createOrLoad();
   const out = join(source.parent, "pre-registry-backup.json");
   await backupWallet(base, source.store, out, password, recovery);
   const store = new WalletStore(MAINNET, target.deps);
-  await restoreCurrentOrPreRegistry(MAINNET, store, out, recovery);
-  await assert.rejects(store.createOrLoad(), { code: "capability_manifest_unapproved" });
+  await restoreWallet(MAINNET, store, out, recovery);
+  assert.equal((await store.createOrLoad()).manifest_id, base.manifest.manifestId);
   await approveCapabilities(store, base, MAINNET, password, digest(await reviewCapabilities(store, base, MAINNET)));
   assert.equal((await store.createOrLoad()).account, before.account);
-  await assert.rejects(restoreCurrentOrPreRegistry(MAINNET, store, out, Buffer.from("wrong recovery passphrase")), { code: "backup_authentication_failed" });
+  await assert.rejects(restoreWallet(MAINNET, store, out, Buffer.from("wrong recovery passphrase")), { code: "backup_authentication_failed" });
 });
 
 test("a rejected link request leaves no journal record and oversized signatures are refused", async t => {
@@ -271,24 +272,107 @@ test("an expired terminal approval still expires its link record", async t => {
   assert.equal((await f.service.send("link_agent", args)).status, "expired");
 });
 
-test("restore authenticates one decrypted backup without retrying a wrong passphrase", async t => {
-  const recovery = Buffer.from("recovery passphrase for test"), noFallback = { withConfig: () => assert.fail("must not retry under another config") };
-  const base = withoutAgentRegistry(MAINNET), source = await fixture(t, { config: base }), out = join(source.parent, "pre-registry-backup.json");
-  await source.store.createOrLoad();
-  await backupWallet(base, source.store, out, password, recovery);
-  await assert.rejects(restoreCurrentOrPreRegistry(MAINNET, noFallback, out, Buffer.from("wrong recovery passphrase")), { code: "backup_authentication_failed" });
+async function preRegistryWallet(t) {
+  const base = withoutAgentRegistry(MAINNET), old = await fixture(t, { config: base });
+  return { ...(await fixture(t, { root: old.root, existing: true })), base, parent: old.parent };
+}
 
-  const previous = previousImplementationConfig(base), old = await fixture(t, { existing: true }), oldStore = new WalletStore(previous, old.deps), oldOut = join(old.parent, "old-backup.json");
-  await oldStore.initialize(limits, password);
-  await backupWallet(previous, oldStore, oldOut, password, recovery);
-  await assert.rejects(restoreCurrentOrPreRegistry(MAINNET, noFallback, oldOut, recovery), { code: "backup_authentication_failed" });
+test("a wallet that has not approved the registry can resolve a pending operation, then approve", async t => {
+  const f = await preRegistryWallet(t), id = randomUUID();
+  assert.equal((await f.service.send("transfer", transfer(id))).status, "submitted");
+  assert.equal((await f.service.operation(id)).status, "submission_unknown");
+  assert.equal((await f.service.review(id)).records.length, 1);
+  await assert.rejects(approveCapabilities(f.store, f.base, MAINNET, password, digest(await reviewCapabilities(f.store, f.base, MAINNET))), { code: "operation_pending" });
+  f.setReceipt({ success: true, actualGasCost: 200n, transactionHash: `0x${"11".repeat(32)}` });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  await approveCapabilities(f.store, f.base, MAINNET, password, digest(await reviewCapabilities(f.store, f.base, MAINNET)));
+  assert.equal((await f.store.createOrLoad()).manifest_id, MAINNET.manifest.manifestId);
+  f.chain.clients.splice(0, f.chain.clients.length);
+  assert.equal((await f.service.registryStatus()).deployed, false);
+});
 
-  const current = await fixture(t), currentOut = join(current.parent, "current-backup.json"), target = await fixture(t, { existing: true });
-  const wallet = await current.store.createOrLoad();
-  await backupWallet(MAINNET, current.store, currentOut, password, recovery);
-  const store = new WalletStore(MAINNET, target.deps);
-  await restoreCurrentOrPreRegistry(MAINNET, Object.assign(store, { withConfig: noFallback.withConfig }), currentOut, recovery);
-  assert.equal((await store.createOrLoad()).account, wallet.account);
+test("an upgraded previous-implementation wallet can still check its pending operation", async t => {
+  const base = withoutAgentRegistry(MAINNET), old = await fixture(t, { config: previousImplementationConfig(MAINNET) }), id = randomUUID();
+  assert.equal((await old.service.send("transfer", transfer(id))).status, "submitted");
+  const upgrade = new WalletStore(base, old.deps);
+  await approveImplementation(upgrade, base, password, digest(await reviewImplementation(upgrade, base)));
+  const f = await fixture(t, { root: old.root, existing: true });
+  assert.equal((await f.service.operation(id)).status, "submission_unknown");
+  await assert.rejects(approveCapabilities(f.store, base, MAINNET, password, digest(await reviewCapabilities(f.store, base, MAINNET))), { code: "operation_pending" });
+});
+
+test("registry use stays blocked until approval and nothing but approval grants it", async t => {
+  const f = await preRegistryWallet(t), wallet = await f.store.createOrLoad(), id = randomUUID(), code = "capability_manifest_unapproved", a = await approval({ agent: wallet.account });
+  await assert.rejects(f.service.registryStatus(), { code });
+  await assert.rejects(f.service.prepareAgentLink(), { code });
+  await assert.rejects(f.service.send("link_agent", { request_id: id, approval: a }), { code });
+  await assert.rejects(f.service.send("unlink_agent", { request_id: id, parent }), { code });
+  await f.store.session(async s => {
+    assert.equal((await Journal.open(s)).data.records.length, 0);
+    assert.throws(() => validateOperation(MAINNET, s.envelope, intent(a), {}, { nonce: 0n, deployed: false, hash: digestToSign }), { code });
+  });
+
+  // Saving a policy reseals the wallet, even one that lists registry permissions.
+  await f.service.configure({ ...limits, agentRegistry: { parents: [parent], allowUnlink: true } }, password, false, digest([]));
+  assert.equal((await f.store.createOrLoad()).manifest_id, f.base.manifest.manifestId);
+  await assert.rejects(f.service.registryStatus(), { code });
+
+  // So does restoring a backup.
+  const recovery = Buffer.from("recovery passphrase for test"), out = join(f.parent, "backup.json"), target = await fixture(t, { existing: true }), restored = new WalletStore(MAINNET, target.deps);
+  await backupWallet(MAINNET, f.store, out, password, recovery);
+  await restoreWallet(MAINNET, restored, out, recovery);
+  assert.equal((await restored.createOrLoad()).manifest_id, f.base.manifest.manifestId);
+
+  // A transition must start from the manifest the wallet actually approved.
+  const other = structuredClone(f.base);
+  other.manifest.contracts.swapRouter.codeHash = `0x${"12".repeat(32)}`;
+  other.manifest.manifestId = configurationId(other.manifest, "manifestId");
+  await assert.rejects(reviewCapabilities(f.store, other, MAINNET), { code });
+});
+
+test("an RPC failure keeps a link request and its local approval retryable", async t => {
+  const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval }, down = async () => { throw new WalletError("registry_rpc_unavailable", "RPC down"); };
+  assert.equal((await f.service.send("link_agent", args)).status, "approval_required");
+  await f.service.approve(id, password, digest((await f.service.review(id)).records[0]));
+  f.chain.verifyRegistry = down;
+  await assert.rejects(f.service.send("link_agent", args), { code: "registry_rpc_unavailable" });
+  assert.equal((await f.service.operation(id)).status, "approval_required");
+  f.chain.verifyRegistry = async () => {};
+  assert.equal((await f.service.send("link_agent", args)).status, "submitted");
+
+  const g = await registryFixture(t), fresh = randomUUID(), freshArgs = { request_id: fresh, approval: g.approval };
+  let checks = 0;
+  g.chain.verifyRegistry = async () => { if (++checks === 2) await down(); };
+  await assert.rejects(g.service.send("link_agent", freshArgs), { code: "registry_rpc_unavailable" });
+  assert.equal((await g.service.operation(fresh)).status, "approval_required");
+  assert.equal((await g.service.send("link_agent", freshArgs)).status, "submitted");
+});
+
+test("registry reads report RPC failures as temporary", async t => {
+  const f = await fixture(t), code = "registry_rpc_unavailable";
+  f.chain.state = async () => { throw new Error("HTTP 429"); };
+  await assert.rejects(f.service.registryStatus(), { code });
+  await assert.rejects(f.service.prepareAgentLink(), { code });
+  const a = await approval(), stale = Math.floor(Date.now() / 1000) - 120;
+  await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(a), { ...state(), timestamp: stale }), { code });
+});
+
+test("prepare_agent_link only sends the user to Portal when linking can succeed", async t => {
+  const f = await fixture(t), linkable = { parent: zero, agent_is_parent: false, agent_eligible: false, factory_allowed: true, deployed: false };
+  const prepared = async status => { f.chain.registryStatus = async () => ({ ...linkable, ...status }); return f.service.prepareAgentLink(); };
+  const ready = await prepared({});
+  assert.ok(ready.portal_url); assert.equal(ready.link_blocked, undefined);
+  for (const [status, code] of [[{ parent }, "registry_already_linked"], [{ agent_is_parent: true }, "registry_ineligible"], [{ factory_allowed: false }, "registry_ineligible"], [{ deployed: true }, "registry_ineligible"]]) {
+    const blocked = await prepared(status);
+    assert.equal(blocked.link_blocked, code); assert.equal(blocked.portal_url, undefined); assert.match(blocked.next_action, /Do not ask the user to sign/);
+  }
+});
+
+test("the factory allowlist only applies to an agent that still has to deploy", async () => {
+  const a = await approval(), good = client();
+  const c = client({ readContract: async opts => opts.functionName === "isAccountFactory" ? false : opts.functionName === "isIncentivAccount" ? true : good.readContract(opts) });
+  await verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), { ...state(), deployed: true });
+  await assert.rejects(verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), state()), { code: "registry_ineligible" });
 });
 
 test("the upgrade command only points a current wallet to capability approval when it is pending", async t => {
@@ -314,7 +398,7 @@ test("an RPC failure during signature validation is not reported as an invalid s
   await assert.rejects(check(parentCall(() => "0x")), { code: "registry_approval_invalid" });
   const chain = new WalletChain(new Ctx(MAINNET));
   chain.clients.splice(0, chain.clients.length, parentCall(() => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); }));
-  await assert.rejects(chain.verifyRegistry({ account: agent }, intent(a), state()), { code: "registry_rpc_unavailable" });
+  await assert.rejects(chain.verifyRegistry({ account: agent, approvedCapabilityManifestId: MAINNET.manifest.manifestId }, intent(a), state()), { code: "registry_rpc_unavailable" });
 });
 
 test("a link retried near its deadline gets recovery guidance instead of a tampering error", async t => {
@@ -337,7 +421,7 @@ test("registry errors produce bounded actionable codes without forwarding raw re
 
 test("token-paid linking reserves only the exact paymaster transfer and rejects a hidden extra payment", async () => {
   const token = MAINNET.manifest.canonicalTokens.USDC.address.toLowerCase(), a = await approval();
-  const i = { ...intent(a), token, gasToken: token }, wallet = { account: agent, owner: owner.address };
+  const i = { ...intent(a), token, gasToken: token }, wallet = { account: agent, owner: owner.address, approvedCapabilityManifestId: MAINNET.manifest.manifestId };
   const built = unsigned(wallet, { to: parent, amount: "0" }, { deployed: false, nonce: 0n });
   Object.assign(built.op, { paymaster: MAINNET.manifest.contracts.unifiedTokenPaymaster.address, paymasterData: "0x", paymasterVerificationGasLimit: 100n, paymasterPostOpGasLimit: 100n });
   const erc20 = (await import('../src/abi.ts')).erc20Abi;

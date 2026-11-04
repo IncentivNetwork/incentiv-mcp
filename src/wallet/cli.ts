@@ -13,7 +13,7 @@ import { bundlerRpc } from "../userop.js";
 import { address, authorize, limitsSchema } from "./policy.js";
 import { digest, terminal } from "./journal.js";
 import { withoutAgentRegistry } from "../account-upgrade.js";
-import { backupWallet, migrateWallet, restoreCurrentOrPreRegistry, restoreWallet, reviewImplementationBackup } from "./backup.js";
+import { backupWallet, migrateWallet, restoreWallet, reviewImplementationBackup } from "./backup.js";
 import { approveCapabilities, reviewCapabilities } from "./capabilities.js";
 import { approveImplementation, reviewImplementation, type implementationReview } from "./implementation.js";
 import { localWalletStore, type WalletStore } from "./store.js";
@@ -185,7 +185,7 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   if (implementation) {
     const { target, store, review, registryPending } = await reviewUpgrade(service.store, config);
     if (review.wallet.network_id === config.identity.networkId) {
-      console.error(`This wallet already uses the current implementation. ${registryPending ? "To use the Agent Registry, run wallet capabilities approve next." : "Use setup to review its policy."}`);
+      console.error(`This wallet already uses the current implementation. Use setup to review its policy.${registryPending ? " To use the Agent Registry, run wallet capabilities approve first." : ""}`);
       return;
     }
     displayImplementationReview(review);
@@ -210,7 +210,7 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
         const administration = await secretPrompt("Existing wallet administration passphrase: ");
         try { console.error(JSON.stringify(await restoreWallet(target, service.store.withConfig(target), resolve(args[2]), recovery, { administration, reviewedDigest: digest(review) }), null, 2)); }
         finally { administration.fill(0); }
-      } else console.error(JSON.stringify(await restoreCurrentOrPreRegistry(config, service.store, resolve(args[2]), recovery), null, 2));
+      } else console.error(JSON.stringify(await restoreWallet(config, service.store, resolve(args[2]), recovery), null, 2));
     }
     finally { recovery.fill(0); }
     return;

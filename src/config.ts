@@ -143,6 +143,14 @@ export function remoteContractPins(cfg: Config, chain: string): ContractPin[] {
 
 export const MAINNET = parseConfig(mainnet);
 
+/** This configuration as earlier releases approved it, before the optional Agent Registry capability. */
+export function withoutAgentRegistry(config: Config): Config {
+  const base = parseConfig(config);
+  delete base.manifest.agentRegistry;
+  base.manifest.manifestId = configurationId(base.manifest, "manifestId");
+  return parseConfig(base);
+}
+
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config {
   const partialOverrides = ["CHAIN_ID", "ENTRY_POINT", "ACCOUNT_FACTORY", "CONTRACT_REGISTRY", "TRANSFER_GATE",
     "BULK_BALANCE_READER", "PAYMASTER", "WCENT", "SWAP_ROUTER", "QUOTER"];

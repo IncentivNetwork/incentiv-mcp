@@ -4,7 +4,8 @@ import { mkdtemp, readFile, realpath, rm, writeFile, mkdir, readdir } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeFunctionData } from "viem";
-import { MAINNET } from "../src/config.ts";
+import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
+import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
 import { allowance, answer, promptPolicy, setupTargets } from "../src/setup-policy.ts";
 import { connectionFor, clientConfigPath, mergeConnection, saveClientConfig, connectClient } from "../src/setup-client.ts";
@@ -153,14 +154,33 @@ test("failed backup and interrupted activation leave new wallets disabled; resum
   await assert.rejects(setupWallet(f.service, f.root, broken.io));
   const before = (await f.service.review()).wallet;
   assert.equal(before.policy.enabled, false);
-  const resumed = interaction(["", "y", "y", "y", ""], join(f.parent, "resumed.json"));
+  const resumed = interaction(["", "y", "", "y", "y", ""], join(f.parent, "resumed.json"));
   const result = await setupWallet(f.service, f.root, resumed.io);
   assert.equal(result.account, before.account); assert.equal(result.activated, false);
   assert.equal((await f.service.review()).wallet.policy.enabled, false);
   assert.equal(f.submissions.length, 0);
-  const finish = interaction(["", "y", "y", "y", "ENABLE"], join(f.parent, "finished.json"));
+  const finish = interaction(["", "y", "", "y", "y", "ENABLE"], join(f.parent, "finished.json"));
   assert.equal((await setupWallet(f.service, f.root, finish.io)).account, before.account);
   assert.equal((await f.service.review()).wallet.policy.enabled, true);
+});
+
+test("keeping current permissions still offers the registry once approved, and only points to approval before that", async t => {
+  const base = withoutAgentRegistry(MAINNET), old = await fixture(t, { config: base }), f = await fixture(t, { root: old.root, existing: true }), portal = "0x0000000000000000000000000000000000000002";
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false }));
+  const pending = interaction(["", "y", "y", "y", ""], join(old.parent, "unapproved.json"));
+  await setupWallet(f.service, f.root, pending.io);
+  assert.ok(!pending.questions.some(q => q.startsWith("Allow this agent")));
+  assert.ok(pending.output.some(line => line.includes("wallet capabilities approve")));
+  assert.equal((await f.service.review()).wallet.manifest_id, base.manifest.manifestId);
+
+  await approveCapabilities(f.store, base, MAINNET, password, digest(await reviewCapabilities(f.store, base, MAINNET)));
+  const approved = interaction(["", "y", "y", portal, "n", "y", "y", "ENABLE"], join(old.parent, "approved.json"));
+  await setupWallet(f.service, f.root, approved.io);
+  const { limits: saved, enabled } = (await f.service.review()).wallet.policy;
+  assert.equal(enabled, true);
+  assert.deepEqual(saved.agentRegistry, { parents: [portal], allowUnlink: false });
+  assert.equal(saved.targets[MAINNET.manifest.agentRegistry.proxy.address.toLowerCase()].length, 1, "link only, because unlink was declined");
+  assert.deepEqual(saved.tokens, limits.tokens);
 });
 
 test("MCP-created wallet can establish disabled administration before backup, and cancellation never enables it", async t => {

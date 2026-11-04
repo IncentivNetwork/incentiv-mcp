@@ -3,7 +3,7 @@ import { decodeFunctionResult } from "viem";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { concatHex, encodeAbiParameters, encodeFunctionData, getContractAddress, keccak256, parseAbi, toHex, type Address, type Hex } from "viem";
-import { canonicalJson, localContractPins, parseConfig, registryContractPins, remoteContractPins, type Config, type ContractPin, type WalletNetworkIdentity } from "./config.js";
+import { canonicalJson, localContractPins, parseConfig, registryContractPins, remoteContractPins, withoutAgentRegistry, type Config, type ContractPin, type WalletNetworkIdentity } from "./config.js";
 
 export class NetworkError extends Error {
   constructor(readonly code: "wallet_network_mismatch" | "capability_manifest_unapproved" | "network_verification_failed", message: string) {
@@ -24,7 +24,9 @@ export function assertWalletNetwork(cfg: Config, wallet: {
   if (canonicalJson(wallet.networkIdentity) !== canonicalJson(cfg.identity)) {
     throw new NetworkError("wallet_network_mismatch", "The existing wallet belongs to a different network identity. For the supported Incentiv account upgrade, use wallet upgrade-implementation in your local terminal");
   }
-  if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId) {
+  // The registry is an optional addition: a wallet that has not approved it keeps every capability it did
+  // approve. Registry operations require approval themselves (assertRegistryApproved).
+  if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId && wallet.approvedCapabilityManifestId !== withoutAgentRegistry(cfg).manifest.manifestId) {
     throw new NetworkError("capability_manifest_unapproved", "The wallet has not approved this capability manifest. Review it with wallet capabilities approve in your local terminal");
   }
 }

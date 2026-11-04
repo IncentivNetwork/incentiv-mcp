@@ -55,6 +55,20 @@ export function setupTargets(config: Config, tokens: TokenInfo[], swaps: boolean
   return targets;
 }
 
+/** Asks which Portal accounts this agent may connect to and returns the policy additions; nothing when declined. */
+export async function promptAgentRegistry(config: Config, ask: Ask, tell: Tell): Promise<{ agentRegistry?: Limits["agentRegistry"]; targets?: Limits["targets"] }> {
+  if (!config.manifest.agentRegistry || !await yesNo(ask, tell, "Allow this agent to connect to Portal accounts?")) return {};
+  const parents = await answer(ask, tell, "Allowed Portal smart-account addresses, comma-separated: ", value => {
+    const values = [...new Set(value.split(",").map(v => v.trim()))];
+    if (!values.length || !values.every(v => isAddress(v) && !/^0x0{40}$/i.test(v))) throw new WalletError("validation_failed", "Enter Portal smart-account addresses");
+    return [...new Set(values.map(value => getAddress(value)))];
+  });
+  const allowUnlink = await yesNo(ask, tell, "Allow the agent to unlink itself?");
+  const registry = config.manifest.agentRegistry.proxy.address.toLowerCase();
+  tell(`Registry contract permissions will be added for ${registry}. Gas budgets still apply.`);
+  return { agentRegistry: { parents, allowUnlink }, targets: { [registry]: [toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)"), ...(allowUnlink ? [toFunctionSelector("unlink()")] : [])] } };
+}
+
 export async function promptPolicy(config: Config, resolveToken: (ref: string) => Promise<TokenInfo>, ask: Ask, tell: Tell) {
   const available = [config.identity.nativeSymbol, ...Object.keys(config.manifest.canonicalTokens)];
   tell(`Choose assets: ${available.join(", ")}. Limits use normal token amounts; 0 blocks that use. Type cancel to stop.`);
@@ -111,19 +125,8 @@ export async function promptPolicy(config: Config, resolveToken: (ref: string) =
     technical.maxBatchCalls = await integer("Maximum batch calls", 1, 16, technical.maxBatchCalls);
     technical.maxFeePerGas = await answer(ask, tell, "Maximum fee per gas in gwei [100000]: ", value => allowance(value || "100000", 9));
   }
-  let agentRegistry: Limits["agentRegistry"];
-  if (config.manifest.agentRegistry && await yesNo(ask, tell, "Allow this agent to connect to Portal accounts?")) {
-    const parents = await answer(ask, tell, "Allowed Portal smart-account addresses, comma-separated: ", value => {
-      const values = [...new Set(value.split(",").map(v => v.trim()))];
-      if (!values.length || !values.every(v => isAddress(v) && !/^0x0{40}$/i.test(v))) throw new WalletError("validation_failed", "Enter Portal smart-account addresses");
-      return [...new Set(values.map(value => getAddress(value)))];
-    });
-    agentRegistry = { parents, allowUnlink: await yesNo(ask, tell, "Allow the agent to unlink itself?") };
-    const registry = config.manifest.agentRegistry.proxy.address.toLowerCase();
-    tell(`Registry contract permissions will be added for ${registry}. Gas budgets still apply.`);
-  }
-  const targets = setupTargets(config, tokens, swaps);
-  if (agentRegistry && config.manifest.agentRegistry) targets[config.manifest.agentRegistry.proxy.address.toLowerCase()] = [toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)"), ...(agentRegistry.allowUnlink ? [toFunctionSelector("unlink()")] : [])];
+  const { agentRegistry, targets: registryTargets } = await promptAgentRegistry(config, ask, tell);
+  const targets = { ...setupTargets(config, tokens, swaps), ...registryTargets };
   const limits = limitsSchema.parse({ ...(agentRegistry ? { agentRegistry } : {}), tokens: amounts, recipients: { mode: "allowlist", addresses: recipients }, targets, swaps, ...technical, independentRpcOrigins: [], ...(swaps ? { trustedRpcOrigins: origins } : {}), maxGasCostWei });
   return { limits, tokens };
 }

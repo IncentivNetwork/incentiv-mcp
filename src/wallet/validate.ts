@@ -1,4 +1,4 @@
-import { isRegistryIntent, registryCall } from "../agent-registry.js";
+import { assertRegistryApproved, isRegistryIntent, registryCall } from "../agent-registry.js";
 import { decodeFunctionData, encodeFunctionData, type Address, type Hex } from "viem";
 import { z } from "zod";
 import type { Config } from "../config.js";
@@ -30,6 +30,7 @@ function decode(abi: any, data: Hex): any {
   return parsed;
 }
 export function validateOperation(cfg: Config, wallet: WalletEnvelope, intent: Intent, wire: Record<string, string>, expected: { nonce: bigint; deployed: boolean; hash: string; deadline?: number }) {
+  if (isRegistryIntent(intent)) assertRegistryApproved(cfg, wallet);
   try {
     const parsed = operationSchema.parse(wire), op = userOpFromJson(parsed);
     requireValue(equal(op.sender, wallet.account) && op.nonce === expected.nonce && op.signature === "0x");

@@ -34,17 +34,17 @@ incentiv-mcp wallet capabilities approve
 incentiv-mcp setup
 ```
 
-Wallet tools report `capability_manifest_unapproved` until you do. The command derives the previous manifest by removing the registry from the active configuration. With a custom network that changes anything else, pass `--previous /absolute/path/previous-config.json`.
+Transfers, swaps, reconciliation, backups and pending-operation commands keep working until you do; only the registry tools report `capability_manifest_unapproved`. Saving a policy or restoring a backup never approves the registry. The command derives the previous manifest by removing the registry from the active configuration. With a custom network that changes anything else, pass `--previous /absolute/path/previous-config.json`.
 
-Approval preserves wallet identity, addresses, keys and journal history. It refuses unresolved signed operations and disables policy until reviewed again. Registry configuration is optional, without defaults, so old configuration and policy MACs remain valid. Adding the registry changes `manifestId`, not `networkId`.
+Approval preserves wallet identity, addresses, keys and journal history. It refuses unresolved signed operations, which you can check and resolve with the usual commands first, and disables policy until reviewed again. Setup then offers registry permissions even if you keep your current limits. Registry configuration is optional, without defaults, so old configuration and policy MACs remain valid. Adding the registry changes `manifestId`, not `networkId`.
 
 If your wallet is on the older account implementation, run `wallet upgrade-implementation` first, then the commands above. Implementation upgrades cannot also change capabilities. Backups from before the registry restore with `wallet restore --in`, followed by the same steps.
 
-The manifest pins the proxy and implementation bytecode, implementation slot and EIP-712 domain. These are checked before every registry operation and at capability approval, not at startup. After a registry upgrade, registry tools return `registry_verification_failed` until a reviewed capability update, while transfers, swaps and reconciliation continue. No retired registry is used.
+The manifest pins the proxy and implementation bytecode, implementation slot and EIP-712 domain. These are checked before every registry operation and at capability approval, not at startup. After a registry upgrade, registry tools return `registry_verification_failed` and capability approval fails until a reviewed capability update, while transfers, swaps and reconciliation continue. `registry_rpc_unavailable` is temporary: retry the same request. No retired registry is used.
 
 ## Expiry, cancellation and unlink
 
-Registry consent nonces are separate from EntryPoint nonces. Every link/unlink increments both participants' registry nonces, including a parent's other-agent changes. Obtain approvals one at a time. A stale or invalid parent approval requires signing again in Portal. If consent goes bad while a request awaits local approval, the next `link_agent` retry returns the error and closes that request as `failed`; `wallet approve` returns the same error but leaves the request pending. Use a fresh approval with a new request UUID.
+Registry consent nonces are separate from EntryPoint nonces. Every link/unlink increments both participants' registry nonces, including a parent's other-agent changes. Obtain approvals one at a time. A stale or invalid parent approval requires signing again in Portal. If consent goes bad while a request awaits local approval, the next `link_agent` retry returns the error and closes that request as `failed`; `wallet approve` returns the same error but leaves the request pending. Use a fresh approval with a new request UUID. An RPC failure closes nothing during these registry checks, so the same request can be retried.
 
 A failed on-chain execution consumes the user-operation nonce and gas but does not consume registry consent. If abandoning the approval, use Portal's **Cancel outstanding approvals**, which sends `invalidateNonce()` from the parent and invalidates all its pending approvals. Clearing JSON or cancelling a local request does not revoke on-chain consent.
 

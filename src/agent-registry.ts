@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Intent } from "./wallet/journal.js";
 import { WalletError } from "./wallet/errors.js";
+import { uint } from "./wallet/policy.js";
 
 export const REGISTRY_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 export const agentRegistryAbi = parseAbi([
@@ -24,7 +25,6 @@ export const agentRegistryAbi = parseAbi([
 ]);
 const accountSignatureAbi = parseAbi(["function isValidSignature(bytes32 hash,bytes signature) view returns(bytes4)"]);
 const addr = z.string().regex(/^0x[0-9a-fA-F]{40}$/).refine(a => !/^0x0{40}$/i.test(a));
-const uint = z.string().regex(/^(0|[1-9][0-9]*)$/).refine(s => BigInt(s) < 2n ** 256n);
 export const registryApprovalSchema = z.strictObject({
   version: z.literal(1), chain_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), registry: addr,
   parent: addr, agent: addr, parent_nonce: uint,
@@ -45,6 +45,11 @@ export function registryCapability(cfg: Config) {
   const capability = cfg.manifest.agentRegistry;
   if (!capability) throw new WalletError("registry_unavailable", "Agent Registry is not enabled in this network's approved manifest");
   return capability;
+}
+/** A wallet can open under a manifest that adds the registry before approving it; registry use still requires approval. */
+export function assertRegistryApproved(cfg: Config, wallet: { approvedCapabilityManifestId: string }) {
+  registryCapability(cfg);
+  if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId) throw new WalletError("capability_manifest_unapproved", "This wallet has not approved the Agent Registry. Review it with wallet capabilities approve in your local terminal");
 }
 export function registryPinsMatch(cfg: Config, slot: string | undefined, domain: readonly [string, string, string, bigint, string, ...unknown[]]): boolean {
   const cap = registryCapability(cfg);
@@ -78,6 +83,11 @@ export async function registryStatus(client: PublicClient, cfg: Config, agent: A
     parent_is_agent: parentState ? !/^0x0{40}$/i.test(parentState[1]) : undefined,
     parent_agent_count: parentState?.[2].toString(), parent_nonce: parentState?.[3].toString() };
 }
+/** Why this agent cannot link to any parent; the contract checks a deployed agent itself and the factory only for a new one. */
+export function linkBlocker(status: { parent: string; agent_is_parent: boolean; agent_eligible: boolean; factory_allowed: boolean }, deployed: boolean): [code: string, message: string] | undefined {
+  if (!/^0x0{40}$/i.test(status.parent)) return ["registry_already_linked", "Agent is already linked; refresh status or unlink first"];
+  if (status.agent_is_parent || (deployed ? !status.agent_eligible : !status.factory_allowed)) return ["registry_ineligible", "Account roles or allowed factories do not permit this link"];
+}
 export function registryCall(cfg: Config, agent: Address, intent: Intent) {
   const cap = registryCapability(cfg);
   if (intent.kind === "unlink_agent") return { to: cap.proxy.address, value: 0n, data: encodeFunctionData({ abi: agentRegistryAbi, functionName: "unlink" }) };
@@ -97,11 +107,12 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
   }
   const a = intent.registryApproval!;
   const localNow = Math.floor(Date.now() / 1000);
-  if (state.timestamp < localNow - 60 || state.timestamp > localNow + 30) throw new WalletError("registry_verification_failed", "Registry RPC block is stale or in the future");
+  if (state.timestamp < localNow - 60 || state.timestamp > localNow + 30) throw new WalletError("registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request");
   const now = Math.max(localNow, state.timestamp);
   if (Number(a.parent_deadline) <= now + 10) throw new WalletError("registry_approval_expired", "Portal approval expired or is too close to expiry; obtain a fresh approval");
-  if (!/^0x0{40}$/i.test(status.parent)) throw new WalletError("registry_already_linked", "Agent is already linked; refresh status or unlink first");
-  if (status.agent_is_parent || status.parent_is_agent || !status.parent_eligible || !status.factory_allowed || (state.deployed && !status.agent_eligible)) throw new WalletError("registry_ineligible", "Account roles or allowed factories do not permit this link");
+  const blocked = linkBlocker(status, state.deployed);
+  if (blocked) throw new WalletError(...blocked);
+  if (status.parent_is_agent || !status.parent_eligible) throw new WalletError("registry_ineligible", "Account roles or allowed factories do not permit this link");
   if (BigInt(status.parent_agent_count!) >= BigInt(status.max_agents)) throw new WalletError("registry_limit_reached", "Parent has reached its agent limit; unlink an agent in Portal first");
   if (status.parent_nonce !== a.parent_nonce) throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval");
   const cap = registryCapability(cfg);

@@ -1,4 +1,4 @@
-import { isRegistryIntent, registryCapability } from "../agent-registry.js";
+import { isRegistryIntent, registryCapability, linkBlocker } from "../agent-registry.js";
 import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { type Hex } from "viem";
@@ -143,8 +143,8 @@ export class WalletService {
       }
       r ??= await journal.create(requestId, intent);
       try {
+        if (existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
         const state = await this.chain.state(s.envelope);
-        if (existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent, state);
         const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits));
         const used = journal.used();
         // First policy evaluation precedes building; violations may build an unsigned review candidate.
@@ -196,7 +196,9 @@ export class WalletService {
         await this.canSubmit(s, r);
         await journal.transition(r, "signed"); // fsync completes before any submission.
       } catch (error) {
-        if (r.status === "preparing") { r.lastError = error instanceof WalletError ? error.code : "validation_failed"; await journal.transition(r, "failed"); }
+        // An RPC outage says nothing about the consent, so the same request ID and any local approval stay usable.
+        if (r.status === "preparing" && error instanceof WalletError && error.code === "registry_rpc_unavailable") await journal.transition(r, "approval_required");
+        else if (r.status === "preparing") { r.lastError = error instanceof WalletError ? error.code : "validation_failed"; await journal.transition(r, "failed"); }
         if (error instanceof WalletError) throw error;
         throw new WalletError("validation_failed", "Local operation preparation failed");
       }
@@ -223,6 +225,8 @@ export class WalletService {
     return this.store.session(async s => {
       const cap = registryCapability(this.ctx.config);
       const status = await this.chain.registryStatus(s.envelope);
+      const blocked = linkBlocker(status, status.deployed);
+      if (blocked) return { ...status, link_blocked: blocked[0], next_action: `${blocked[1]}. Do not ask the user to sign in Portal.` };
       const url = new URL(cap.portalUrl);
       url.searchParams.set("agent", s.envelope.account);
       url.searchParams.set("chain_id", String(this.ctx.config.identity.chainId));
