@@ -25,7 +25,7 @@ export function assertWalletNetwork(cfg: Config, wallet: {
     throw new NetworkError("wallet_network_mismatch", "The existing wallet belongs to a different network identity. For the supported Incentiv account upgrade, use wallet upgrade-implementation in your local terminal");
   }
   if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId) {
-    throw new NetworkError("capability_manifest_unapproved", "The wallet has not approved this capability manifest");
+    throw new NetworkError("capability_manifest_unapproved", "The wallet has not approved this capability manifest. Review it with wallet capabilities approve in your local terminal");
   }
 }
 

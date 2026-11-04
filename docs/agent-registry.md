@@ -27,16 +27,18 @@ The registry's `link(address,address,uint256,bytes,uint256,bytes)` and `unlink()
 
 ## Existing wallets
 
-Save the previous complete network configuration before updating. With the proposed configuration selected, run:
+After updating, run:
 
 ```sh
-incentiv-mcp wallet capabilities approve --previous /absolute/path/previous-config.json
+incentiv-mcp wallet capabilities approve
 incentiv-mcp setup
 ```
 
+Wallet tools report `capability_manifest_unapproved` until you do. The command derives the previous manifest by removing the registry from the active configuration. With a custom network that changes anything else, pass `--previous /absolute/path/previous-config.json`.
+
 Approval preserves wallet identity, addresses, keys and journal history. It refuses unresolved signed operations and disables policy until reviewed again. Registry configuration is optional, without defaults, so old configuration and policy MACs remain valid. Adding the registry changes `manifestId`, not `networkId`.
 
-If you still need the older account implementation upgrade, complete it using a complete configuration with the existing capabilities first. Approve the registry capability separately afterward; implementation upgrades cannot also change capabilities.
+If your wallet is on the older account implementation, run `wallet upgrade-implementation` first, then the commands above. Implementation upgrades cannot also change capabilities. Backups from before the registry restore with `wallet restore --in`, followed by the same steps.
 
 The manifest pins the proxy and implementation bytecode, implementation slot and EIP-712 domain. A registry upgrade requires a reviewed capability update. No retired registry is used.
 

@@ -3,8 +3,8 @@ import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { MAINNET, configurationId } from "../src/config.ts";
-import { assertImplementationUpgrade, previousImplementationConfig } from "../src/account-upgrade.ts";
+import { MAINNET as PACKAGED, configurationId } from "../src/config.ts";
+import { assertImplementationUpgrade, previousImplementationConfig, withoutAgentRegistry } from "../src/account-upgrade.ts";
 import { Ctx } from "../src/context.ts";
 import { deriveSmartAccount, NetworkError } from "../src/network.ts";
 import { WalletStore } from "../src/wallet/store.ts";
@@ -17,6 +17,8 @@ import { parseEnvelope, unlockWallet } from "../src/wallet/keystore.ts";
 import { exists } from "../src/wallet/files.ts";
 import { fixture, args, password, limits } from "../scripts/wallet-pipeline-fixture.mjs";
 
+// Implementation upgrades target the current manifest without the registry capability.
+const MAINNET = withoutAgentRegistry(PACKAGED);
 const previous = previousImplementationConfig(MAINNET);
 const snapshot = root => Promise.all(["wallet.json", "operations/journal.json"].map(async path => {
   try { return await readFile(join(root, "wallet", path)); }
@@ -27,7 +29,7 @@ const approve = async (store, passphrase = password, initialLimits) => approveIm
 test("implementation approval accepts only the reviewed network transition and preserves address derivation", () => {
   assert.equal(previous.identity.accountImplementation.address.toLowerCase(), "0x43fb62a71d0ce27fd6ab70347a438d67ec2dfc6c");
   assert.equal(previous.identity.networkId, "0xd2710c6ff1e86a0c66fb2274612b5f8b770e7b4956cd59ca70b7edc328b11d49");
-  assert.equal(previous.manifest.manifestId, "0xfa52eb6b578f55901b3d47d83944ad72e0c18a39c47c882537cf0402ba99017d");
+  assert.equal(previous.manifest.manifestId, "0x6fe24377ccfc78465ee7febb06cbc71eb0a975285432b5f15531438dbc2877c4");
   const owner = "0xb6204d2a6f872e96ed273fefbe9b3190099fa4f9";
   assert.equal(deriveSmartAccount(previous, owner), deriveSmartAccount(MAINNET, owner));
   const customEndpoint = structuredClone(MAINNET);

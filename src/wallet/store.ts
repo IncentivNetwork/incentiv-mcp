@@ -72,6 +72,9 @@ export class WalletStore {
     }
   }
 
+  /** The same wallet storage under another configuration, for reviewed CLI transitions. */
+  withConfig(config: Config) { return new WalletStore(config, this.deps); }
+
   reviewOrphan() { return orphanRecovery(this.deps); }
   recoverOrphan(passphrase: Buffer, reviewedDigest: string) { return orphanRecovery(this.deps, { passphrase, reviewedDigest }); }
 

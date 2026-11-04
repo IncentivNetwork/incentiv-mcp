@@ -15,6 +15,11 @@ import { WalletChain } from "../src/wallet/chain.ts";
 import { Ctx } from "../src/context.ts";
 import { computeUserOpHash, encodeExecuteBatch, userOpToJson } from "../src/userop.ts";
 import { fixture, limits, password, unsigned } from "../scripts/wallet-pipeline-fixture.mjs";
+import { join } from "node:path";
+import { previousImplementationConfig, withoutAgentRegistry } from "../src/account-upgrade.ts";
+import { approveImplementation, reviewImplementation } from "../src/wallet/implementation.ts";
+import { backupWallet, restoreCurrentOrPreRegistry } from "../src/wallet/backup.ts";
+import { WalletStore } from "../src/wallet/store.ts";
 
 const zero = `0x${"00".repeat(20)}`, parent = "0x0000000000000000000000000000000000000002";
 const owner = privateKeyToAccount(`0x${"01".padStart(64, "0")}`), agent = deriveSmartAccount(MAINNET, owner.address);
@@ -189,6 +194,44 @@ test("registry capability approval preserves wallet identity and legacy journal 
   await proposedStore.session(async s => { assert.equal(s.envelope.policy.enabled, false); await Journal.open(s); });
 });
 
+
+test("derived configurations reproduce the manifest IDs that released wallets approved", () => {
+  assert.equal(withoutAgentRegistry(MAINNET).manifest.manifestId, "0x46e12b725e59f3f5c3fc3f39c48eb6e4301a5cfdb5f06b7df2a5c02cf65d77b4");
+  assert.equal(previousImplementationConfig(MAINNET).manifest.manifestId, "0x6fe24377ccfc78465ee7febb06cbc71eb0a975285432b5f15531438dbc2877c4");
+});
+
+test("a released default-config wallet approves the registry without a previous configuration file", async t => {
+  const base = withoutAgentRegistry(MAINNET), f = await fixture(t, { config: base }), before = await f.store.createOrLoad();
+  const store = new WalletStore(MAINNET, f.deps);
+  await assert.rejects(store.createOrLoad(), { code: "capability_manifest_unapproved" });
+  await approveCapabilities(store, base, MAINNET, password, digest(await reviewCapabilities(store, base, MAINNET)));
+  assert.equal((await store.createOrLoad()).account, before.account);
+});
+
+test("a previous-implementation wallet upgrades, then approves the registry as a separate step", async t => {
+  const base = withoutAgentRegistry(MAINNET), f = await fixture(t, { config: previousImplementationConfig(MAINNET) }), before = await f.store.createOrLoad();
+  const full = new WalletStore(MAINNET, f.deps), upgrade = full.withConfig(base);
+  await assert.rejects(approveImplementation(full, MAINNET, password, digest(await reviewImplementation(full, MAINNET))), { code: "policy_denied" });
+  await approveImplementation(upgrade, base, password, digest(await reviewImplementation(upgrade, base)));
+  await upgrade.session(async s => { assert.equal(s.envelope.approvedCapabilityManifestId, base.manifest.manifestId); assert.equal(s.envelope.networkIdentity.networkId, MAINNET.identity.networkId); });
+  await assert.rejects(full.createOrLoad(), { code: "capability_manifest_unapproved" });
+  await approveCapabilities(full, base, MAINNET, password, digest(await reviewCapabilities(full, base, MAINNET)));
+  const after = await full.createOrLoad();
+  assert.equal(after.account, before.account); assert.equal(after.owner, before.owner);
+});
+
+test("a backup from before the registry restores under its approved manifest, then approves the registry", async t => {
+  const base = withoutAgentRegistry(MAINNET), source = await fixture(t, { config: base }), target = await fixture(t, { existing: true });
+  const recovery = Buffer.from("recovery passphrase for test"), before = await source.store.createOrLoad();
+  const out = join(source.parent, "pre-registry-backup.json");
+  await backupWallet(base, source.store, out, password, recovery);
+  const store = new WalletStore(MAINNET, target.deps);
+  await restoreCurrentOrPreRegistry(MAINNET, store, out, recovery);
+  await assert.rejects(store.createOrLoad(), { code: "capability_manifest_unapproved" });
+  await approveCapabilities(store, base, MAINNET, password, digest(await reviewCapabilities(store, base, MAINNET)));
+  assert.equal((await store.createOrLoad()).account, before.account);
+  await assert.rejects(restoreCurrentOrPreRegistry(MAINNET, store, out, Buffer.from("wrong recovery passphrase")), { code: "backup_authentication_failed" });
+});
 
 test("registry errors produce bounded actionable codes without forwarding raw revert data", () => {
   for (const [errorName, args, expected] of [["NotLinked", [agent], "registry_link_changed"], ["SelfLink", [], "registry_ineligible"], ["InvalidAgentSignature", [], "registry_agent_signature_invalid"], ["InvalidParentSignature", [], "registry_approval_invalid"], ["SignatureExpired", [1n], "registry_approval_expired"], ["AgentLimitReached", [parent, 5n], "registry_limit_reached"]]) {

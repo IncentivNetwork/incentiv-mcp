@@ -32,7 +32,8 @@ history and pending signed operations are preserved. The command sends no funds
 and leaves sending disabled; check pending operations and review policy using
 `setup` or `wallet policy configure` before enabling it again. Do not delete the
 wallet or create a replacement to work around a mismatch. New wallets use the
-current implementation directly.
+current implementation directly. To use the Agent Registry afterward, run
+`wallet capabilities approve`; see [Agent Registry](agent-registry.md).
 
 For an old encrypted backup, restore into an empty profile with:
 

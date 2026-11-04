@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
 import { canonicalJson, type Config } from "../config.js";
-import { previousImplementationConfig } from "../account-upgrade.js";
+import { previousImplementationConfig, withoutAgentRegistry } from "../account-upgrade.js";
 import { authenticateWallet, parseEnvelope, sealWallet, unlockWallet, WalletError } from "./keystore.js";
 import { authorize, scrypt } from "./policy.js";
 import { digest, Journal, journalApprovesManifest, journalApprovesNetwork, journalSchema, ownsNonce, type JournalData } from "./journal.js";
@@ -97,6 +97,16 @@ export async function restoreWallet(config: Config, store: WalletStore, input: s
       await Journal.open(session);
     } });
   } finally { snapshot.wrappingKey.fill(0); }
+}
+
+/** Ordinary restore; a backup from before the registry capability restores under the manifest it approved. */
+export async function restoreCurrentOrPreRegistry(config: Config, store: WalletStore, input: string, recovery: Buffer) {
+  try { return await restoreWallet(config, store, input, recovery); }
+  catch (error) {
+    if (!(error instanceof WalletError) || error.code !== "backup_authentication_failed" || !config.manifest.agentRegistry) throw error;
+    const base = withoutAgentRegistry(config);
+    return await restoreWallet(base, store.withConfig(base), input, recovery);
+  }
 }
 
 export async function migrateWallet(store: WalletStore, target: number) {

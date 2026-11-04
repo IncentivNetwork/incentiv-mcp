@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createCipheriv, hkdfSync, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { MAINNET, configurationId } from "../src/config.ts";
+import { MAINNET } from "../src/config.ts";
 import { previousImplementationConfig } from "../src/account-upgrade.ts";
 import { authenticateWallet, ownerAddress, parseEnvelope, sealWallet, walletAad } from "../src/wallet/keystore.ts";
 
@@ -23,10 +23,7 @@ test("keystore v1 published vector authenticates and matches independent AES/HKD
   cipher.setAAD(Buffer.from(vector.aadUtf8));
   assert.equal(Buffer.concat([cipher.update(Buffer.from(vector.ownerKeyHex, "hex")), cipher.final()]).toString("base64"), wallet.cipher.ciphertext);
   assert.equal(cipher.getAuthTag().toString("base64"), wallet.cipher.tag);
-  const legacy = structuredClone(MAINNET);
-  delete legacy.manifest.agentRegistry;
-  legacy.manifest.manifestId = configurationId(legacy.manifest, "manifestId");
-  authenticateWallet(previousImplementationConfig(legacy), wallet, key);
+  authenticateWallet(previousImplementationConfig(MAINNET), wallet, key);
   assert.equal(ownerAddress(ownerKey), "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf");
   key.fill(0); aes.fill(0);
 });

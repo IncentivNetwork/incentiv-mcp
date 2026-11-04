@@ -182,7 +182,7 @@ Storage errors do not include raw credential-provider or filesystem error payloa
 incentiv-mcp wallet policy configure
 incentiv-mcp wallet doctor
 incentiv-mcp wallet init
-incentiv-mcp wallet capabilities approve --previous <config.json>
+incentiv-mcp wallet capabilities approve [--previous <config.json>]
 incentiv-mcp wallet recover
 incentiv-mcp wallet approve <request-id>
 incentiv-mcp wallet disable
