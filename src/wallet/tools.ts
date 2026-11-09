@@ -8,11 +8,12 @@ import type { WalletService } from "./service.js";
 
 export function registerWalletTools(server: McpServer, wallet: WalletService): ToolDoc[] {
   const catalog: ToolDoc[] = [];
-  // "sign" uses the wallet key but never changes chain state, so clients need not treat it as destructive.
+  // "sign" never changes chain state, but it hands out a signature that cannot be withdrawn, so clients
+  // should still confirm it, and each call signs anew rather than repeating the last result.
   const add = (name: string, description: string, shape: Record<string, z.ZodType>, kind: boolean | "sign", handler: (args: Record<string, unknown>) => Promise<unknown>) => {
     const readOnly = kind === true, signs = kind === "sign";
     catalog.push({ name, description, readOnly, signs, params: Object.entries(shape).map(([name, schema]) => ({ name, required: !schema.isOptional() })) });
-    server.registerTool(name, { description, inputSchema: z.strictObject(shape), annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly && !signs, idempotentHint: true, openWorldHint: true } }, async args => {
+    server.registerTool(name, { description, inputSchema: z.strictObject(shape), annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: !signs, openWorldHint: true } }, async args => {
       try { return { content: [{ type: "text" as const, text: JSON.stringify(await handler(args)) }] }; }
       catch (error) {
         const known = error instanceof WalletError || error instanceof NetworkError;

@@ -21,6 +21,7 @@ import { approveImplementation, reviewImplementation } from "../src/wallet/imple
 import { backupWallet, restoreWallet } from "../src/wallet/backup.ts";
 import { WalletStore } from "../src/wallet/store.ts";
 import { WalletError } from "../src/wallet/errors.ts";
+import { WalletService } from "../src/wallet/service.ts";
 import { reviewUpgrade } from "../src/wallet/cli.ts";
 
 const zero = `0x${"00".repeat(20)}`, parent = "0x0000000000000000000000000000000000000002";
@@ -747,7 +748,8 @@ async function signedLinkFixture(t, allowed = true, status = {}, policy = {}) {
   f.chain.agentLinkConsent = async (_wallet, requested, notAfter) => {
     calls.push(["consent", requested, notAfter]);
     const current = { parent: zero, agent: f.approval.agent, agent_is_parent: false, agent_eligible: true, factory_allowed: true, max_agents: "5", requested_parent: requested, parent_eligible: true, parent_is_agent: false, parent_agent_count: "0", parent_nonce: "0", deployed: true, ...status };
-    const blocked = linkBlocker(current, current.deployed) ?? parentBlocker(current, requested);
+    const soon = current.deployed && notAfter !== undefined && notAfter < Math.floor(Date.now() / 1000) + 15 * 60;
+    const blocked = (soon ? ["policy_expired", "Local wallet policy has expired or expires too soon"] : undefined) ?? linkBlocker(current, current.deployed) ?? parentBlocker(current, requested);
     return blocked || !current.deployed ? { status: current, blocked } : { status: current, consent: { nonce: 4n, digest: digestToSign, deadline: 1900000000n, block: 7n } };
   };
   f.chain.verifyAgentLinkSignature = async (_wallet, digest, signature, block) => { calls.push(["verify", digest, signature, block]); };
@@ -774,9 +776,16 @@ test("prepare_agent_link caps the consent at local policy expiry and refuses a p
   const f = await signedLinkFixture(t, true, {}, { expiresAt });
   assert.equal((await f.service.prepareAgentLink(parent)).agent_signed, true);
   assert.deepEqual(f.calls[0], ["consent", parent, Math.floor(expiresAt / 1000)]);
-  const soon = await signedLinkFixture(t, true, {}, { expiresAt: Date.now() + 60_000 });
+  const soonAt = Date.now() + 60_000, soon = await signedLinkFixture(t, true, {}, { expiresAt: soonAt });
   const refused = await soon.service.prepareAgentLink(parent);
-  assert.equal(refused.link_blocked, "policy_expired"); assert.equal(refused.portal_url, undefined); assert.deepEqual(soon.calls, []);
+  assert.equal(refused.link_blocked, "policy_expired"); assert.match(refused.next_action, /Do not ask the user to sign/); assert.equal(refused.portal_url, undefined);
+  assert.deepEqual(soon.calls, [["consent", parent, Math.floor(soonAt / 1000)]]);
+});
+
+test("a release with candidate signing disabled refuses to sign link consent before any registry read", async t => {
+  const f = await signedLinkFixture(t), service = new WalletService(f.service.ctx, f.store, f.chain, false);
+  const refused = await service.prepareAgentLink(parent);
+  assert.equal(refused.link_blocked, "wallet_release_unreviewed"); assert.match(refused.next_action, /without parent/); assert.deepEqual(f.calls, []);
 });
 
 test("prepare_agent_link signs nothing for a parent that local policy or the registry refuses", async t => {
@@ -831,7 +840,11 @@ test("the chain reads status and digest at one block, with a deadline capped by 
   assert.equal(full.consent.digest, agentLinkDigest(MAINNET, agent, parent, 0n, full.consent.deadline));
   const capped = await consentChain([deployedAgent()], now).agentLinkConsent(consentWallet, parent, now + 3600);
   assert.equal(capped.consent.deadline, BigInt(now + 3600));
-  await assert.rejects(consentChain([deployedAgent()], now).agentLinkConsent(consentWallet, parent, now + 60), { code: "policy_expired" });
+  // A policy ending within 15 minutes of the block's time is refused like the registry's own blockers, and nothing is read for signing.
+  const soon = await consentChain([deployedAgent()], now).agentLinkConsent(consentWallet, parent, now + 60);
+  assert.equal(soon.blocked[0], "policy_expired"); assert.equal(soon.consent, undefined);
+  const ahead = await consentChain([deployedAgent()], now + 20).agentLinkConsent(consentWallet, parent, now + 15 * 60 + 10);
+  assert.equal(ahead.blocked[0], "policy_expired");
 });
 
 test("the chain signs nothing from a stale block, a blocked parent or disagreeing RPCs", async () => {

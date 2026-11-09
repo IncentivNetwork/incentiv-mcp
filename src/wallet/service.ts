@@ -1,4 +1,4 @@
-import { AGENT_LINK_MIN_SECONDS, isRegistryIntent, registryCapability, linkBlocker } from "../agent-registry.js";
+import { isRegistryIntent, registryCapability, linkBlocker } from "../agent-registry.js";
 import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { type Hex } from "viem";
@@ -262,7 +262,8 @@ export class WalletService {
       const limits = await this.enabled(s).catch((error: unknown) => { if (error instanceof WalletError) return error; throw error; });
       if (limits instanceof WalletError) return refuse(local, [limits.code, limits.message]);
       if (!registryParentAllowed(limits, requested)) return refuse(local, ["registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call prepare_agent_link again"]);
-      if (limits.expiresAt && limits.expiresAt - Date.now() < AGENT_LINK_MIN_SECONDS * 1000) return refuse(local, ["policy_expired", "Local wallet policy has expired or expires too soon. Renew it with incentiv-mcp setup in your local terminal"]);
+      if (!this.signingEnabled) return refuse(local, ["wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent. Use prepare_agent_link without parent and the Portal approval flow"]);
+      // How soon the policy ends is decided against the block's clock, with the deadline, in agentLinkConsent.
       const { status, blocked, consent } = await this.chain.agentLinkConsent(s.envelope, requested, limits.expiresAt ? Math.floor(limits.expiresAt / 1000) : undefined);
       if (blocked) return refuse(status, blocked);
       // The registry checks a signature through the agent account's ERC-1271, so an undeployed agent cannot consent this way.

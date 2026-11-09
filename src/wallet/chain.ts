@@ -179,20 +179,33 @@ export class WalletChain {
   /**
    * The registry status for `parent` and, when this deployed agent may consent to it, the AgentLink digest,
    * both read at one block every RPC agrees on. The deadline runs from that block's time and never passes
-   * `notAfter` (Unix seconds), so the consent cannot outlive the local policy that allowed it.
+   * `notAfter` (Unix seconds), so the consent cannot outlive the local policy that allowed it. A policy
+   * ending too soon is refused here, against the same clock that sets the deadline.
    */
   async agentLinkConsent(wallet: WalletEnvelope, parent: Address, notAfter?: number) {
     return this.registryRead(wallet, async () => {
-      const state = await this.state(wallet);
-      const status = await this.registryStatusAt(wallet, state, parent);
-      const blocked = linkBlocker(status, state.deployed) ?? parentBlocker(status, parent);
-      if (blocked || !state.deployed) return { status, blocked };
-      const now = freshBlockTime(state.timestamp);
-      const deadline = Math.min(now + AGENT_LINK_REQUEST_SECONDS, notAfter ?? Number.MAX_SAFE_INTEGER);
-      if (deadline < now + AGENT_LINK_MIN_SECONDS) throw new WalletError("policy_expired", "Local wallet policy expires too soon to sign a link request; renew it with incentiv-mcp setup in your local terminal");
-      const results = await Promise.all(this.clients.map(client => readAgentLinkDigest(client, this.ctx.config, wallet.account as Address, parent, BigInt(deadline), state.block)));
-      if (!same(results.map(r => `${r.nonce}:${r.digest}`))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
-      return { status, blocked, consent: { ...results[0], deadline: BigInt(deadline), block: state.block } };
+      const cfg = this.ctx.config, agent = wallet.account as Address, state = await this.state(wallet);
+      // Only a deployed agent signs, so only then do the block's time and the policy's expiry matter.
+      let deadline: bigint | undefined, expiring: [code: string, message: string] | undefined;
+      if (state.deployed) {
+        const now = freshBlockTime(state.timestamp), end = Math.min(now + AGENT_LINK_REQUEST_SECONDS, notAfter ?? Number.MAX_SAFE_INTEGER);
+        if (end < now + AGENT_LINK_MIN_SECONDS) expiring = ["policy_expired", "Local wallet policy has expired or expires too soon. Renew it with incentiv-mcp setup in your local terminal"];
+        else deadline = BigInt(end);
+      }
+      const results = await Promise.all(this.clients.map(async client => {
+        await verifyRegistryDeployment(client, cfg, state.block);
+        // The digest is a view read, so it runs beside the status; it is used only if nothing blocks the link.
+        const [status, link] = await Promise.all([
+          registryStatus(client, cfg, agent, parent, state.block),
+          deadline === undefined ? undefined : readAgentLinkDigest(client, cfg, agent, parent, deadline, state.block),
+        ]);
+        return { status, link };
+      }));
+      if (!same(results.map(r => JSON.stringify(r.status))) || !same(results.map(r => r.link && `${r.link.nonce}:${r.link.digest}`))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+      const status = { ...results[0].status, deployed: state.deployed }, link = results[0].link;
+      const blocked = expiring ?? linkBlocker(status, state.deployed) ?? parentBlocker(status, parent);
+      if (blocked || !link || deadline === undefined) return { status, blocked };
+      return { status, blocked, consent: { ...link, deadline, block: state.block } };
     });
   }
   async verifyAgentLinkSignature(wallet: WalletEnvelope, digest: Hex, signature: Hex, block: bigint) {
