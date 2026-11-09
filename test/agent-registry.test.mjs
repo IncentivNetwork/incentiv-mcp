@@ -6,7 +6,7 @@ import { createPublicClient, custom, encodeAbiParameters, encodeEventTopics, Htt
 import { privateKeyToAccount } from "viem/accounts";
 import { MAINNET, configurationId, parseConfig, withoutAgentRegistry } from "../src/config.ts";
 import { deriveSmartAccount } from "../src/network.ts";
-import { agentRegistryAbi, hasRegistryEvent, registryApprovalSchema, registryCall, registryRevertCode, verifyRegistryDeployment, verifyRegistryIntent } from "../src/agent-registry.ts";
+import { agentLinkDigest, agentRegistryAbi, assertAgentSignature, hasRegistryEvent, readAgentLinkDigest, registryApprovalSchema, registryCall, registryRevertCode, verifyRegistryDeployment, verifyRegistryIntent } from "../src/agent-registry.ts";
 import { intentSchema, Journal, digest, ownsNonce } from "../src/wallet/journal.ts";
 import { validateOperation } from "../src/wallet/validate.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
@@ -46,6 +46,7 @@ function client(overrides = {}) {
       if (functionName === "maxAgentsPerParent") return 5n;
       if (functionName === "agentCount" || functionName === "nonces") return 0n;
       if (functionName === "parentLinkDigest") return digestToSign;
+      if (functionName === "agentLinkDigest") return agentLinkDigest(MAINNET, args[1], args[0], 0n, args[2]);
       if (functionName === "isValidSignature") return (await recoverMessageAddress({ message: { raw: args[0] }, signature: args[1] })) === owner.address ? "0x1626ba7e" : "0xffffffff";
       assert.fail(functionName);
     },
@@ -722,3 +723,64 @@ test("registry reverts expose actionable error and fresh-consent guidance throug
   assert.equal(result.registry_error, "registry_approval_invalid");
   assert.match(result.next_action, /fresh approval in Portal/);
 });
+
+test("the agent-link digest matches the mainnet registry", () => {
+  // agentLinkDigest(0x…02, 0x…03, 1900000000) read from the mainnet proxy, where 0x…03 has nonce 0.
+  assert.equal(agentLinkDigest(MAINNET, "0x0000000000000000000000000000000000000003", parent, 0n, 1900000000n), "0xb6e5540180a89bd960609763d2464a49209c61af3b0bb2c11766dad62dee249b");
+});
+
+test("the agent signs only a locally computed digest that the registry agrees with", async () => {
+  const read = await readAgentLinkDigest(client(), MAINNET, agent, parent, 1900000000n, 123n);
+  assert.deepEqual(read, { nonce: 0n, digest: agentLinkDigest(MAINNET, agent, parent, 0n, 1900000000n) });
+  const c = client(), good = c.readContract;
+  c.readContract = args => args.functionName === "agentLinkDigest" ? Promise.resolve(digestToSign) : good(args);
+  await assert.rejects(readAgentLinkDigest(c, MAINNET, agent, parent, 1900000000n, 123n), { code: "registry_verification_failed" });
+  const signed = await owner.signMessage({ message: { raw: read.digest } });
+  await assertAgentSignature(client(), agent, read.digest, signed, 123n);
+  const stranger = privateKeyToAccount(`0x${"02".padStart(64, "0")}`);
+  await assert.rejects(assertAgentSignature(client(), agent, read.digest, await stranger.signMessage({ message: { raw: read.digest } }), 123n), { code: "registry_agent_signature_invalid" });
+});
+
+async function signedLinkFixture(t, allowed = true, status = {}) {
+  const f = await registryFixture(t, allowed), calls = [];
+  f.chain.registryStatus = async (_wallet, requested) => ({ parent: zero, agent: f.approval.agent, agent_is_parent: false, agent_eligible: true, factory_allowed: true, max_agents: "5", requested_parent: requested, parent_eligible: true, parent_is_agent: false, parent_agent_count: "0", parent_nonce: "0", deployed: true, ...status });
+  f.chain.agentLinkDigest = async (_wallet, requested) => { calls.push(["digest", requested]); return { nonce: 4n, digest: digestToSign, deadline: 1900000000n, block: 7n }; };
+  f.chain.verifyAgentLinkSignature = async (_wallet, digest, signature, block) => { calls.push(["verify", digest, signature, block]); };
+  return { ...f, calls };
+}
+
+test("prepare_agent_link with a parent signs this agent's consent for Portal to submit", async t => {
+  const f = await signedLinkFixture(t);
+  const prepared = await f.service.prepareAgentLink(parent);
+  assert.equal(prepared.agent_signed, true); assert.equal(prepared.link_blocked, undefined);
+  const url = new URL(prepared.portal_url), signature = url.searchParams.get("agent_signature");
+  assert.equal(url.searchParams.get("agent").toLowerCase(), f.approval.agent.toLowerCase());
+  assert.equal(url.searchParams.get("parent"), parent);
+  assert.equal(url.searchParams.get("agent_nonce"), "4");
+  assert.equal(url.searchParams.get("agent_deadline"), "1900000000");
+  const ownerAddress = await f.store.session(async s => s.envelope.owner);
+  assert.equal(await recoverMessageAddress({ message: { raw: digestToSign }, signature }), ownerAddress);
+  assert.deepEqual(f.calls, [["digest", parent], ["verify", digestToSign, signature, 7n]]);
+  assert.match(prepared.next_action, /Do not call link_agent/);
+});
+
+test("prepare_agent_link signs nothing for a parent that local policy or the registry refuses", async t => {
+  const denied = await signedLinkFixture(t, false);
+  const refused = await denied.service.prepareAgentLink(parent);
+  assert.equal(refused.link_blocked, "registry_parent_not_allowed"); assert.equal(refused.portal_url, undefined); assert.deepEqual(denied.calls, []);
+  for (const [status, code] of [[{ parent_agent_count: "5" }, "registry_limit_reached"], [{ parent_eligible: false }, "registry_ineligible"], [{ parent_is_agent: true }, "registry_ineligible"]]) {
+    const f = await signedLinkFixture(t, true, status);
+    const blocked = await f.service.prepareAgentLink(parent);
+    assert.equal(blocked.link_blocked, code); assert.equal(blocked.portal_url, undefined); assert.deepEqual(f.calls, []);
+  }
+});
+
+test("an undeployed agent keeps the approval flow, since the registry cannot check its signature", async t => {
+  const f = await signedLinkFixture(t, true, { deployed: false, agent_eligible: false });
+  const prepared = await f.service.prepareAgentLink(parent);
+  assert.equal(prepared.agent_signed, false); assert.deepEqual(f.calls, []);
+  const url = new URL(prepared.portal_url);
+  assert.equal(url.searchParams.get("agent_signature"), null);
+  assert.match(prepared.next_action, /link_agent/);
+});
+

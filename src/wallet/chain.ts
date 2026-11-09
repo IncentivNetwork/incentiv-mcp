@@ -1,4 +1,4 @@
-import { assertRegistryApproved, hasRegistryEvent, isContractRejection, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
+import { AGENT_LINK_REQUEST_SECONDS, assertAgentSignature, assertRegistryApproved, hasRegistryEvent, readAgentLinkDigest, isContractRejection, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
 import { BaseError, createPublicClient, decodeEventLog, HttpRequestError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError, TimeoutError, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
@@ -175,6 +175,21 @@ export class WalletChain {
       if (!same(results.map(r => JSON.stringify(r)))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
       return { ...results[0], deployed: state.deployed };
     });
+  }
+  /** The AgentLink digest for `parent`, agreed by every RPC at one block, with a deadline from that block's time. */
+  async agentLinkDigest(wallet: WalletEnvelope, parent: Address) {
+    return this.registryRead(wallet, async () => {
+      const state = await this.state(wallet);
+      const localNow = Math.floor(Date.now() / 1000);
+      if (state.timestamp < localNow - 60 || state.timestamp > localNow + 30) throw new WalletError("registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request");
+      const deadline = BigInt(Math.max(localNow, state.timestamp) + AGENT_LINK_REQUEST_SECONDS);
+      const results = await Promise.all(this.clients.map(client => readAgentLinkDigest(client, this.ctx.config, wallet.account as Address, parent, deadline, state.block)));
+      if (!same(results.map(r => `${r.nonce}:${r.digest}`))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+      return { ...results[0], deadline, block: state.block };
+    });
+  }
+  async verifyAgentLinkSignature(wallet: WalletEnvelope, digest: Hex, signature: Hex, block: bigint) {
+    await this.registryRead(wallet, () => Promise.all(this.clients.map(client => assertAgentSignature(client, wallet.account as Address, digest, signature, block))));
   }
   async build(wallet: WalletEnvelope, intent: Intent, state: ChainState, deadline?: number) {
     const input = await this.token(intent.token), gasToken = await this.token(intent.gasToken);

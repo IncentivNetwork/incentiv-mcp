@@ -1,4 +1,4 @@
-import { isRegistryIntent, registryCapability, linkBlocker } from "../agent-registry.js";
+import { isRegistryIntent, registryCapability, linkBlocker, parentBlocker } from "../agent-registry.js";
 import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { type Hex } from "viem";
@@ -10,7 +10,7 @@ import { userOpToJson } from "../userop.js";
 import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
 import { Journal, digest, intentSchema, ownsNonce, terminal, type Intent, type OperationRecord } from "./journal.js";
-import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, type Limits, type Spend } from "./policy.js";
+import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, type Limits, type Spend } from "./policy.js";
 import { MIN_SWAP_REMAINING_SECONDS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure } from "./chain.js";
 import { validateOperation } from "./validate.js";
 
@@ -234,17 +234,46 @@ export class WalletService {
   async registryStatus(parent?: string) {
     return this.store.session(s => this.chain.registryStatus(s.envelope, parent ? getAddress(parent) : undefined));
   }
-  async prepareAgentLink() {
+  /**
+   * The Portal URL that asks the user to connect this agent. With `parent`, the agent also signs its own
+   * AgentLink consent to that parent, so Portal can submit the link from the parent's account once the
+   * user trusts this agent. That needs the same authenticated local policy as link_agent: the parent must
+   * be allowed, and the wallet enabled for signing. The signature names this one parent, which still has
+   * to send the link itself, so it gives nobody else a way to link this agent.
+   */
+  async prepareAgentLink(parent?: string) {
     return this.store.session(async s => {
       const cap = registryCapability(this.ctx.config);
-      const status = await this.chain.registryStatus(s.envelope);
-      const blocked = linkBlocker(status, status.deployed);
+      const requested = parent ? getAddress(parent) : undefined;
+      const status = await this.chain.registryStatus(s.envelope, requested);
+      const blocked = linkBlocker(status, status.deployed) ?? (requested ? parentBlocker(status, requested) : undefined);
       if (blocked) return { ...status, link_blocked: blocked[0], next_action: `${blocked[1]}. Do not ask the user to sign in Portal.` };
       const url = new URL(cap.portalUrl);
       url.searchParams.set("agent", s.envelope.account);
       url.searchParams.set("chain_id", String(this.ctx.config.identity.chainId));
       url.searchParams.set("registry", cap.proxy.address);
-      return { ...status, portal_url: url.href, next_action: "Open Portal, review and sign the connection, then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest." };
+      const approvalFlow = "Open Portal, review and sign the connection, then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest.";
+      if (!requested) return { ...status, portal_url: url.href, next_action: approvalFlow };
+      // The registry checks a signature through the agent account's ERC-1271, so an undeployed agent cannot consent this way.
+      if (!status.deployed) return { ...status, portal_url: url.href, agent_signed: false, next_action: `This agent is not deployed yet, so Portal cannot submit the link. ${approvalFlow}` };
+      const limits = await this.enabled(s);
+      if (!registryParentAllowed(limits, requested)) return { ...status, link_blocked: "registry_parent_not_allowed", next_action: "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call prepare_agent_link again. Do not ask the user to sign in Portal." };
+      if (limits.expiresAt && Date.now() >= limits.expiresAt) return { ...status, link_blocked: "policy_expired", next_action: "Local wallet policy expired. Renew it with incentiv-mcp setup in your local terminal. Do not ask the user to sign in Portal." };
+      await this.canSubmit(s);
+      const consent = await this.chain.agentLinkDigest(s.envelope, requested);
+      const privateKey = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
+      let signature: Hex;
+      try {
+        // The account checks its owner's EIP-191 signature over the digest bytes, as for operations.
+        signature = await privateKeyToAccount(`0x${privateKey.toString("hex")}`).signMessage({ message: { raw: consent.digest } });
+      } finally { privateKey.fill(0); }
+      await this.chain.verifyAgentLinkSignature(s.envelope, consent.digest, signature, consent.block);
+      url.searchParams.set("parent", requested);
+      url.searchParams.set("agent_nonce", consent.nonce.toString());
+      url.searchParams.set("agent_deadline", consent.deadline.toString());
+      url.searchParams.set("agent_signature", signature);
+      return { ...status, portal_url: url.href, agent_signed: true, agent_link: { parent: requested, agent_nonce: consent.nonce.toString(), agent_deadline: consent.deadline.toString() },
+        next_action: "Give this URL to the user. In Portal they trust this agent, then submit the connection from their account and pay its fee. Do not call link_agent. Check get_agent_registry_status afterwards. The request expires at agent_deadline, or earlier if this agent's registry nonce changes." };
     });
   }
   private balanceTokens(limits: Limits): string[] {
