@@ -283,7 +283,7 @@ for (const scenario of ["chain", "genesis", "code", "empty code", "beacon", "imp
 test("disabled bridge removes all four tools, remote access and matching docs in both modes", async () => {
   const cfg = structuredClone(MAINNET); cfg.manifest.bridge.enabled = false; identify(cfg);
   for (const bundle of [makeServer(new Ctx(cfg), () => []), await createLocalStdioMcpServer(new Ctx(cfg))]) {
-    assert.ok([20, 29].includes(bundle.catalog.length));
+    assert.ok([20, 30].includes(bundle.catalog.length));
     assert.ok(bundle.catalog.every((tool) => !tool.name.includes("bridge")));
     const markdown = renderMarkdown(cfg, bundle.catalog);
     const html = renderHtml(cfg, bundle.catalog);

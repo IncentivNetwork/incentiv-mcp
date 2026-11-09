@@ -41,7 +41,7 @@ Chain tools never hold keys. A `build_*` tool returns the fully populated **unsi
 | Build (unsigned) | `build_transfer`, `build_swap`, `build_transaction` |
 | Bridge | `get_bridge_routes`, `build_bridge_transfer`, `build_bridge_transfer_out`, `get_bridge_status` |
 | Broadcast (signed) | `broadcast_user_operation`, `broadcast_transaction` |
-| Local wallet (stdio only) | `create_agent_wallet`, `get_agent_wallet`, `send_transfer`, `send_swap`, `get_agent_operation`, `get_agent_registry_status`, `prepare_agent_link`, `link_agent`, `unlink_agent` |
+| Local wallet (stdio only) | `create_agent_wallet`, `get_agent_wallet`, `send_transfer`, `send_swap`, `get_agent_operation`, `get_agent_registry_status`, `prepare_agent_link`, `sign_agent_link`, `link_agent`, `unlink_agent` |
 
 Notable behaviors:
 
@@ -56,15 +56,15 @@ EOAs appear only where raw EVM data does (balances, and the plain-transaction hi
 
 ## Connect an agent to Portal
 
-If the agent account is already deployed, call `prepare_agent_link` with `parent` set to a Portal smart account that local policy allows. The agent signs its consent to that one parent and returns a Portal URL. The user trusts the agent in Portal and submits the connection from their own account, paying its fee. Do not call `link_agent` for this request. The consent expires after 24 hours, or earlier when local policy expires. Changing local policy afterwards does not withdraw it.
+If the agent account is already deployed, call `sign_agent_link` with `parent` set to a Portal smart account that local policy allows. The agent signs its consent to that one parent and returns a Portal URL. The user trusts the agent in Portal and submits the connection from their own account, paying its fee. Do not call `link_agent` for this request. The consent expires after 24 hours, or earlier when local policy expires. Changing local policy afterwards does not withdraw it.
 
-Otherwise, call `prepare_agent_link` without `parent` and open its Portal URL. Check the agent and parent smart-account addresses, approve the connection in Portal, and pass the returned approval JSON to `link_agent` with a fresh `request_id` UUID. Reuse that UUID for identical retries and check `get_agent_operation` for confirmation. The agent pays gas and can deploy in its first linking operation.
+Otherwise, call `prepare_agent_link` and open its Portal URL. Check the agent and parent smart-account addresses, approve the connection in Portal, and pass the returned approval JSON to `link_agent` with a fresh `request_id` UUID. Reuse that UUID for identical retries and check `get_agent_operation` for confirmation. The agent pays gas and can deploy in its first linking operation.
 
 Existing wallets must approve the new capability manifest and review their policy before using the registry. See [agent connection and migration](docs/agent-registry.md) for permissions, gas, stale approvals and unlinking. `get_agent_registry_status` shows the current relationship. A connection does not authorize spending from the parent.
 
 ## Configuration
 
-The server registers nine wallet tools without touching storage until one is called. `wallet doctor` checks the network and bundler without opening a wallet. `wallet init` creates a disabled wallet, and `wallet policy configure` sets the administration password through a no-echo terminal prompt. `wallet backup --out <file>` writes an encrypted backup, and `wallet restore --in <file>` restores into an empty namespace. `wallet capabilities approve --previous <config.json>` approves new capabilities and keeps the account. See [wallet storage and CLI](https://github.com/IncentivNetwork/incentiv-mcp/blob/main/docs/wallet-storage.md).
+The server registers ten wallet tools without touching storage until one is called. `wallet doctor` checks the network and bundler without opening a wallet. `wallet init` creates a disabled wallet, and `wallet policy configure` sets the administration password through a no-echo terminal prompt. `wallet backup --out <file>` writes an encrypted backup, and `wallet restore --in <file>` restores into an empty namespace. `wallet capabilities approve --previous <config.json>` approves new capabilities and keeps the account. See [wallet storage and CLI](https://github.com/IncentivNetwork/incentiv-mcp/blob/main/docs/wallet-storage.md).
 
 Runtime dependencies are exact, and the full dependency graph is published in `npm-shrinkwrap.json`. Installation never runs a wallet migration.
 

@@ -20,6 +20,9 @@ import { validateOperation } from "./validate.js";
 // There is no environment-variable or MCP-argument override.
 export const WALLET_CANDIDATE_SIGNING_ENABLED = true;
 
+const APPROVAL_FLOW = "Open Portal, review and sign the connection, then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest.";
+const linkRefusal = (status: object, [code, message]: [string, string]) => ({ ...status, link_blocked: code, next_action: `${message}. Do not ask the user to sign in Portal.` });
+
 export class WalletService {
   constructor(readonly ctx: Ctx, readonly store: WalletStore = localWalletStore(ctx.config), readonly chain: WalletChain = new WalletChain(ctx), private readonly signingEnabled = WALLET_CANDIDATE_SIGNING_ENABLED) {}
   create() { return this.store.createOrLoad(); }
@@ -27,6 +30,14 @@ export class WalletService {
     if (!s.envelope.policy.configured) throw new WalletError("policy_not_configured", "Run incentiv-mcp setup in your local terminal");
     if (!s.envelope.policy.enabled || await s.disabled()) throw new WalletError("wallet_locked", "Wallet is disabled; local administration authorization is required");
     return s.envelope.policy.limits;
+  }
+  /** The owner's EIP-191 signature over `hash` as raw bytes, which is what the account checks. */
+  private async signRaw(s: WalletSession, hash: Hex): Promise<Hex> {
+    const privateKey = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
+    try {
+      // viem requires a hex string; V8 cannot guarantee zeroization of that temporary.
+      return await privateKeyToAccount(`0x${privateKey.toString("hex")}`).signMessage({ message: { raw: hash } });
+    } finally { privateKey.fill(0); }
   }
   private liveTestApproved(s: WalletSession, r?: OperationRecord): boolean {
     const a = r?.approval;
@@ -200,11 +211,7 @@ export class WalletService {
         await this.canSubmit(s, r);
         if (r.approval && r.approval.expiresAt <= Date.now()) throw new WalletError("approval_required", "Exact-operation approval expired before signing");
         if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("validation_failed", "Operation deadline is too close");
-        const privateKey = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
-        try {
-          // viem requires a hex string; V8 cannot guarantee zeroization of that temporary.
-          r.operation!.signature = await privateKeyToAccount(`0x${privateKey.toString("hex")}`).signMessage({ message: { raw: validated.hash } });
-        } finally { privateKey.fill(0); }
+        r.operation!.signature = await this.signRaw(s, validated.hash);
         await this.canSubmit(s, r);
         await journal.transition(r, "signed"); // fsync completes before any submission.
       } catch (error) {
@@ -234,47 +241,44 @@ export class WalletService {
   async registryStatus(parent?: string) {
     return this.store.session(s => this.chain.registryStatus(s.envelope, parent ? getAddress(parent) : undefined));
   }
-  /**
-   * The Portal URL that asks the user to connect this agent. With `parent`, the agent also signs its own
-   * AgentLink consent to that parent, so Portal can submit the link from the parent's account once the
-   * user trusts this agent. That needs the same authenticated local policy as link_agent: the parent must
-   * be allowed, and the wallet enabled for signing. The signature names this one parent, which still has
-   * to send the link itself, so it gives nobody else a way to link this agent. It expires no later than
-   * the local policy, and nothing here can withdraw it before then.
-   */
-  async prepareAgentLink(parent?: string) {
+  private agentLinkUrl(s: WalletSession) {
+    const cap = registryCapability(this.ctx.config), url = new URL(cap.portalUrl);
+    url.searchParams.set("agent", s.envelope.account);
+    url.searchParams.set("chain_id", String(this.ctx.config.identity.chainId));
+    url.searchParams.set("registry", cap.proxy.address);
+    return url;
+  }
+  /** The Portal URL that asks the user to approve this agent's connection for link_agent. Reads only. */
+  async prepareAgentLink() {
     return this.store.session(async s => {
-      const cap = registryCapability(this.ctx.config);
-      const refuse = (status: object, [code, message]: [string, string]) => ({ ...status, link_blocked: code, next_action: `${message}. Do not ask the user to sign in Portal.` });
-      const url = new URL(cap.portalUrl);
-      url.searchParams.set("agent", s.envelope.account);
-      url.searchParams.set("chain_id", String(this.ctx.config.identity.chainId));
-      url.searchParams.set("registry", cap.proxy.address);
-      const approvalFlow = "Open Portal, review and sign the connection, then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest.";
-      if (!parent) {
-        const status = await this.chain.registryStatus(s.envelope);
-        const blocked = linkBlocker(status, status.deployed);
-        return blocked ? refuse(status, blocked) : { ...status, portal_url: url.href, next_action: approvalFlow };
-      }
-      const requested = getAddress(parent);
+      const url = this.agentLinkUrl(s), status = await this.chain.registryStatus(s.envelope);
+      const blocked = linkBlocker(status, status.deployed);
+      return blocked ? linkRefusal(status, blocked) : { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };
+    });
+  }
+  /**
+   * This agent's own AgentLink consent to `parent`, in a Portal URL, so Portal can submit the link from the
+   * parent's account once the user trusts this agent. That needs the same authenticated local policy as
+   * link_agent: the parent must be allowed, and the wallet enabled for signing. The signature names this one
+   * parent, which still has to send the link itself, so it gives nobody else a way to link this agent. It
+   * expires no later than the local policy, and nothing here can withdraw it before then.
+   */
+  async signAgentLink(parent: string) {
+    return this.store.session(async s => {
+      const url = this.agentLinkUrl(s), requested = getAddress(parent);
       // Local policy decides before any registry read, and its refusals take the same shape as the registry's.
       const local = { agent: s.envelope.account, requested_parent: requested };
       const limits = await this.enabled(s).catch((error: unknown) => { if (error instanceof WalletError) return error; throw error; });
-      if (limits instanceof WalletError) return refuse(local, [limits.code, limits.message]);
-      if (!registryParentAllowed(limits, requested)) return refuse(local, ["registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call prepare_agent_link again"]);
-      if (!this.signingEnabled) return refuse(local, ["wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent. Use prepare_agent_link without parent and the Portal approval flow"]);
+      if (limits instanceof WalletError) return linkRefusal(local, [limits.code, limits.message]);
+      if (!registryParentAllowed(limits, requested)) return linkRefusal(local, ["registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call sign_agent_link again"]);
+      if (!this.signingEnabled) return linkRefusal(local, ["wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent. Use prepare_agent_link and the Portal approval flow"]);
       // How soon the policy ends is decided against the block's clock, with the deadline, in agentLinkConsent.
       const { status, blocked, consent } = await this.chain.agentLinkConsent(s.envelope, requested, limits.expiresAt ? Math.floor(limits.expiresAt / 1000) : undefined);
-      if (blocked) return refuse(status, blocked);
+      if (blocked) return linkRefusal(status, blocked);
       // The registry checks a signature through the agent account's ERC-1271, so an undeployed agent cannot consent this way.
-      if (!consent) return { ...status, portal_url: url.href, agent_signed: false, next_action: `This agent is not deployed yet, so Portal cannot submit the link. ${approvalFlow}` };
+      if (!consent) return { ...status, portal_url: url.href, agent_signed: false, next_action: `This agent is not deployed yet, so Portal cannot submit the link. ${APPROVAL_FLOW}` };
       await this.canSubmit(s);
-      const privateKey = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
-      let signature: Hex;
-      try {
-        // The account checks its owner's EIP-191 signature over the digest bytes, as for operations.
-        signature = await privateKeyToAccount(`0x${privateKey.toString("hex")}`).signMessage({ message: { raw: consent.digest } });
-      } finally { privateKey.fill(0); }
+      const signature = await this.signRaw(s, consent.digest);
       await this.chain.verifyAgentLinkSignature(s.envelope, consent.digest, signature, consent.block);
       // As for operations, the wallet must still be enabled and owned once the signature exists.
       await this.canSubmit(s);
@@ -422,9 +426,7 @@ export class WalletService {
       if (BigInt(balances[gasToken] ?? "0") < validated.gasCharge) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment.${nativeGasHint(this.ctx.config, gasToken)}`);
       await this.canSubmit(s);
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");
-      const key = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
-      try { replacement.operation.signature = await privateKeyToAccount(`0x${key.toString("hex")}`).signMessage({ message: { raw: validated.hash } }); }
-      finally { key.fill(0); }
+      replacement.operation.signature = await this.signRaw(s, validated.hash);
       replacement.signed = true;
       // Keep the original reservation as well: either signed operation might win.
       addSpend(r.reservation, gasToken, validated.gasCharge);

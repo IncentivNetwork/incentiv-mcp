@@ -166,15 +166,21 @@ export class WalletChain {
     });
   }
   async registryStatus(wallet: WalletEnvelope, parent?: Address) {
-    return this.registryRead(wallet, async () => this.registryStatusAt(wallet, await this.state(wallet), parent));
+    return this.registryRead(wallet, async () => (await this.registryStatusAt(wallet, await this.state(wallet), parent)).status);
   }
-  private async registryStatusAt(wallet: WalletEnvelope, state: ChainState, parent?: Address) {
+  /**
+   * The registry status at `state`'s block, agreed by every RPC after each verifies the deployment.
+   * `extra.read` runs on each RPC beside the status read, and its results must agree too, compared by `extra.key`.
+   */
+  private async registryStatusAt<T>(wallet: WalletEnvelope, state: ChainState, parent?: Address, extra?: { read: (client: PublicClient) => Promise<T>; key: (value: T) => string }) {
     const results = await Promise.all(this.clients.map(async client => {
       await verifyRegistryDeployment(client, this.ctx.config, state.block);
-      return registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block);
+      const [status, more] = await Promise.all([registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block), extra?.read(client)]);
+      return { status, more };
     }));
-    if (!same(results.map(r => JSON.stringify(r)))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
-    return { ...results[0], deployed: state.deployed };
+    if (!same(results.map(r => JSON.stringify(r.status))) || (extra && !same(results.map(r => extra.key(r.more as T))))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+    const [first] = results;
+    return { status: { ...first?.status as Awaited<ReturnType<typeof registryStatus>>, deployed: state.deployed }, extra: first?.more };
   }
   /**
    * The registry status for `parent` and, when this deployed agent may consent to it, the AgentLink digest,
@@ -192,17 +198,11 @@ export class WalletChain {
         if (end < now + AGENT_LINK_MIN_SECONDS) expiring = ["policy_expired", "Local wallet policy has expired or expires too soon. Renew it with incentiv-mcp setup in your local terminal"];
         else deadline = BigInt(end);
       }
-      const results = await Promise.all(this.clients.map(async client => {
-        await verifyRegistryDeployment(client, cfg, state.block);
-        // The digest is a view read, so it runs beside the status; it is used only if nothing blocks the link.
-        const [status, link] = await Promise.all([
-          registryStatus(client, cfg, agent, parent, state.block),
-          deadline === undefined ? undefined : readAgentLinkDigest(client, cfg, agent, parent, deadline, state.block),
-        ]);
-        return { status, link };
-      }));
-      if (!same(results.map(r => JSON.stringify(r.status))) || !same(results.map(r => r.link && `${r.link.nonce}:${r.link.digest}`))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
-      const status = { ...results[0].status, deployed: state.deployed }, link = results[0].link;
+      // The digest is a view read, so it runs beside the status; it is used only if nothing blocks the link.
+      const { status, extra: link } = await this.registryStatusAt(wallet, state, parent, {
+        read: async client => deadline === undefined ? undefined : readAgentLinkDigest(client, cfg, agent, parent, deadline, state.block),
+        key: read => read ? `${read.nonce}:${read.digest}` : "",
+      });
       const blocked = expiring ?? linkBlocker(status, state.deployed) ?? parentBlocker(status, parent);
       if (blocked || !link || deadline === undefined) return { status, blocked };
       return { status, blocked, consent: { ...link, deadline, block: state.block } };

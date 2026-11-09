@@ -25,7 +25,9 @@ export const agentRegistryAbi = parseAbi([
   "error InvalidParentSignature()", "error InvalidAgentSignature()", "error SignatureExpired(uint256 deadline)",
 ]);
 const accountSignatureAbi = parseAbi(["function isValidSignature(bytes32 hash,bytes signature) view returns(bytes4)"]);
-const addr = z.string().regex(/^0x[0-9a-fA-F]{40}$/).refine(a => !/^0x0{40}$/i.test(a));
+/** A registry participant: any address except zero, which the registry uses for "none". */
+export const registryAddressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/).refine(a => !/^0x0{40}$/i.test(a), "Zero address is not an account");
+const addr = registryAddressSchema;
 export const registryApprovalSchema = z.strictObject({
   version: z.literal(1), chain_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), registry: addr,
   parent: addr, agent: addr, parent_nonce: uint,
@@ -123,12 +125,18 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
   if (status.parent_nonce !== a.parent_nonce) throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval");
   const cap = registryCapability(cfg);
   const digest = await client.readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "parentLinkDigest", args: [a.parent as Address, wallet.account as Address, BigInt(a.parent_deadline)], blockNumber: state.block });
-  const magic = await client.readContract({ address: a.parent as Address, abi: accountSignatureAbi, functionName: "isValidSignature", args: [digest, a.parent_signature as Hex], blockNumber: state.block }).catch((error: unknown) => {
-    // A rejecting or codeless parent is an invalid signature; an RPC failure says nothing about it.
+  if (!await acceptsSignature(client, a.parent as Address, digest, a.parent_signature as Hex, state.block)) throw new WalletError("registry_approval_invalid", "Parent signature is invalid; obtain a fresh Portal approval");
+}
+/**
+ * Whether `account` accepts `signature` over `digest` through ERC-1271, as the registry checks it. A rejecting
+ * or codeless account does not accept it; an RPC failure says nothing about it, so it is thrown.
+ */
+async function acceptsSignature(client: PublicClient, account: Address, digest: Hex, signature: Hex, blockNumber: bigint) {
+  const magic = await client.readContract({ address: account, abi: accountSignatureAbi, functionName: "isValidSignature", args: [digest, signature], blockNumber }).catch((error: unknown) => {
     if (isContractRejection(error)) return "0x";
     throw error;
   });
-  if (magic !== "0x1626ba7e") throw new WalletError("registry_approval_invalid", "Parent signature is invalid; obtain a fresh Portal approval");
+  return magic === "0x1626ba7e";
 }
 /**
  * The current time for a registry check: the later of the local clock and the block's, refusing a block
@@ -174,11 +182,7 @@ export async function readAgentLinkDigest(client: PublicClient, cfg: Config, age
 }
 /** The agent account itself must accept the signature, as the registry will check it through ERC-1271. */
 export async function assertAgentSignature(client: PublicClient, agent: Address, digest: Hex, signature: Hex, blockNumber: bigint) {
-  const magic = await client.readContract({ address: agent, abi: accountSignatureAbi, functionName: "isValidSignature", args: [digest, signature], blockNumber }).catch((error: unknown) => {
-    if (isContractRejection(error)) return "0x";
-    throw error;
-  });
-  if (magic !== "0x1626ba7e") throw new WalletError("registry_agent_signature_invalid", "This agent account did not accept its own link signature");
+  if (!await acceptsSignature(client, agent, digest, signature, blockNumber)) throw new WalletError("registry_agent_signature_invalid", "This agent account did not accept its own link signature");
 }
 // Only inspect the log interval belonging to this operation within an EntryPoint bundle.
 export function hasRegistryEvent(cfg: Config, intent: Intent, agent: string, logs: { address: string; data: Hex; topics: readonly Hex[] }[]) {

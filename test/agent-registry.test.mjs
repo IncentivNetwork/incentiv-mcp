@@ -756,9 +756,9 @@ async function signedLinkFixture(t, allowed = true, status = {}, policy = {}) {
   return { ...f, calls };
 }
 
-test("prepare_agent_link with a parent signs this agent's consent for Portal to submit", async t => {
+test("sign_agent_link signs this agent's consent for Portal to submit", async t => {
   const f = await signedLinkFixture(t);
-  const prepared = await f.service.prepareAgentLink(parent);
+  const prepared = await f.service.signAgentLink(parent);
   assert.equal(prepared.agent_signed, true); assert.equal(prepared.link_blocked, undefined);
   const url = new URL(prepared.portal_url), signature = url.searchParams.get("agent_signature");
   assert.equal(url.searchParams.get("agent").toLowerCase(), f.approval.agent.toLowerCase());
@@ -771,30 +771,30 @@ test("prepare_agent_link with a parent signs this agent's consent for Portal to 
   assert.match(prepared.next_action, /Do not call link_agent/);
 });
 
-test("prepare_agent_link caps the consent at local policy expiry and refuses a policy about to expire", async t => {
+test("sign_agent_link caps the consent at local policy expiry and refuses a policy about to expire", async t => {
   const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
   const f = await signedLinkFixture(t, true, {}, { expiresAt });
-  assert.equal((await f.service.prepareAgentLink(parent)).agent_signed, true);
+  assert.equal((await f.service.signAgentLink(parent)).agent_signed, true);
   assert.deepEqual(f.calls[0], ["consent", parent, Math.floor(expiresAt / 1000)]);
   const soonAt = Date.now() + 60_000, soon = await signedLinkFixture(t, true, {}, { expiresAt: soonAt });
-  const refused = await soon.service.prepareAgentLink(parent);
+  const refused = await soon.service.signAgentLink(parent);
   assert.equal(refused.link_blocked, "policy_expired"); assert.match(refused.next_action, /Do not ask the user to sign/); assert.equal(refused.portal_url, undefined);
   assert.deepEqual(soon.calls, [["consent", parent, Math.floor(soonAt / 1000)]]);
 });
 
 test("a release with candidate signing disabled refuses to sign link consent before any registry read", async t => {
   const f = await signedLinkFixture(t), service = new WalletService(f.service.ctx, f.store, f.chain, false);
-  const refused = await service.prepareAgentLink(parent);
-  assert.equal(refused.link_blocked, "wallet_release_unreviewed"); assert.match(refused.next_action, /without parent/); assert.deepEqual(f.calls, []);
+  const refused = await service.signAgentLink(parent);
+  assert.equal(refused.link_blocked, "wallet_release_unreviewed"); assert.match(refused.next_action, /Use prepare_agent_link/); assert.deepEqual(f.calls, []);
 });
 
-test("prepare_agent_link signs nothing for a parent that local policy or the registry refuses", async t => {
+test("sign_agent_link signs nothing for a parent that local policy or the registry refuses", async t => {
   const denied = await signedLinkFixture(t, false);
-  const refused = await denied.service.prepareAgentLink(parent);
+  const refused = await denied.service.signAgentLink(parent);
   assert.equal(refused.link_blocked, "registry_parent_not_allowed"); assert.equal(refused.portal_url, undefined); assert.deepEqual(denied.calls, []);
   for (const [status, code] of [[{ parent_agent_count: "5" }, "registry_limit_reached"], [{ parent_eligible: false }, "registry_ineligible"], [{ parent_is_agent: true }, "registry_ineligible"], [{ parent }, "registry_already_linked"]]) {
     const f = await signedLinkFixture(t, true, status);
-    const blocked = await f.service.prepareAgentLink(parent);
+    const blocked = await f.service.signAgentLink(parent);
     assert.equal(blocked.link_blocked, code); assert.equal(blocked.portal_url, undefined); assert.deepEqual(f.calls, [["consent", parent, undefined]]);
   }
 });
@@ -802,16 +802,16 @@ test("prepare_agent_link signs nothing for a parent that local policy or the reg
 test("a disabled wallet gets a structured refusal, and one disabled while signing returns no signature", async t => {
   const f = await signedLinkFixture(t);
   await f.store.disable();
-  const refused = await f.service.prepareAgentLink(parent);
+  const refused = await f.service.signAgentLink(parent);
   assert.equal(refused.link_blocked, "wallet_locked"); assert.match(refused.next_action, /Do not ask the user to sign/); assert.deepEqual(f.calls, []);
   const g = await signedLinkFixture(t), verify = g.chain.verifyAgentLinkSignature;
   g.chain.verifyAgentLinkSignature = async (...a) => { await verify(...a); await g.store.disable(); };
-  await assert.rejects(g.service.prepareAgentLink(parent), { code: "wallet_locked" });
+  await assert.rejects(g.service.signAgentLink(parent), { code: "wallet_locked" });
 });
 
 test("an undeployed agent keeps the approval flow, since the registry cannot check its signature", async t => {
   const f = await signedLinkFixture(t, true, { deployed: false, agent_eligible: false });
-  const prepared = await f.service.prepareAgentLink(parent);
+  const prepared = await f.service.signAgentLink(parent);
   assert.equal(prepared.agent_signed, false); assert.deepEqual(f.calls, [["consent", parent, undefined]]);
   const url = new URL(prepared.portal_url);
   assert.equal(url.searchParams.get("agent_signature"), null);
