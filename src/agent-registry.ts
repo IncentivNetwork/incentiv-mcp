@@ -62,10 +62,12 @@ export function assertRegistryApproved(cfg: Config, wallet: { approvedCapability
   registryCapability(cfg);
   if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId) throw new WalletError("capability_manifest_unapproved", "This wallet has not approved the Agent Registry. Review it with wallet capabilities approve in your local terminal");
 }
+/** The registry's EIP-712 signing domain name and version, pinned at deployment checks and used for local digests. */
+export const REGISTRY_DOMAIN = { name: "Incentiv Agent Registry", version: "1" } as const;
 export function registryPinsMatch(cfg: Config, slot: string | undefined, domain: readonly [string, string, string, bigint, string, ...unknown[]]): boolean {
   const cap = registryCapability(cfg);
   return !!slot && /^0x[0-9a-fA-F]+$/.test(slot) && BigInt(slot) === BigInt(cap.implementation.address)
-    && domain[0] === "0x0f" && domain[1] === "Incentiv Agent Registry" && domain[2] === "1"
+    && domain[0] === "0x0f" && domain[1] === REGISTRY_DOMAIN.name && domain[2] === REGISTRY_DOMAIN.version
     && domain[3] === BigInt(cfg.identity.chainId) && sameAddress(domain[4], cap.proxy.address);
 }
 export async function verifyRegistryDeployment(client: PublicClient, cfg: Config, blockNumber: bigint) {
@@ -155,7 +157,7 @@ export const AGENT_LINK_MIN_SECONDS = 15 * 60;
 export function agentLinkDigest(cfg: Config, agent: Address, parent: Address, nonce: bigint, deadline: bigint): Hex {
   const cap = registryCapability(cfg);
   return hashTypedData({
-    domain: { name: "Incentiv Agent Registry", version: "1", chainId: cfg.identity.chainId, verifyingContract: cap.proxy.address },
+    domain: { ...REGISTRY_DOMAIN, chainId: cfg.identity.chainId, verifyingContract: cap.proxy.address },
     types: { AgentLink: [{ name: "agent", type: "address" }, { name: "parent", type: "address" }, { name: "nonce", type: "uint256" }, { name: "deadline", type: "uint256" }] },
     primaryType: "AgentLink",
     message: { agent, parent, nonce, deadline },

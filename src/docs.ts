@@ -156,7 +156,7 @@ export function renderHtml(cfg: Config, tools: ToolDoc[]): string {
           ${g.tools
             .map(
               (t) => `<details class="tool-entry">
-            <summary>${esc(t.name)}<span class="tool-kind">${t.readOnly ? "Read / prepare" : t.signs ? "Sign" : "Submit"}</span></summary>
+            <summary>${esc(t.name)}<span class="tool-kind">${t.readOnly ? "Read / prepare" : "Submit"}</span></summary>
             <p>${esc(t.description ?? "")}</p>
             <div class="params">${
               t.params.length

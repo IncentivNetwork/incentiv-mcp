@@ -749,7 +749,7 @@ async function signedLinkFixture(t, allowed = true, status = {}, policy = {}) {
     calls.push(["consent", requested, notAfter]);
     const current = { parent: zero, agent: f.approval.agent, agent_is_parent: false, agent_eligible: true, factory_allowed: true, max_agents: "5", requested_parent: requested, parent_eligible: true, parent_is_agent: false, parent_agent_count: "0", parent_nonce: "0", deployed: true, ...status };
     const soon = current.deployed && notAfter !== undefined && notAfter < Math.floor(Date.now() / 1000) + 15 * 60;
-    const blocked = (soon ? ["policy_expired", "Local wallet policy has expired or expires too soon"] : undefined) ?? linkBlocker(current, current.deployed) ?? parentBlocker(current, requested);
+    const blocked = linkBlocker(current, current.deployed) ?? parentBlocker(current, requested) ?? (soon ? ["policy_expired", "Local wallet policy has expired or expires too soon"] : undefined);
     return blocked || !current.deployed ? { status: current, blocked } : { status: current, consent: { nonce: 4n, digest: digestToSign, deadline: 1900000000n, block: 7n } };
   };
   f.chain.verifyAgentLinkSignature = async (_wallet, digest, signature, block) => { calls.push(["verify", digest, signature, block]); };
@@ -809,13 +809,14 @@ test("a disabled wallet gets a structured refusal, and one disabled while signin
   await assert.rejects(g.service.signAgentLink(parent), { code: "wallet_locked" });
 });
 
-test("an undeployed agent keeps the approval flow, since the registry cannot check its signature", async t => {
+test("an undeployed agent signs nothing and is sent to prepare_agent_link, since the registry cannot check its signature", async t => {
   const f = await signedLinkFixture(t, true, { deployed: false, agent_eligible: false });
-  const prepared = await f.service.signAgentLink(parent);
-  assert.equal(prepared.agent_signed, false); assert.deepEqual(f.calls, [["consent", parent, undefined]]);
-  const url = new URL(prepared.portal_url);
-  assert.equal(url.searchParams.get("agent_signature"), null);
-  assert.match(prepared.next_action, /link_agent/);
+  const refused = await f.service.signAgentLink(parent);
+  assert.equal(refused.link_blocked, "registry_agent_not_deployed"); assert.equal(refused.portal_url, undefined); assert.equal(refused.agent_signed, undefined);
+  assert.match(refused.next_action, /prepare_agent_link/); assert.deepEqual(f.calls, [["consent", parent, undefined]]);
+  // An expired policy no longer yields an approval URL for an undeployed agent either.
+  const expired = await signedLinkFixture(t, true, { deployed: false, agent_eligible: false }, { expiresAt: Date.now() + 1000 });
+  assert.equal((await expired.service.signAgentLink(parent)).portal_url, undefined);
 });
 
 function consentChain(clients, timestamp = Math.floor(Date.now() / 1000), deployed = true) {
@@ -845,6 +846,10 @@ test("the chain reads status and digest at one block, with a deadline capped by 
   assert.equal(soon.blocked[0], "policy_expired"); assert.equal(soon.consent, undefined);
   const ahead = await consentChain([deployedAgent()], now + 20).agentLinkConsent(consentWallet, parent, now + 15 * 60 + 10);
   assert.equal(ahead.blocked[0], "policy_expired");
+  // A registry blocker is reported ahead of an expiring policy, since renewing the policy would not clear it.
+  const linked = deployedAgent(), linkedRead = linked.readContract;
+  linked.readContract = args => args.functionName === "parentOf" && args.args[0].toLowerCase() === agent.toLowerCase() ? Promise.resolve(parent) : linkedRead(args);
+  assert.equal((await consentChain([linked], now).agentLinkConsent(consentWallet, parent, now + 60)).blocked[0], "registry_already_linked");
 });
 
 test("the chain signs nothing from a stale block, a blocked parent or disagreeing RPCs", async () => {

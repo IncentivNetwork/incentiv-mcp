@@ -203,7 +203,8 @@ export class WalletChain {
         read: async client => deadline === undefined ? undefined : readAgentLinkDigest(client, cfg, agent, parent, deadline, state.block),
         key: read => read ? `${read.nonce}:${read.digest}` : "",
       });
-      const blocked = expiring ?? linkBlocker(status, state.deployed) ?? parentBlocker(status, parent);
+      // A registry blocker comes first: renewing the policy would not get past it.
+      const blocked = linkBlocker(status, state.deployed) ?? parentBlocker(status, parent) ?? expiring;
       if (blocked || !link || deadline === undefined) return { status, blocked };
       return { status, blocked, consent: { ...link, deadline, block: state.block } };
     });

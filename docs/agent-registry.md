@@ -15,7 +15,7 @@ The consent lasts 24 hours, never past the local policy's expiry, and ends earli
 
 A signed consent cannot be withdrawn from MCP. Removing the parent from policy, disabling the wallet or renewing the policy stops new signatures but leaves an issued URL usable until its `agent_deadline`. Treat the URL like an approval and share it only with that parent's owner. If a connection you did not want goes through, unlink it from the parent in Portal. `unlink_agent` works too, but only if local policy sets `allowUnlink`; allowing a parent does not allow unlinking.
 
-For an agent that is not deployed yet, `sign_agent_link` signs nothing and returns the agent-submitted URL instead.
+For an agent that is not deployed yet, `sign_agent_link` signs nothing and returns `registry_agent_not_deployed`, because the registry checks the agent's signature through its deployed account. Use `prepare_agent_link` and the flow below instead.
 
 ## Connect with a Portal approval
 

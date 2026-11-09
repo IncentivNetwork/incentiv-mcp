@@ -276,7 +276,7 @@ export class WalletService {
       const { status, blocked, consent } = await this.chain.agentLinkConsent(s.envelope, requested, limits.expiresAt ? Math.floor(limits.expiresAt / 1000) : undefined);
       if (blocked) return linkRefusal(status, blocked);
       // The registry checks a signature through the agent account's ERC-1271, so an undeployed agent cannot consent this way.
-      if (!consent) return { ...status, portal_url: url.href, agent_signed: false, next_action: `This agent is not deployed yet, so Portal cannot submit the link. ${APPROVAL_FLOW}` };
+      if (!consent) return { ...status, link_blocked: "registry_agent_not_deployed", next_action: "This agent is not deployed yet, so it cannot sign link consent. Call prepare_agent_link and use the Portal approval flow with link_agent instead." };
       await this.canSubmit(s);
       const signature = await this.signRaw(s, consent.digest);
       await this.chain.verifyAgentLinkSignature(s.envelope, consent.digest, signature, consent.block);

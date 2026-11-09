@@ -97,7 +97,11 @@ test("wallet tool schemas reject secrets/arbitrary calls and send annotations de
     // Preparing the approval URL only reads. Signing never submits, but its consent cannot be withdrawn, and every call signs a new one.
     assert.deepEqual(tools.find(t => t.name === "prepare_agent_link").annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true });
     assert.deepEqual(tools.find(t => t.name === "sign_agent_link").annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
-    for (const parent of ["0x0000000000000000000000000000000000000000", "0x12"]) assert.equal((await client.callTool({ name: "sign_agent_link", arguments: { parent } })).isError, true);
+    for (const parent of ["0x0000000000000000000000000000000000000000", "0x12"]) {
+      assert.equal((await client.callTool({ name: "sign_agent_link", arguments: { parent } })).isError, true);
+      assert.equal((await client.callTool({ name: "unlink_agent", arguments: { request_id: "00000000-0000-4000-8000-000000000000", parent } })).isError, true);
+    }
+    assert.equal(calls, 0);
     const response = await client.callTool({ name: "send_transfer", arguments: { request_id: "00000000-0000-4000-8000-000000000000", token: "CENT", to: "0x0000000000000000000000000000000000000001", amount: "1", private_key: "SECRET_CANARY", calls: [] } });
     assert.equal(response.isError, true); assert.equal(calls, 0); assert.ok(!JSON.stringify(response).includes("SECRET_CANARY"));
   } finally { await client.close(); await bundle.server.close(); }
