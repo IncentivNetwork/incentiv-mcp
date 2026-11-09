@@ -809,6 +809,20 @@ test("a disabled wallet gets a structured refusal, and one disabled while signin
   await assert.rejects(g.service.signAgentLink(parent), { code: "wallet_locked" });
 });
 
+test("sign_agent_link waits for an unresolved link or unlink, which would void any consent signed now", async t => {
+  const f = await signedLinkFixture(t), id = randomUUID();
+  assert.equal((await f.service.send("link_agent", { request_id: id, approval: f.approval })).status, "submitted");
+  const refused = await f.service.signAgentLink(parent);
+  assert.equal(refused.link_blocked, "operation_pending"); assert.match(refused.next_action, new RegExp(id)); assert.deepEqual(f.calls, []);
+});
+
+test("sign_agent_link refuses an unapproved registry capability in the same shape as other local refusals", async t => {
+  const f = await preRegistryWallet(t);
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: false } } }));
+  const refused = await f.service.signAgentLink(parent);
+  assert.equal(refused.link_blocked, "capability_manifest_unapproved"); assert.match(refused.next_action, /Do not ask the user to sign/);
+});
+
 test("an undeployed agent signs nothing and is sent to prepare_agent_link, since the registry cannot check its signature", async t => {
   const f = await signedLinkFixture(t, true, { deployed: false, agent_eligible: false });
   const refused = await f.service.signAgentLink(parent);
@@ -856,6 +870,9 @@ test("the chain signs nothing from a stale block, a blocked parent or disagreein
   await assert.rejects(consentChain([deployedAgent()], Math.floor(Date.now() / 1000) - 600).agentLinkConsent(consentWallet, parent), { code: "registry_rpc_unavailable" });
   const full = consentChain([deployedAgent()]), c = full.clients[0], good = c.readContract;
   c.readContract = args => args.functionName === "agentCount" && args.args[0].toLowerCase() === parent.toLowerCase() ? Promise.resolve(5n) : good(args);
+  // A blocked link reads no digest, so a digest read that would fail cannot hide the registry's reason.
+  const reads = c.readContract;
+  c.readContract = args => args.functionName === "agentLinkDigest" ? assert.fail("digest read for a blocked link") : reads(args);
   const blocked = await full.agentLinkConsent(consentWallet, parent);
   assert.equal(blocked.blocked[0], "registry_limit_reached"); assert.equal(blocked.consent, undefined);
   const undeployed = await consentChain([client()], undefined, false).agentLinkConsent(consentWallet, parent);

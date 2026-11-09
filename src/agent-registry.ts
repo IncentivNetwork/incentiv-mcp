@@ -27,10 +27,9 @@ export const agentRegistryAbi = parseAbi([
 const accountSignatureAbi = parseAbi(["function isValidSignature(bytes32 hash,bytes signature) view returns(bytes4)"]);
 /** A registry participant: any address except zero, which the registry uses for "none". */
 export const registryAddressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/).refine(a => !/^0x0{40}$/i.test(a), "Zero address is not an account");
-const addr = registryAddressSchema;
 export const registryApprovalSchema = z.strictObject({
-  version: z.literal(1), chain_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), registry: addr,
-  parent: addr, agent: addr, parent_nonce: uint,
+  version: z.literal(1), chain_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), registry: registryAddressSchema,
+  parent: registryAddressSchema, agent: registryAddressSchema, parent_nonce: uint,
   parent_deadline: uint.refine(s => BigInt(s) <= BigInt(Number.MAX_SAFE_INTEGER)),
   // Generous for EOA and passkey signatures; every accepted request occupies the capped journal.
   parent_signature: z.string().max(8194).regex(/^0x(?:[0-9a-fA-F]{2})+$/),
@@ -144,9 +143,9 @@ async function acceptsSignature(client: PublicClient, account: Address, digest: 
  * The current time for a registry check: the later of the local clock and the block's, refusing a block
  * too far from the local clock to trust either.
  */
-export function freshBlockTime(timestamp: number): number {
+export function freshBlockTime(timestamp: number, [code, message]: [string, string] = ["registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request"]): number {
   const localNow = Math.floor(Date.now() / 1000);
-  if (timestamp < localNow - 60 || timestamp > localNow + 30) throw new WalletError("registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request");
+  if (!Number.isSafeInteger(timestamp) || timestamp < localNow - 60 || timestamp > localNow + 30) throw new WalletError(code, message);
   return Math.max(localNow, timestamp);
 }
 /** How long an agent-signed link request stays valid. It may wait in Portal until the user trusts the agent. */

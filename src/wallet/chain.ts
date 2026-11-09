@@ -111,8 +111,7 @@ export class WalletChain {
     if (BigInt(intent.minimumOut!) > low || BigInt(intent.minimumOut!) * 10_000n < high * BigInt(10_000 - intent.slippageBps)) throw new WalletError("validation_failed", "Absolute minimum output is incompatible with the quotes and slippage bound");
   }
   async verifySwap(wallet: WalletEnvelope, intent: Intent, limits: Limits, state: ChainState): Promise<void> {
-    const now = Math.floor(Date.now() / 1000);
-    if (!Number.isSafeInteger(state.timestamp) || state.timestamp < now - 60 || state.timestamp > now + 30) throw new WalletError("validation_failed", "Swap RPC block is stale or in the future");
+    freshBlockTime(state.timestamp, ["validation_failed", "Swap RPC block is stale or in the future"]);
     await this.quote(intent, limits, state.block);
     const cfg = this.ctx.config, contracts = cfg.manifest.contracts;
     const input = await this.token(intent.token), output = await this.token(intent.tokenOut!);
@@ -166,47 +165,35 @@ export class WalletChain {
     });
   }
   async registryStatus(wallet: WalletEnvelope, parent?: Address) {
-    return this.registryRead(wallet, async () => (await this.registryStatusAt(wallet, await this.state(wallet), parent)).status);
+    return this.registryRead(wallet, async () => this.registryStatusAt(wallet, await this.state(wallet), parent));
   }
-  /**
-   * The registry status at `state`'s block, agreed by every RPC after each verifies the deployment.
-   * `extra.read` runs on each RPC beside the status read, and its results must agree too, compared by `extra.key`.
-   */
-  private async registryStatusAt<T>(wallet: WalletEnvelope, state: ChainState, parent?: Address, extra?: { read: (client: PublicClient) => Promise<T>; key: (value: T) => string }) {
+  /** The registry status at `state`'s block, agreed by every RPC after each verifies the deployment. */
+  private async registryStatusAt(wallet: WalletEnvelope, state: ChainState, parent?: Address) {
     const results = await Promise.all(this.clients.map(async client => {
       await verifyRegistryDeployment(client, this.ctx.config, state.block);
-      const [status, more] = await Promise.all([registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block), extra?.read(client)]);
-      return { status, more };
+      return registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block);
     }));
-    if (!same(results.map(r => JSON.stringify(r.status))) || (extra && !same(results.map(r => extra.key(r.more as T))))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
-    const [first] = results;
-    return { status: { ...first?.status as Awaited<ReturnType<typeof registryStatus>>, deployed: state.deployed }, extra: first?.more };
+    if (!same(results.map(r => JSON.stringify(r)))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+    return { ...results[0], deployed: state.deployed };
   }
   /**
    * The registry status for `parent` and, when this deployed agent may consent to it, the AgentLink digest,
-   * both read at one block every RPC agrees on. The deadline runs from that block's time and never passes
-   * `notAfter` (Unix seconds), so the consent cannot outlive the local policy that allowed it. A policy
-   * ending too soon is refused here, against the same clock that sets the deadline.
+   * both read at one block every RPC agrees on. A registry blocker is returned first, since renewing the
+   * policy would not clear it. The deadline runs from that block's time and never passes `notAfter` (Unix
+   * seconds), so the consent cannot outlive the local policy that allowed it; a policy ending too soon is
+   * refused against the same clock.
    */
   async agentLinkConsent(wallet: WalletEnvelope, parent: Address, notAfter?: number) {
     return this.registryRead(wallet, async () => {
-      const cfg = this.ctx.config, agent = wallet.account as Address, state = await this.state(wallet);
+      const state = await this.state(wallet), status = await this.registryStatusAt(wallet, state, parent);
+      const blocked = linkBlocker(status, state.deployed) ?? parentBlocker(status, parent);
       // Only a deployed agent signs, so only then do the block's time and the policy's expiry matter.
-      let deadline: bigint | undefined, expiring: [code: string, message: string] | undefined;
-      if (state.deployed) {
-        const now = freshBlockTime(state.timestamp), end = Math.min(now + AGENT_LINK_REQUEST_SECONDS, notAfter ?? Number.MAX_SAFE_INTEGER);
-        if (end < now + AGENT_LINK_MIN_SECONDS) expiring = ["policy_expired", "Local wallet policy has expired or expires too soon. Renew it with incentiv-mcp setup in your local terminal"];
-        else deadline = BigInt(end);
-      }
-      // The digest is a view read, so it runs beside the status; it is used only if nothing blocks the link.
-      const { status, extra: link } = await this.registryStatusAt(wallet, state, parent, {
-        read: async client => deadline === undefined ? undefined : readAgentLinkDigest(client, cfg, agent, parent, deadline, state.block),
-        key: read => read ? `${read.nonce}:${read.digest}` : "",
-      });
-      // A registry blocker comes first: renewing the policy would not get past it.
-      const blocked = linkBlocker(status, state.deployed) ?? parentBlocker(status, parent) ?? expiring;
-      if (blocked || !link || deadline === undefined) return { status, blocked };
-      return { status, blocked, consent: { ...link, deadline, block: state.block } };
+      if (blocked || !state.deployed) return { status, blocked };
+      const now = freshBlockTime(state.timestamp), deadline = Math.min(now + AGENT_LINK_REQUEST_SECONDS, notAfter ?? Number.MAX_SAFE_INTEGER);
+      if (deadline < now + AGENT_LINK_MIN_SECONDS) return { status, blocked: ["policy_expired", "Local wallet policy has expired or expires too soon. Renew it with incentiv-mcp setup in your local terminal"] as [string, string] };
+      const results = await Promise.all(this.clients.map(client => readAgentLinkDigest(client, this.ctx.config, wallet.account as Address, parent, BigInt(deadline), state.block)));
+      if (!same(results.map(r => `${r.nonce}:${r.digest}`))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+      return { status, blocked, consent: { ...results[0], deadline: BigInt(deadline), block: state.block } };
     });
   }
   async verifyAgentLinkSignature(wallet: WalletEnvelope, digest: Hex, signature: Hex, block: bigint) {

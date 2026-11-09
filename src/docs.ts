@@ -11,12 +11,15 @@ import { docsStyles } from "./docs-styles.js";
  * registered tools. Served as an MCP resource and as a local HTML page.
  */
 
+/** The local wallet's tools, which only the local server registers. Docs derive their list and count from this. */
+const WALLET_TOOLS = ["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation", "get_agent_registry_status", "prepare_agent_link", "sign_agent_link", "link_agent", "unlink_agent"];
+
 /** Grouping follows the tool naming. */
 const GROUPS: { title: string; blurb: string; match: (t: ToolDoc) => boolean }[] = [
   {
     title: "Local wallet",
     blurb: "Configure policy once; permitted transfers and swaps then execute automatically within those limits.",
-    match: (t) => ["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation", "get_agent_registry_status", "prepare_agent_link", "sign_agent_link", "link_agent", "unlink_agent"].includes(t.name),
+    match: (t) => WALLET_TOOLS.includes(t.name),
   },
   {
     title: "Accounts & balances",
@@ -144,7 +147,7 @@ export function renderHtml(cfg: Config, tools: ToolDoc[]): string {
   const bridgeTokens = [...new Set(ROUTES.map((r) => r.token))];
   const chainNames = Object.values(REMOTE_CHAINS).map((c) => c.name);
 
-  const walletNames = new Set(["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation", "get_agent_registry_status", "prepare_agent_link", "sign_agent_link", "link_agent", "unlink_agent"]);
+  const walletNames = new Set(WALLET_TOOLS);
   const chainTools = tools.filter(tool => !walletNames.has(tool.name));
   const toolHtml = grouped(chainTools)
     .map(
@@ -297,7 +300,7 @@ ${cfg.manifest.bridge.enabled ? `<section>
   <h2>${chainTools.length} chain tools.</h2>
   <p class="intro">Expand a tool to see its description and arguments. Optional arguments are labeled. Token arguments accept a symbol (<code>USDC</code>), a contract address, or <code>${esc(cfg.identity.nativeSymbol)}</code> for the native coin.</p>
   ${toolHtml}
-  <aside class="local-tools"><h3>Ten wallet tools.</h3><p>These tools operate on the wallet on this computer and are available only in the local server.</p><p><code>create_agent_wallet</code> · <code>get_agent_wallet</code> · <code>send_transfer</code> · <code>send_swap</code> · <code>get_agent_operation</code> · <code>get_agent_registry_status</code> · <code>prepare_agent_link</code> · <code>sign_agent_link</code> · <code>link_agent</code> · <code>unlink_agent</code></p><a href="#setup">Install and set up →</a></aside>
+  <aside class="local-tools"><h3>${WALLET_TOOLS.length} wallet tools.</h3><p>These tools operate on the wallet on this computer and are available only in the local server.</p><p>${WALLET_TOOLS.map(name => `<code>${name}</code>`).join(" · ")}</p><a href="#setup">Install and set up →</a></aside>
 </section>
 
 ${cfg.manifest.bridge.enabled ? `<section>

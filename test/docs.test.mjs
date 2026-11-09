@@ -21,7 +21,7 @@ test("documentation leads with local install and keeps the tool catalog accurate
       for (const id of ["setup", "troubleshooting", "tools"]) assert.equal((html.match(new RegExp(`id="${id}"`, "g")) ?? []).length, 1);
       assert.ok(html.indexOf('id="setup"') < html.indexOf('id="tools"'));
       assert.match(html, /npm install --global --ignore-scripts incentiv-mcp/);
-      assert.match(html, /Ten wallet tools/);
+      assert.match(html, /10 wallet tools/);
       assert.doesNotMatch(html, /<script[^>]+src=|<link[^>]+stylesheet/);
       assert.match(html, /data:font\/woff2;base64/);
       assert.equal((html.match(/<details[ >]/g) ?? []).length, (html.match(/<\/details>/g) ?? []).length);

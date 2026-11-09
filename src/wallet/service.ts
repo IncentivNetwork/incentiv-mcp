@@ -1,4 +1,4 @@
-import { isRegistryIntent, registryCapability, linkBlocker } from "../agent-registry.js";
+import { assertRegistryApproved, isRegistryIntent, registryCapability, linkBlocker } from "../agent-registry.js";
 import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { type Hex } from "viem";
@@ -272,6 +272,10 @@ export class WalletService {
       if (limits instanceof WalletError) return linkRefusal(local, [limits.code, limits.message]);
       if (!registryParentAllowed(limits, requested)) return linkRefusal(local, ["registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call sign_agent_link again"]);
       if (!this.signingEnabled) return linkRefusal(local, ["wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent. Use prepare_agent_link and the Portal approval flow"]);
+      try { assertRegistryApproved(this.ctx.config, s.envelope); } catch (error) { if (error instanceof WalletError) return linkRefusal(local, [error.code, error.message]); throw error; }
+      // A link or unlink that may still land would change this agent's registry nonce, voiding any consent signed now.
+      const pending = (await Journal.open(s)).data.records.find(r => isRegistryIntent(r.intent) && ownsNonce(r.status));
+      if (pending) return linkRefusal(local, ["operation_pending", `Registry request ${pending.requestId} is still unresolved. Check it with get_agent_operation, then call sign_agent_link again`]);
       // How soon the policy ends is decided against the block's clock, with the deadline, in agentLinkConsent.
       const { status, blocked, consent } = await this.chain.agentLinkConsent(s.envelope, requested, limits.expiresAt ? Math.floor(limits.expiresAt / 1000) : undefined);
       if (blocked) return linkRefusal(status, blocked);
