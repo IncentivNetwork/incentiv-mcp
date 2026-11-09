@@ -93,6 +93,8 @@ test("wallet tool schemas reject secrets/arbitrary calls and send annotations de
   try {
     const { tools } = await client.listTools();
     for (const name of ["send_transfer", "send_swap"]) assert.deepEqual(tools.find(t => t.name === name).annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true });
+    // It signs consent with the wallet key but never submits.
+    assert.deepEqual(tools.find(t => t.name === "prepare_agent_link").annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true });
     const response = await client.callTool({ name: "send_transfer", arguments: { request_id: "00000000-0000-4000-8000-000000000000", token: "CENT", to: "0x0000000000000000000000000000000000000001", amount: "1", private_key: "SECRET_CANARY", calls: [] } });
     assert.equal(response.isError, true); assert.equal(calls, 0); assert.ok(!JSON.stringify(response).includes("SECRET_CANARY"));
   } finally { await client.close(); await bundle.server.close(); }

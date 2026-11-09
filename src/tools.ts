@@ -202,6 +202,8 @@ export interface ToolDoc {
   description?: string;
   params: { name: string; required: boolean }[];
   readOnly: boolean;
+  /** Signs with the wallet key without changing chain state. */
+  signs?: boolean;
 }
 
 /** Register the keyless public tool surface and return its documentation catalog. */

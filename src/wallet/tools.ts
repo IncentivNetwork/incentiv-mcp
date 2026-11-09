@@ -8,9 +8,11 @@ import type { WalletService } from "./service.js";
 
 export function registerWalletTools(server: McpServer, wallet: WalletService): ToolDoc[] {
   const catalog: ToolDoc[] = [];
-  const add = (name: string, description: string, shape: Record<string, z.ZodType>, readOnly: boolean, handler: (args: Record<string, unknown>) => Promise<unknown>) => {
-    catalog.push({ name, description, readOnly, params: Object.entries(shape).map(([name, schema]) => ({ name, required: !schema.isOptional() })) });
-    server.registerTool(name, { description, inputSchema: z.strictObject(shape), annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: true, openWorldHint: true } }, async args => {
+  // "sign" uses the wallet key but never changes chain state, so clients need not treat it as destructive.
+  const add = (name: string, description: string, shape: Record<string, z.ZodType>, kind: boolean | "sign", handler: (args: Record<string, unknown>) => Promise<unknown>) => {
+    const readOnly = kind === true, signs = kind === "sign";
+    catalog.push({ name, description, readOnly, signs, params: Object.entries(shape).map(([name, schema]) => ({ name, required: !schema.isOptional() })) });
+    server.registerTool(name, { description, inputSchema: z.strictObject(shape), annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly && !signs, idempotentHint: true, openWorldHint: true } }, async args => {
       try { return { content: [{ type: "text" as const, text: JSON.stringify(await handler(args)) }] }; }
       catch (error) {
         const known = error instanceof WalletError || error instanceof NetworkError;
@@ -26,7 +28,7 @@ export function registerWalletTools(server: McpServer, wallet: WalletService): T
   add("send_swap", "Automatically swap within policy using explicitly trusted RPC origins or independent quote sources, an absolute minimum output and fresh local validation. Retain the request UUID on retries.", { ...common, token_in: z.string().max(64), token_out: z.string().max(64), amount_in: amount, minimum_out: amount, slippage_bps: z.number().int().min(0).max(1000).optional(), fee_tier: z.number().int().min(1).max(1_000_000).optional() }, false, args => wallet.send("swap", args));
   add("get_agent_operation", "Reconcile a journaled request using its UUID or user-operation hash. Never submits or rebroadcasts.", { id: z.union([z.string().uuid(), z.string().regex(/^0x[0-9a-fA-F]{64}$/)]) }, true, args => wallet.operation(String(args.id)));
   add("get_agent_registry_status", "Read this local smart account's registry relationship and optional parent eligibility.", { parent: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional() }, true, args => wallet.registryStatus(args.parent as string | undefined));
-  add("prepare_agent_link", "Get the first-party Portal connection URL for this smart account. With parent, a parent allowed by local wallet policy, a deployed agent also signs its consent to that parent so the user can submit the connection in Portal. Never submits.", { parent: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional() }, false, args => wallet.prepareAgentLink(args.parent as string | undefined));
+  add("prepare_agent_link", "Get the first-party Portal connection URL for this smart account. With parent, a parent allowed by local wallet policy, a deployed agent also signs its consent to that parent so the user can submit the connection in Portal. Never submits.", { parent: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional() }, "sign", args => wallet.prepareAgentLink(args.parent as string | undefined));
   add("link_agent", "Connect this agent smart account using a Portal parent approval. Local authenticated policy and gas limits apply. Reuse the request UUID for identical retries; stale approval needs re-signing in Portal.", { ...common, approval: registryApprovalSchema }, false, args => wallet.send("link_agent", args));
   add("unlink_agent", "Unlink this agent from the expected parent. Requires local policy authorization. Retain the same UUID for retries.", { ...common, parent: z.string().regex(/^0x[0-9a-fA-F]{40}$/) }, false, args => wallet.send("unlink_agent", args));
   return catalog;

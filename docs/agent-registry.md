@@ -11,7 +11,11 @@ This flow needs a deployed agent account.
 3. Give the returned Portal URL to the user. It carries `parent`, `agent_nonce`, `agent_deadline` and `agent_signature`. The user trusts the agent in Portal, then confirms the connection, which Portal sends from their account with its fee.
 4. Check `get_agent_registry_status`. Do not call `link_agent` for this request.
 
-The consent lasts 24 hours and ends earlier if this agent's registry nonce changes. It names one parent, and the registry accepts it only in a `link` sent by that parent or signed by it, so the URL gives nobody else a way to link this agent. A parent missing from local policy, an expired policy or a disabled wallet signs nothing. For an agent that is not deployed yet, `prepare_agent_link` returns the agent-submitted URL instead.
+The consent lasts 24 hours, never past the local policy's expiry, and ends earlier if this agent's registry nonce changes. A policy that expires within 15 minutes signs nothing. The consent names one parent, and the registry accepts it only in a `link` sent by that parent or signed by it, so the URL gives nobody else a way to link this agent. A parent missing from local policy, an expired policy or a disabled wallet signs nothing.
+
+A signed consent cannot be withdrawn from MCP. Removing the parent from policy, disabling the wallet or renewing the policy stops new signatures but leaves an issued URL usable until its `agent_deadline`. Treat the URL like an approval and share it only with that parent's owner. If a connection you did not want goes through, unlink it with `unlink_agent` or in Portal.
+
+For an agent that is not deployed yet, `prepare_agent_link` returns the agent-submitted URL instead.
 
 ## Connect with a Portal approval
 

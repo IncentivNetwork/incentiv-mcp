@@ -116,14 +116,10 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
     return;
   }
   const a = intent.registryApproval!;
-  const localNow = Math.floor(Date.now() / 1000);
-  if (state.timestamp < localNow - 60 || state.timestamp > localNow + 30) throw new WalletError("registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request");
-  const now = Math.max(localNow, state.timestamp);
+  const now = freshBlockTime(state.timestamp);
   if (Number(a.parent_deadline) <= now + 10) throw new WalletError("registry_approval_expired", "Portal approval expired or is too close to expiry; obtain a fresh approval");
-  const blocked = linkBlocker(status, state.deployed);
+  const blocked = linkBlocker(status, state.deployed) ?? parentBlocker(status, a.parent);
   if (blocked) throw new WalletError(...blocked);
-  if (status.parent_is_agent || !status.parent_eligible) throw new WalletError("registry_ineligible", "Account roles or allowed factories do not permit this link");
-  if (BigInt(status.parent_agent_count!) >= BigInt(status.max_agents)) throw new WalletError("registry_limit_reached", "Parent has reached its agent limit; unlink an agent in Portal first");
   if (status.parent_nonce !== a.parent_nonce) throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval");
   const cap = registryCapability(cfg);
   const digest = await client.readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "parentLinkDigest", args: [a.parent as Address, wallet.account as Address, BigInt(a.parent_deadline)], blockNumber: state.block });
@@ -134,8 +130,19 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
   });
   if (magic !== "0x1626ba7e") throw new WalletError("registry_approval_invalid", "Parent signature is invalid; obtain a fresh Portal approval");
 }
+/**
+ * The current time for a registry check: the later of the local clock and the block's, refusing a block
+ * too far from the local clock to trust either.
+ */
+export function freshBlockTime(timestamp: number): number {
+  const localNow = Math.floor(Date.now() / 1000);
+  if (timestamp < localNow - 60 || timestamp > localNow + 30) throw new WalletError("registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request");
+  return Math.max(localNow, timestamp);
+}
 /** How long an agent-signed link request stays valid. It may wait in Portal until the user trusts the agent. */
 export const AGENT_LINK_REQUEST_SECONDS = 24 * 60 * 60;
+/** The shortest agent-signed link request worth handing out; a policy expiring sooner signs nothing. */
+export const AGENT_LINK_MIN_SECONDS = 15 * 60;
 /** The AgentLink EIP-712 digest, computed locally so a changed registry cannot choose what the agent key signs. */
 export function agentLinkDigest(cfg: Config, agent: Address, parent: Address, nonce: bigint, deadline: bigint): Hex {
   const cap = registryCapability(cfg);
@@ -152,11 +159,10 @@ export function parentBlocker(status: { agent: string; parent_eligible?: boolean
   if (BigInt(status.parent_agent_count ?? "0") >= BigInt(status.max_agents)) return ["registry_limit_reached", "Parent has reached its agent limit; unlink an agent in Portal first"];
 }
 /**
- * The digest this agent signs to consent to `parent`, at one pinned block: the local digest must equal
- * the registry's own `agentLinkDigest`, or nothing is signed.
+ * The digest this agent signs to consent to `parent`, at one pinned block whose registry deployment the
+ * caller has verified: the local digest must equal the registry's own `agentLinkDigest`, or nothing is signed.
  */
 export async function readAgentLinkDigest(client: PublicClient, cfg: Config, agent: Address, parent: Address, deadline: bigint, blockNumber: bigint) {
-  await verifyRegistryDeployment(client, cfg, blockNumber);
   const cap = registryCapability(cfg);
   const [nonce, onChain] = await Promise.all([
     client.readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "nonces", args: [agent], blockNumber }),
