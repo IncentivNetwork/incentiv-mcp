@@ -4,19 +4,19 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createPublicClient, custom, encodeAbiParameters, encodeEventTopics, HttpRequestError, recoverMessageAddress, decodeFunctionData, encodeFunctionData, encodeErrorResult } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { MAINNET, configurationId, parseConfig } from "../src/config.ts";
+import { MAINNET, configurationId, parseConfig, withoutAgentRegistry } from "../src/config.ts";
 import { deriveSmartAccount } from "../src/network.ts";
 import { agentRegistryAbi, hasRegistryEvent, registryApprovalSchema, registryCall, registryRevertCode, verifyRegistryDeployment, verifyRegistryIntent } from "../src/agent-registry.ts";
 import { intentSchema, Journal, digest, ownsNonce } from "../src/wallet/journal.ts";
 import { validateOperation } from "../src/wallet/validate.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { limitsSchema, policyViolations } from "../src/wallet/policy.ts";
-import { WalletChain } from "../src/wallet/chain.ts";
+import { isTransportFailure, WalletChain } from "../src/wallet/chain.ts";
 import { Ctx } from "../src/context.ts";
 import { computeUserOpHash, encodeExecuteBatch, userOpToJson } from "../src/userop.ts";
 import { args as transfer, fixture, limits, password, unsigned } from "../scripts/wallet-pipeline-fixture.mjs";
 import { join } from "node:path";
-import { previousImplementationConfig, withoutAgentRegistry } from "../src/account-upgrade.ts";
+import { previousImplementationConfig } from "../src/account-upgrade.ts";
 import { approveImplementation, reviewImplementation } from "../src/wallet/implementation.ts";
 import { backupWallet, restoreWallet } from "../src/wallet/backup.ts";
 import { WalletStore } from "../src/wallet/store.ts";
@@ -164,6 +164,8 @@ test("confirmation requires the right proxy, parent, agent and unlinking side", 
   const unlink = { ...i, kind: "unlink_agent" };
   assert.equal(hasRegistryEvent(MAINNET, unlink, agent, [registryLog("AgentUnlinked")]), true);
   assert.equal(hasRegistryEvent(MAINNET, unlink, agent, [registryLog("AgentUnlinked", parent)]), false);
+  // Reconciling under a manifest without the registry reports the event as missing instead of throwing.
+  assert.equal(hasRegistryEvent(withoutAgentRegistry(MAINNET), i, agent, [log]), false);
 });
 
 test("receipt cannot borrow a registry event from another user operation in the same bundle", async t => {
@@ -178,8 +180,9 @@ test("receipt cannot borrow a registry event from another user operation in the 
   assert.equal((await chain.receipt(record)).registryError, "registry_event_missing");
   logs = [registryLog("AgentLinked"), beforeExecution, opLog(hash)];
   assert.equal((await chain.receipt(record)).registryError, "registry_event_missing");
+  // Without an execution boundary the operation's logs cannot be isolated, but the nonce still settles.
   logs = [registryLog("AgentLinked"), opLog(hash)];
-  await assert.rejects(chain.receipt(record), /execution boundary missing/);
+  assert.equal((await chain.receipt(record)).registryError, "registry_event_missing");
   logs = [beforeExecution, registryLog("AgentLinked"), opLog(hash)];
   const settled = await chain.receipt(record);
   assert.equal(settled.success, true); assert.equal(settled.registryError, undefined);
@@ -430,6 +433,11 @@ test("one Portal approval cannot fill the journal under new request IDs", async 
   for (let i = 1; i < 8; i++) { assert.equal((await f.service.send("link_agent", args(randomUUID()))).status, "approval_required"); await close(); }
   await assert.rejects(f.service.send("link_agent", args(randomUUID())), { code: "policy_denied" });
   await f.store.session(async s => assert.equal((await Journal.open(s)).data.records.length, 8));
+  // A different gas token does not make the same approval count as new.
+  const token = f.chain.token, usdc = MAINNET.manifest.canonicalTokens.USDC.address.toLowerCase();
+  f.chain.token = async ref => ref === "USDC" ? { address: usdc, decimals: 6, symbol: "USDC", name: "test" } : token.call(f.chain, ref);
+  await assert.rejects(f.service.send("link_agent", { ...args(randomUUID()), gas_token: "USDC" }), error => error.code === "policy_denied" && /tried too many times/.test(error.message));
+  f.chain.token = token;
   const fresh = { ...f.approval, parent_deadline: String(Number(f.approval.parent_deadline) + 60) };
   assert.equal((await f.service.send("link_agent", { request_id: randomUUID(), approval: fresh })).status, "approval_required");
 });
@@ -473,7 +481,7 @@ test("a temporary RPC error does not outlive the record state it explained", asy
 
 test("registry reads report RPC failures as temporary", async t => {
   const f = await fixture(t), code = "registry_rpc_unavailable";
-  f.chain.state = async () => { throw new Error("HTTP 429"); };
+  f.chain.state = async () => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); };
   await assert.rejects(f.service.registryStatus(), { code });
   await assert.rejects(f.service.prepareAgentLink(), { code });
   const a = await approval(), stale = Math.floor(Date.now() / 1000) - 120;
@@ -532,6 +540,17 @@ test("an RPC failure during signature validation is not reported as an invalid s
   await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_verification_failed" });
   chain.clients.splice(0, 1, domainCall(() => { throw Object.assign(new Error("internal error"), { code: -32603 }); }));
   await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_rpc_unavailable" });
+  // Malformed return data repeats on every retry, so it is not reported as temporary.
+  chain.clients.splice(0, 1, domainCall(() => "0x01"));
+  await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_verification_failed" });
+});
+
+test("a revert reported as -32603 is not a transport failure", async () => {
+  const read = respond => createPublicClient({ transport: custom({ request: async () => respond() }, { retryCount: 0 }) })
+    .readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "eip712Domain" }).then(() => assert.fail("expected a rejection"), error => error);
+  assert.equal(isTransportFailure(await read(() => { throw Object.assign(new Error("execution reverted"), { code: -32603 }); })), false);
+  assert.equal(isTransportFailure(await read(() => { throw Object.assign(new Error("internal error"), { code: -32603 }); })), true);
+  assert.equal(isTransportFailure(await read(() => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); })), true);
 });
 
 test("a link retried near its deadline gets recovery guidance instead of a tampering error", async t => {

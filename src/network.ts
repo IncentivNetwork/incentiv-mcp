@@ -1,9 +1,8 @@
 import { agentRegistryAbi, registryPinsMatch, REGISTRY_IMPLEMENTATION_SLOT } from "./agent-registry.js";
-import { decodeFunctionResult } from "viem";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { concatHex, encodeAbiParameters, encodeFunctionData, getContractAddress, keccak256, parseAbi, toHex, type Address, type Hex } from "viem";
-import { canonicalJson, localContractPins, parseConfig, registryContractPins, remoteContractPins, withoutAgentRegistry, type Config, type ContractPin, type WalletNetworkIdentity } from "./config.js";
+import { concatHex, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, getContractAddress, keccak256, parseAbi, toHex, type Address, type Hex } from "viem";
+import { canonicalJson, localContractPins, parseConfig, registryContractPins, registryFreeManifestId, remoteContractPins, type Config, type ContractPin, type WalletNetworkIdentity } from "./config.js";
 
 export class NetworkError extends Error {
   constructor(readonly code: "wallet_network_mismatch" | "capability_manifest_unapproved" | "network_verification_failed", message: string) {
@@ -27,7 +26,7 @@ export function assertWalletNetwork(cfg: Config, wallet: {
   }
   // The registry is optional: a wallet that has not approved these registry pins keeps every other capability
   // it did approve. Registry operations require approval themselves (assertRegistryApproved).
-  const registryFree = withoutAgentRegistry(cfg).manifest.manifestId;
+  const registryFree = registryFreeManifestId(cfg);
   if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId && wallet.approvedCapabilityManifestId !== registryFree && wallet.registryFreeManifestId !== registryFree) {
     throw new NetworkError("capability_manifest_unapproved", "The wallet has not approved this capability manifest. Review it with wallet capabilities approve in your local terminal");
   }

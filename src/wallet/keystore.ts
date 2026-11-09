@@ -2,7 +2,7 @@ import { WalletError } from "./errors.js";
 import { createCipheriv, createDecipheriv, createECDH, hkdfSync, randomBytes } from "node:crypto";
 import { getAddress, keccak256, type Address } from "viem";
 import { z } from "zod";
-import { canonicalJson, identitySchema, withoutAgentRegistry, type Config } from "../config.js";
+import { canonicalJson, identitySchema, registryFreeManifestId, type Config } from "../config.js";
 import { assertWalletNetwork, deriveSmartAccount } from "../network.js";
 import { adminSchema, policySchema, type Policy } from "./policy.js";
 
@@ -86,7 +86,7 @@ export function sealWallet(cfg: Config, binding: WalletBinding, privateKey: Buff
   const owner = ownerAddress(privateKey);
   const envelope: WalletEnvelope = {
     schemaVersion: 1, walletId: binding.walletId, networkIdentity: structuredClone(cfg.identity),
-    ...(keep ?? { approvedCapabilityManifestId: cfg.manifest.manifestId, ...(cfg.manifest.agentRegistry ? { registryFreeManifestId: withoutAgentRegistry(cfg).manifest.manifestId } : {}) }), owner, account: deriveSmartAccount(cfg, owner), salt: "0",
+    ...(keep ?? { approvedCapabilityManifestId: cfg.manifest.manifestId, ...(cfg.manifest.agentRegistry ? { registryFreeManifestId: registryFreeManifestId(cfg) } : {}) }), owner, account: deriveSmartAccount(cfg, owner), salt: "0",
     policy,
     keyStorage: { kind: binding.storage, creationToken: binding.creationToken },
     keyDerivation: { name: "HKDF-SHA256", salt: randomBytes(16).toString("base64"), info: "incentiv-mcp/wallet/v1" },

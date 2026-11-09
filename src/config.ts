@@ -151,6 +151,14 @@ export function withoutAgentRegistry(config: Config): Config {
   return parseConfig(base);
 }
 
+const registryFreeIds = new WeakMap<Config, Hex>();
+/** The manifest ID of withoutAgentRegistry(config), computed once per configuration. */
+export function registryFreeManifestId(config: Config): Hex {
+  let id = registryFreeIds.get(config);
+  if (!id) registryFreeIds.set(config, id = withoutAgentRegistry(config).manifest.manifestId);
+  return id;
+}
+
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config {
   const partialOverrides = ["CHAIN_ID", "ENTRY_POINT", "ACCOUNT_FACTORY", "CONTRACT_REGISTRY", "TRANSFER_GATE",
     "BULK_BALANCE_READER", "PAYMASTER", "WCENT", "SWAP_ROUTER", "QUOTER"];

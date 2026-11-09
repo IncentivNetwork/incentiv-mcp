@@ -3,7 +3,9 @@ import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { type Hex } from "viem";
 import { z } from "zod";
+import { type Config } from "../config.js";
 import { Ctx } from "../context.js";
+import { NetworkError } from "../network.js";
 import { userOpToJson } from "../userop.js";
 import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
@@ -137,8 +139,10 @@ export class WalletService {
       // Rejected new registry requests must not consume journal capacity. An existing record is checked below, where a failure closes it.
       const existing = !!r;
       if (!existing && intent.kind === "link_agent") {
-        // Reusing one Portal approval under new request IDs must not be able to fill the journal.
-        const attempts = journal.data.records.filter(o => o.intentHash === digest(intent));
+        // Reusing one Portal approval under new request IDs must not be able to fill the journal,
+        // so attempts are counted per approval rather than per intent (which varies with gas token).
+        const approval = digest(intent.registryApproval);
+        const attempts = journal.data.records.filter(o => o.intent.kind === "link_agent" && digest(o.intent.registryApproval) === approval);
         const open = attempts.find(o => !terminal(o.status));
         if (open) throw new WalletError("operation_pending", `Request ${open.requestId} already holds this Portal approval; retry with that request ID`);
         if (attempts.length >= MAX_LINK_ATTEMPTS) throw new WalletError("policy_denied", "This Portal approval has been tried too many times; obtain a fresh approval");
@@ -352,8 +356,10 @@ export class WalletService {
   /** A stuck nonce is urgent: say what to do next rather than suggesting storage damage. */
   private async replacementStep<T>(gasToken: string, step: () => Promise<T> | T): Promise<T> {
     try { return await step(); } catch (error) {
-      if (error instanceof WalletError) throw new WalletError(error.code, `${error.message.slice(error.code.length + 2)}.${nativeGasHint(gasToken)}`);
-      throw new WalletError("validation_failed", `Could not prepare this replacement; retry.${nativeGasHint(gasToken)}`);
+      // Only gas payment problems can be cleared by paying in native gas; other errors keep their own guidance.
+      if (error instanceof WalletError) throw GAS_FIXABLE_ERRORS.includes(error.code) ? new WalletError(error.code, `${error.message.slice(error.code.length + 2)}.${nativeGasHint(this.ctx.config, gasToken)}`) : error;
+      if (error instanceof NetworkError) throw error;
+      throw new WalletError("validation_failed", `Could not prepare this replacement; retry.${nativeGasHint(this.ctx.config, gasToken)}`);
     }
   }
   private replacementIntent(s: WalletSession, gasToken = "native"): Intent {
@@ -374,7 +380,7 @@ export class WalletService {
       if (gasToken !== "native" && validated.gasCharge.toString() !== replacement.gasCharge) throw new WalletError("validation_failed", "Replacement token gas payment changed");
       await this.replacementStep(gasToken, () => this.chain.simulate(validated));
       const balances = await this.chain.balances(s.envelope, [gasToken]);
-      if (BigInt(balances[gasToken] ?? "0") < validated.gasCharge) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment.${nativeGasHint(gasToken)}`);
+      if (BigInt(balances[gasToken] ?? "0") < validated.gasCharge) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment.${nativeGasHint(this.ctx.config, gasToken)}`);
       await this.canSubmit(s);
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");
       const key = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
@@ -402,7 +408,8 @@ export class WalletService {
 }
 const MAX_LINK_ATTEMPTS = 8;
 const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable"];
-const nativeGasHint = (gasToken: string) => gasToken === "native" ? "" : " To pay gas in CENT instead, review again with --native-gas.";
+const GAS_FIXABLE_ERRORS = ["policy_denied", "simulation_failed", "validation_failed"];
+const nativeGasHint = (cfg: Config, gasToken: string) => gasToken === "native" ? "" : ` To pay gas in ${cfg.identity.nativeSymbol} instead, review again with --native-gas.`;
 
 /** Every policy exception records its reasons. Without any, a retry re-evaluates the request, so there is nothing to approve. */
 export function assertNeedsApproval(r: OperationRecord) {

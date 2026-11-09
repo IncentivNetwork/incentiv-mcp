@@ -136,8 +136,10 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
 // Only inspect the log interval belonging to this operation within an EntryPoint bundle.
 export function hasRegistryEvent(cfg: Config, intent: Intent, agent: string, logs: { address: string; data: Hex; topics: readonly Hex[] }[]) {
   const event = intent.kind === "link_agent" ? "AgentLinked" : "AgentUnlinked";
-  return logs.some(log => {
-    if (!sameAddress(log.address, registryCapability(cfg).proxy.address)) return false;
+  // A receipt may be reconciled under a manifest without the registry; report the event as missing rather than blocking the wallet.
+  const proxy = cfg.manifest.agentRegistry?.proxy.address;
+  return !!proxy && logs.some(log => {
+    if (!sameAddress(log.address, proxy)) return false;
     try {
       const decoded = decodeEventLog({ abi: agentRegistryAbi, data: log.data, topics: log.topics as [Hex, ...Hex[]], strict: true });
       return decoded.eventName === event && "parent" in decoded.args && sameAddress(decoded.args.parent, intent.registryParent!) && sameAddress(decoded.args.agent, agent)

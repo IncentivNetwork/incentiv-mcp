@@ -16,7 +16,8 @@ const revertReasonEvent = parseAbiItem("event UserOperationRevertReason(bytes32 
 
 /** A node or network problem that a retry can clear, as opposed to an answer from the chain. */
 export function isTransportFailure(error: unknown): boolean {
-  return error instanceof BaseError && !!error.walk(cause => [HttpRequestError, TimeoutError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError].some(type => cause instanceof type));
+  // Some nodes report contract reverts as -32603; an answer from the contract is never retryable.
+  return error instanceof BaseError && !isContractRejection(error) && !!error.walk(cause => [HttpRequestError, TimeoutError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError].some(type => cause instanceof type));
 }
 const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() === String(values[0]).toLowerCase());
 export const SWAP_DEADLINE_SECONDS = 60;
@@ -152,8 +153,10 @@ export class WalletChain {
     assertRegistryApproved(this.ctx.config, wallet);
     try { return await read(); } catch (error) {
       if (error instanceof WalletError) throw error;
+      if (isTransportFailure(error)) throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry this request");
+      // Reverts, malformed return data and local faults repeat on retry, so they close the request.
       if (isContractRejection(error)) throw new WalletError("registry_verification_failed", "The registry refused a read, so it may have changed");
-      throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry this request");
+      throw new WalletError("registry_verification_failed", "Registry state could not be verified");
     }
   }
   async verifyRegistry(wallet: WalletEnvelope, intent: Intent, state?: ChainState) {
@@ -234,12 +237,13 @@ export class WalletChain {
           try { if (log.address.toLowerCase() === this.ctx.config.identity.entryPoint.address.toLowerCase()) { decodeEventLog({ abi: [operationEvent, beforeExecutionEvent], ...log }); break; } } catch { /* another event */ }
           start--;
         }
-        if (start < 0) throw new Error("EntryPoint execution boundary missing from receipt");
         // Exclude validation/setup logs before BeforeExecution, including for the first operation.
-        const logs = receipt.logs.slice(start + 1, index);
+        // Without that boundary this operation's logs cannot be isolated, so its registry event counts as missing.
+        const logs = start < 0 ? [] : receipt.logs.slice(start + 1, index);
         // The EntryPoint result settles the nonce either way, so a missing event is reported rather than blocking the wallet.
         let code = matches[0][0].success && !hasRegistryEvent(this.ctx.config, record.intent, record.operation.sender, logs) ? "registry_event_missing" : undefined;
-        for (const log of logs) {
+        // Revert reasons are keyed by userOpHash, so they are safe to read from the whole bundle prefix.
+        for (const log of start < 0 ? receipt.logs.slice(0, index) : logs) {
           if (log.address.toLowerCase() !== this.ctx.config.identity.entryPoint.address.toLowerCase()) continue;
           try {
             const { args } = decodeEventLog({ abi: [revertReasonEvent], ...log });
