@@ -816,6 +816,25 @@ test("sign_agent_link waits for an unresolved link or unlink, which would void a
   assert.equal(refused.link_blocked, "operation_pending"); assert.match(refused.next_action, new RegExp(id)); assert.deepEqual(f.calls, []);
 });
 
+test("a signed but unsent registry request is named with the retry that clears it", async t => {
+  const f = await signedLinkFixture(t), id = randomUUID(), submit = f.service.submit;
+  f.service.submit = async () => {}; // The process stops between signing and submission.
+  assert.equal((await f.service.send("link_agent", { request_id: id, approval: f.approval })).status, "signed");
+  f.service.submit = submit;
+  const refused = await f.service.signAgentLink(parent);
+  assert.equal(refused.link_blocked, "operation_pending"); assert.match(refused.next_action, new RegExp(`Retry link_agent with that request_id.*${id}|${id}.*Retry link_agent with that request_id`)); assert.deepEqual(f.calls, []);
+  assert.equal((await f.service.send("link_agent", { request_id: id, approval: f.approval })).status, "submitted");
+});
+
+test("a registry request still awaiting local approval does not block consent but is named in a warning", async t => {
+  const f = await signedLinkFixture(t, false), id = randomUUID();
+  assert.equal((await f.service.send("link_agent", { request_id: id, approval: f.approval })).status, "approval_required");
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: false } } }));
+  const signed = await f.service.signAgentLink(parent);
+  assert.equal(signed.agent_signed, true); assert.match(signed.warning, new RegExp(id));
+  assert.equal((await (await signedLinkFixture(t)).service.signAgentLink(parent)).warning, undefined);
+});
+
 test("sign_agent_link refuses an unapproved registry capability in the same shape as other local refusals", async t => {
   const f = await preRegistryWallet(t);
   await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: false } } }));

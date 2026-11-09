@@ -6,6 +6,7 @@ import { MAINNET } from "../src/config.ts";
 import { Ctx } from "../src/context.ts";
 import { renderMarkdown } from "../src/docs.ts";
 import { createLocalStdioMcpServer, makeServer } from "../src/server.ts";
+import { WALLET_TOOL_NAMES } from "../src/wallet/tool-names.ts";
 
 const CHAIN_TOOL_NAMES = [
   "get_account",
@@ -34,18 +35,6 @@ const CHAIN_TOOL_NAMES = [
   "broadcast_transaction",
 ];
 
-const WALLET_TOOL_NAMES = [
-  "create_agent_wallet",
-  "get_agent_wallet",
-  "send_transfer",
-  "send_swap",
-  "get_agent_operation",
-  "get_agent_registry_status",
-  "prepare_agent_link",
-  "sign_agent_link",
-  "link_agent",
-  "unlink_agent",
-];
 
 function context() {
   return new Ctx(MAINNET);

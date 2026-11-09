@@ -257,6 +257,23 @@ export class WalletService {
     });
   }
   /**
+   * The local conditions for signing link consent to `parent`, each refused with a WalletError: an enabled
+   * policy that allows the parent, a release that may sign, an approved registry capability, and no
+   * registry request that may still land. Requests that only await approval are returned as `queued`.
+   */
+  private async linkConsentChecks(s: WalletSession, parent: string) {
+    const limits = await this.enabled(s);
+    if (!registryParentAllowed(limits, parent)) throw new WalletError("registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call sign_agent_link again");
+    if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent. Use prepare_agent_link and the Portal approval flow");
+    assertRegistryApproved(this.ctx.config, s.envelope);
+    const registry = (await Journal.open(s)).data.records.filter(r => isRegistryIntent(r.intent) && !terminal(r.status));
+    // A link or unlink that may still land would change this agent's registry nonce, voiding any consent signed now.
+    const pending = registry.find(r => ownsNonce(r.status));
+    if (pending?.status === "signed") throw new WalletError("operation_pending", `Registry request ${pending.requestId} is signed but was never submitted. Retry ${pending.intent.kind} with that request_id to submit it, then call sign_agent_link again`);
+    if (pending) throw new WalletError("operation_pending", `Registry request ${pending.requestId} is still unresolved. Check it with get_agent_operation until it settles, then call sign_agent_link again`);
+    return { limits, queued: registry.map(r => r.requestId) };
+  }
+  /**
    * This agent's own AgentLink consent to `parent`, in a Portal URL, so Portal can submit the link from the
    * parent's account once the user trusts this agent. That needs the same authenticated local policy as
    * link_agent: the parent must be allowed, and the wallet enabled for signing. The signature names this one
@@ -266,16 +283,10 @@ export class WalletService {
   async signAgentLink(parent: string) {
     return this.store.session(async s => {
       const url = this.agentLinkUrl(s), requested = getAddress(parent);
-      // Local policy decides before any registry read, and its refusals take the same shape as the registry's.
-      const local = { agent: s.envelope.account, requested_parent: requested };
-      const limits = await this.enabled(s).catch((error: unknown) => { if (error instanceof WalletError) return error; throw error; });
-      if (limits instanceof WalletError) return linkRefusal(local, [limits.code, limits.message]);
-      if (!registryParentAllowed(limits, requested)) return linkRefusal(local, ["registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call sign_agent_link again"]);
-      if (!this.signingEnabled) return linkRefusal(local, ["wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent. Use prepare_agent_link and the Portal approval flow"]);
-      try { assertRegistryApproved(this.ctx.config, s.envelope); } catch (error) { if (error instanceof WalletError) return linkRefusal(local, [error.code, error.message]); throw error; }
-      // A link or unlink that may still land would change this agent's registry nonce, voiding any consent signed now.
-      const pending = (await Journal.open(s)).data.records.find(r => isRegistryIntent(r.intent) && ownsNonce(r.status));
-      if (pending) return linkRefusal(local, ["operation_pending", `Registry request ${pending.requestId} is still unresolved. Check it with get_agent_operation, then call sign_agent_link again`]);
+      // Local checks decide before any registry read, and their refusals take the same shape as the registry's.
+      const local = await this.linkConsentChecks(s, requested).catch((error: unknown) => { if (error instanceof WalletError) return error; throw error; });
+      if (local instanceof WalletError) return linkRefusal({ agent: s.envelope.account, requested_parent: requested }, [local.code, local.message]);
+      const { limits, queued } = local;
       // How soon the policy ends is decided against the block's clock, with the deadline, in agentLinkConsent.
       const { status, blocked, consent } = await this.chain.agentLinkConsent(s.envelope, requested, limits.expiresAt ? Math.floor(limits.expiresAt / 1000) : undefined);
       if (blocked) return linkRefusal(status, blocked);
@@ -291,6 +302,7 @@ export class WalletService {
       url.searchParams.set("agent_deadline", consent.deadline.toString());
       url.searchParams.set("agent_signature", signature);
       return { ...status, portal_url: url.href, agent_signed: true, agent_link: { parent: requested, agent_nonce: consent.nonce.toString(), agent_deadline: consent.deadline.toString() },
+        ...(queued.length ? { warning: `Registry request ${queued.join(", ")} still awaits local approval. If it is approved and lands, it changes this agent's registry nonce and this consent stops working.` } : {}),
         next_action: "Give this URL to the user. In Portal they trust this agent, then submit the connection from their account and pay its fee. Do not call link_agent. Check get_agent_registry_status afterwards. The request expires at agent_deadline, which is never later than local policy expiry, or earlier if this agent's registry nonce changes. Changing local policy does not withdraw it." };
     });
   }

@@ -3,7 +3,8 @@ import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Intent } from "./wallet/journal.js";
 import { WalletError } from "./wallet/errors.js";
-import { uint } from "./wallet/policy.js";
+import { sameAddress, uint } from "./wallet/policy.js";
+export { sameAddress };
 
 export const REGISTRY_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 export const agentRegistryAbi = parseAbi([
@@ -41,7 +42,6 @@ export function registryRevertCode(data: Hex): string | undefined {
     return ({ NotLinked: "registry_link_changed", SelfLink: "registry_ineligible", InvalidAgentSignature: "registry_agent_signature_invalid", InvalidParentSignature: "registry_approval_invalid", SignatureExpired: "registry_approval_expired", AgentLimitReached: "registry_limit_reached", AgentAlreadyHasParent: "registry_already_linked", ParentIsAgent: "registry_ineligible", AgentIsParent: "registry_ineligible", ParentNotIncentivAccount: "registry_ineligible", AgentNotIncentivAccount: "registry_ineligible" } as Record<string, string>)[errorName];
   } catch { return undefined; }
 }
-export const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 /** The contract itself refused the call. viem also reports a node's -32603 internal error as a revert, which says nothing about the contract. */
 export function isContractRejection(error: unknown): boolean {
   if (!(error instanceof BaseError)) return false;

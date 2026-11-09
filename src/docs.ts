@@ -5,14 +5,12 @@ import { getBridgeConfig } from "./bridge.js";
 import { onboardingHtml, onboardingScript, troubleshootingHtml } from "./onboarding-docs.js";
 import { brandLogo, brandFonts } from "./brand-assets.js";
 import { docsStyles } from "./docs-styles.js";
+import { WALLET_TOOL_NAMES as WALLET_TOOLS } from "./wallet/tool-names.js";
 
 /**
  * Documentation rendered from the tool catalog, so it stays in step with the
  * registered tools. Served as an MCP resource and as a local HTML page.
  */
-
-/** The local wallet's tools, which only the local server registers. Docs derive their list and count from this. */
-const WALLET_TOOLS = ["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation", "get_agent_registry_status", "prepare_agent_link", "sign_agent_link", "link_agent", "unlink_agent"];
 
 /** Grouping follows the tool naming. */
 const GROUPS: { title: string; blurb: string; match: (t: ToolDoc) => boolean }[] = [
