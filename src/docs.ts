@@ -5,6 +5,7 @@ import { getBridgeConfig } from "./bridge.js";
 import { onboardingHtml, onboardingScript, troubleshootingHtml } from "./onboarding-docs.js";
 import { brandLogo, brandFonts } from "./brand-assets.js";
 import { docsStyles } from "./docs-styles.js";
+import { WALLET_TOOL_NAMES as WALLET_TOOLS } from "./wallet/tool-names.js";
 
 /**
  * Documentation rendered from the tool catalog, so it stays in step with the
@@ -16,7 +17,7 @@ const GROUPS: { title: string; blurb: string; match: (t: ToolDoc) => boolean }[]
   {
     title: "Local wallet",
     blurb: "Configure policy once; permitted transfers and swaps then execute automatically within those limits.",
-    match: (t) => ["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation", "get_agent_registry_status", "prepare_agent_link", "link_agent", "unlink_agent"].includes(t.name),
+    match: (t) => WALLET_TOOLS.includes(t.name),
   },
   {
     title: "Accounts & balances",
@@ -94,7 +95,7 @@ export function renderMarkdown(cfg: Config, tools: ToolDoc[]): string {
     ``,
     `## Agent connections`,
     ``,
-    `Call \`prepare_agent_link\`, open the first-party Portal URL, and approve the displayed smart-account addresses. Pass Portal's approval JSON to \`link_agent\` with a new request UUID. Parent approvals expire after minutes and become invalid if the parent links or unlinks another agent. Gas and local wallet policy still apply. Use \`get_agent_registry_status\` for current state and \`unlink_agent\` with the expected parent to disconnect.`,
+    `For a deployed agent, call \`sign_agent_link\` with \`parent\` set to a Portal account allowed by local wallet policy. The agent signs its consent to that parent, and the user submits the connection in Portal after trusting the agent; do not call \`link_agent\`. Otherwise call \`prepare_agent_link\`, open the first-party Portal URL, and approve the displayed smart-account addresses. Pass Portal's approval JSON to \`link_agent\` with a new request UUID. Parent approvals expire after minutes and become invalid if the parent links or unlinks another agent. Gas and local wallet policy still apply. Use \`get_agent_registry_status\` for current state and \`unlink_agent\` with the expected parent to disconnect.`,
     ``,
     `## How writing works`,
     ``,
@@ -120,7 +121,7 @@ export function renderMarkdown(cfg: Config, tools: ToolDoc[]): string {
     if (g.blurb) lines.push(g.blurb, ``);
     for (const t of g.tools) {
       const params = t.params.map((p) => (p.required ? p.name : `${p.name}?`)).join(", ") || "—";
-      lines.push(`- **\`${t.name}\`** (${params})${t.readOnly ? "" : " — *changes chain state*"}`);
+      lines.push(`- **\`${t.name}\`** (${params})${t.readOnly ? "" : t.signs ? " — *signs, never submits*" : " — *changes chain state*"}`);
       if (t.description) lines.push(`  ${t.description}`);
     }
     lines.push(``);
@@ -144,7 +145,7 @@ export function renderHtml(cfg: Config, tools: ToolDoc[]): string {
   const bridgeTokens = [...new Set(ROUTES.map((r) => r.token))];
   const chainNames = Object.values(REMOTE_CHAINS).map((c) => c.name);
 
-  const walletNames = new Set(["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation", "get_agent_registry_status", "prepare_agent_link", "link_agent", "unlink_agent"]);
+  const walletNames = new Set(WALLET_TOOLS);
   const chainTools = tools.filter(tool => !walletNames.has(tool.name));
   const toolHtml = grouped(chainTools)
     .map(
@@ -297,7 +298,7 @@ ${cfg.manifest.bridge.enabled ? `<section>
   <h2>${chainTools.length} chain tools.</h2>
   <p class="intro">Expand a tool to see its description and arguments. Optional arguments are labeled. Token arguments accept a symbol (<code>USDC</code>), a contract address, or <code>${esc(cfg.identity.nativeSymbol)}</code> for the native coin.</p>
   ${toolHtml}
-  <aside class="local-tools"><h3>Nine wallet tools.</h3><p>These tools operate on the wallet on this computer and are available only in the local server.</p><p><code>create_agent_wallet</code> · <code>get_agent_wallet</code> · <code>send_transfer</code> · <code>send_swap</code> · <code>get_agent_operation</code> · <code>get_agent_registry_status</code> · <code>prepare_agent_link</code> · <code>link_agent</code> · <code>unlink_agent</code></p><a href="#setup">Install and set up →</a></aside>
+  <aside class="local-tools"><h3>${WALLET_TOOLS.length} wallet tools.</h3><p>These tools operate on the wallet on this computer and are available only in the local server.</p><p>${WALLET_TOOLS.map(name => `<code>${name}</code>`).join(" · ")}</p><a href="#setup">Install and set up →</a></aside>
 </section>
 
 ${cfg.manifest.bridge.enabled ? `<section>

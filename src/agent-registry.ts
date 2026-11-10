@@ -1,9 +1,9 @@
-import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, InternalRpcError, decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
+import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, InternalRpcError, decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, hashTypedData, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Intent } from "./wallet/journal.js";
 import { WalletError } from "./wallet/errors.js";
-import { uint } from "./wallet/policy.js";
+import { sameAddress, uint } from "./wallet/policy.js";
 
 export const REGISTRY_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 export const agentRegistryAbi = parseAbi([
@@ -13,6 +13,7 @@ export const agentRegistryAbi = parseAbi([
   "function agentCount(address parent) view returns(uint256)", "function maxAgentsPerParent() view returns(uint256)",
   "function isIncentivAccount(address account) view returns(bool)", "function isAccountFactory(address factory) view returns(bool)",
   "function parentLinkDigest(address parent,address agent,uint256 deadline) view returns(bytes32)",
+  "function agentLinkDigest(address parent,address agent,uint256 deadline) view returns(bytes32)",
   "function nonces(address account) view returns(uint256)",
   "function eip712Domain() view returns(bytes1 fields,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt,uint256[] extensions)",
   "event AgentLinked(address indexed parent,address indexed agent)",
@@ -24,10 +25,11 @@ export const agentRegistryAbi = parseAbi([
   "error InvalidParentSignature()", "error InvalidAgentSignature()", "error SignatureExpired(uint256 deadline)",
 ]);
 const accountSignatureAbi = parseAbi(["function isValidSignature(bytes32 hash,bytes signature) view returns(bytes4)"]);
-const addr = z.string().regex(/^0x[0-9a-fA-F]{40}$/).refine(a => !/^0x0{40}$/i.test(a));
+/** A registry participant: any address except zero, which the registry uses for "none". */
+export const registryAddressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/).refine(a => !/^0x0{40}$/i.test(a), "Zero address is not an account");
 export const registryApprovalSchema = z.strictObject({
-  version: z.literal(1), chain_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), registry: addr,
-  parent: addr, agent: addr, parent_nonce: uint,
+  version: z.literal(1), chain_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), registry: registryAddressSchema,
+  parent: registryAddressSchema, agent: registryAddressSchema, parent_nonce: uint,
   parent_deadline: uint.refine(s => BigInt(s) <= BigInt(Number.MAX_SAFE_INTEGER)),
   // Generous for EOA and passkey signatures; every accepted request occupies the capped journal.
   parent_signature: z.string().max(8194).regex(/^0x(?:[0-9a-fA-F]{2})+$/),
@@ -39,7 +41,6 @@ export function registryRevertCode(data: Hex): string | undefined {
     return ({ NotLinked: "registry_link_changed", SelfLink: "registry_ineligible", InvalidAgentSignature: "registry_agent_signature_invalid", InvalidParentSignature: "registry_approval_invalid", SignatureExpired: "registry_approval_expired", AgentLimitReached: "registry_limit_reached", AgentAlreadyHasParent: "registry_already_linked", ParentIsAgent: "registry_ineligible", AgentIsParent: "registry_ineligible", ParentNotIncentivAccount: "registry_ineligible", AgentNotIncentivAccount: "registry_ineligible" } as Record<string, string>)[errorName];
   } catch { return undefined; }
 }
-export const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 /** The contract itself refused the call. viem also reports a node's -32603 internal error as a revert, which says nothing about the contract. */
 export function isContractRejection(error: unknown): boolean {
   if (!(error instanceof BaseError)) return false;
@@ -59,10 +60,12 @@ export function assertRegistryApproved(cfg: Config, wallet: { approvedCapability
   registryCapability(cfg);
   if (wallet.approvedCapabilityManifestId !== cfg.manifest.manifestId) throw new WalletError("capability_manifest_unapproved", "This wallet has not approved the Agent Registry. Review it with wallet capabilities approve in your local terminal");
 }
+/** The registry's EIP-712 signing domain name and version, pinned at deployment checks and used for local digests. */
+export const REGISTRY_DOMAIN = { name: "Incentiv Agent Registry", version: "1" } as const;
 export function registryPinsMatch(cfg: Config, slot: string | undefined, domain: readonly [string, string, string, bigint, string, ...unknown[]]): boolean {
   const cap = registryCapability(cfg);
   return !!slot && /^0x[0-9a-fA-F]+$/.test(slot) && BigInt(slot) === BigInt(cap.implementation.address)
-    && domain[0] === "0x0f" && domain[1] === "Incentiv Agent Registry" && domain[2] === "1"
+    && domain[0] === "0x0f" && domain[1] === REGISTRY_DOMAIN.name && domain[2] === REGISTRY_DOMAIN.version
     && domain[3] === BigInt(cfg.identity.chainId) && sameAddress(domain[4], cap.proxy.address);
 }
 export async function verifyRegistryDeployment(client: PublicClient, cfg: Config, blockNumber: bigint) {
@@ -115,23 +118,71 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
     return;
   }
   const a = intent.registryApproval!;
-  const localNow = Math.floor(Date.now() / 1000);
-  if (state.timestamp < localNow - 60 || state.timestamp > localNow + 30) throw new WalletError("registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request");
-  const now = Math.max(localNow, state.timestamp);
+  const now = freshBlockTime(state.timestamp);
   if (Number(a.parent_deadline) <= now + 10) throw new WalletError("registry_approval_expired", "Portal approval expired or is too close to expiry; obtain a fresh approval");
-  const blocked = linkBlocker(status, state.deployed);
+  const blocked = linkBlocker(status, state.deployed) ?? parentBlocker(status, a.parent);
   if (blocked) throw new WalletError(...blocked);
-  if (status.parent_is_agent || !status.parent_eligible) throw new WalletError("registry_ineligible", "Account roles or allowed factories do not permit this link");
-  if (BigInt(status.parent_agent_count!) >= BigInt(status.max_agents)) throw new WalletError("registry_limit_reached", "Parent has reached its agent limit; unlink an agent in Portal first");
   if (status.parent_nonce !== a.parent_nonce) throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval");
   const cap = registryCapability(cfg);
   const digest = await client.readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "parentLinkDigest", args: [a.parent as Address, wallet.account as Address, BigInt(a.parent_deadline)], blockNumber: state.block });
-  const magic = await client.readContract({ address: a.parent as Address, abi: accountSignatureAbi, functionName: "isValidSignature", args: [digest, a.parent_signature as Hex], blockNumber: state.block }).catch((error: unknown) => {
-    // A rejecting or codeless parent is an invalid signature; an RPC failure says nothing about it.
+  if (!await acceptsSignature(client, a.parent as Address, digest, a.parent_signature as Hex, state.block)) throw new WalletError("registry_approval_invalid", "Parent signature is invalid; obtain a fresh Portal approval");
+}
+/**
+ * Whether `account` accepts `signature` over `digest` through ERC-1271, as the registry checks it. A rejecting
+ * or codeless account does not accept it; an RPC failure says nothing about it, so it is thrown.
+ */
+async function acceptsSignature(client: PublicClient, account: Address, digest: Hex, signature: Hex, blockNumber: bigint) {
+  const magic = await client.readContract({ address: account, abi: accountSignatureAbi, functionName: "isValidSignature", args: [digest, signature], blockNumber }).catch((error: unknown) => {
     if (isContractRejection(error)) return "0x";
     throw error;
   });
-  if (magic !== "0x1626ba7e") throw new WalletError("registry_approval_invalid", "Parent signature is invalid; obtain a fresh Portal approval");
+  return magic === "0x1626ba7e";
+}
+/**
+ * The current time for a registry check: the later of the local clock and the block's, refusing a block
+ * too far from the local clock to trust either.
+ */
+export function freshBlockTime(timestamp: number, [code, message]: [string, string] = ["registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request"]): number {
+  const localNow = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(timestamp) || timestamp < localNow - 60 || timestamp > localNow + 30) throw new WalletError(code, message);
+  return Math.max(localNow, timestamp);
+}
+/** How long an agent-signed link request stays valid. It may wait in Portal until the user trusts the agent. */
+export const AGENT_LINK_REQUEST_SECONDS = 24 * 60 * 60;
+/** The shortest agent-signed link request worth handing out; a policy expiring sooner signs nothing. */
+export const AGENT_LINK_MIN_SECONDS = 15 * 60;
+/** The AgentLink EIP-712 digest, computed locally so a changed registry cannot choose what the agent key signs. */
+export function agentLinkDigest(cfg: Config, agent: Address, parent: Address, nonce: bigint, deadline: bigint): Hex {
+  const cap = registryCapability(cfg);
+  return hashTypedData({
+    domain: { ...REGISTRY_DOMAIN, chainId: cfg.identity.chainId, verifyingContract: cap.proxy.address },
+    types: { AgentLink: [{ name: "agent", type: "address" }, { name: "parent", type: "address" }, { name: "nonce", type: "uint256" }, { name: "deadline", type: "uint256" }] },
+    primaryType: "AgentLink",
+    message: { agent, parent, nonce, deadline },
+  });
+}
+/** Why `parent` cannot take this agent right now, read from a registryStatus that named it. */
+export function parentBlocker(status: { agent: string; parent_eligible?: boolean; parent_is_agent?: boolean; parent_agent_count?: string; max_agents: string }, parent: string): [code: string, message: string] | undefined {
+  if (sameAddress(parent, status.agent) || status.parent_is_agent || !status.parent_eligible) return ["registry_ineligible", "Account roles or allowed factories do not permit this link"];
+  if (BigInt(status.parent_agent_count ?? "0") >= BigInt(status.max_agents)) return ["registry_limit_reached", "Parent has reached its agent limit; unlink an agent in Portal first"];
+}
+/**
+ * The digest this agent signs to consent to `parent`, at one pinned block whose registry deployment the
+ * caller has verified: the local digest must equal the registry's own `agentLinkDigest`, or nothing is signed.
+ */
+export async function readAgentLinkDigest(client: PublicClient, cfg: Config, agent: Address, parent: Address, deadline: bigint, blockNumber: bigint) {
+  const cap = registryCapability(cfg);
+  const [nonce, onChain] = await Promise.all([
+    client.readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "nonces", args: [agent], blockNumber }),
+    client.readContract({ address: cap.proxy.address, abi: agentRegistryAbi, functionName: "agentLinkDigest", args: [parent, agent, deadline], blockNumber }),
+  ]);
+  const digest = agentLinkDigest(cfg, agent, parent, nonce, deadline);
+  if (onChain.toLowerCase() !== digest.toLowerCase()) throw new WalletError("registry_verification_failed", "Registry agent-link digest does not match the expected signing format");
+  return { nonce, digest };
+}
+/** The agent account itself must accept the signature, as the registry will check it through ERC-1271. */
+export async function assertAgentSignature(client: PublicClient, agent: Address, digest: Hex, signature: Hex, blockNumber: bigint) {
+  if (!await acceptsSignature(client, agent, digest, signature, blockNumber)) throw new WalletError("registry_agent_signature_invalid", "This agent account did not accept its own link signature");
 }
 // Only inspect the log interval belonging to this operation within an EntryPoint bundle.
 export function hasRegistryEvent(cfg: Config, intent: Intent, agent: string, logs: { address: string; data: Hex; topics: readonly Hex[] }[]) {

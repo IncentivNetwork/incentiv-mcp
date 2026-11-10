@@ -63,6 +63,11 @@ export function tokenLimits(limits: Limits, token: string) {
 export function addSpend(spend: Spend, token: string, amount: bigint): void {
   const key = token.toLowerCase(); spend[key] = (BigInt(spend[key] ?? "0") + amount).toString();
 }
+export const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+/** Whether authenticated local policy lets this agent link to `parent`, by sending the link or signing consent for it. */
+export function registryParentAllowed(limits: Limits, parent: string | undefined) {
+  return !!parent && !!limits.agentRegistry?.parents.some(a => sameAddress(a, parent));
+}
 export function policyViolations(limits: Limits, input: {
   token: string; tokenOut?: string; amount: string; to?: string; swap: boolean; slippage: number;
   spend: Spend; used: Spend; balances: Spend; gasCost: bigint; fee: bigint; gasUnits: bigint;
@@ -70,7 +75,7 @@ export function policyViolations(limits: Limits, input: {
   gasToken: string; gasCharge: bigint; calls: { to: string; data: string }[];
 }, now = Date.now()): string[] {
   const reasons: string[] = [];
-  if (input.registryKind === "link_agent" && !limits.agentRegistry?.parents.some(a => a.toLowerCase() === input.registryParent?.toLowerCase())) reasons.push("registry_parent_not_allowed");
+  if (input.registryKind === "link_agent" && !registryParentAllowed(limits, input.registryParent)) reasons.push("registry_parent_not_allowed");
   if (input.registryKind === "unlink_agent" && !limits.agentRegistry?.allowUnlink) reasons.push("registry_unlink_not_allowed");
   const token = tokenLimits(limits, input.token);
   if (!token || BigInt(input.amount) > BigInt(token.perTransaction)) reasons.push("per_transaction_limit");

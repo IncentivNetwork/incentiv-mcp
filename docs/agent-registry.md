@@ -1,11 +1,28 @@
 # Agent Registry connections
 
-The mainnet proxy is `0x1Be49e07439A4c3B1B95E1A9ba1031f477306012`, chain ID 24101. This integration supports the agent-submitted flow: Portal signs parent consent; the local agent smart account sends `link` in an ERC-4337 v0.7 operation. No parent key enters MCP and no separate agent consent signature is exported.
+The mainnet proxy is `0x1Be49e07439A4c3B1B95E1A9ba1031f477306012`, chain ID 24101. This integration supports two flows. In the Portal-submitted flow, the agent signs its own `AgentLink` consent for one parent and Portal sends `link` from the parent's account. In the agent-submitted flow, Portal signs parent consent and the local agent smart account sends `link` in an ERC-4337 v0.7 operation. No parent key enters MCP in either flow.
 
-## Connect
+## Connect from Portal
+
+This flow needs a deployed agent account.
+
+1. Allow the parent in local policy (see below) with `incentiv-mcp setup`.
+2. Call `sign_agent_link` with `parent` set to that Portal smart account. MCP checks the registry and the parent, computes the `AgentLink` digest locally and requires the registry's `agentLinkDigest` to match it at the same block, signs its bytes with the agent key (EIP-191), and checks that the agent account accepts the signature. Nothing is submitted.
+3. Give the returned Portal URL to the user. It carries `parent`, `agent_nonce`, `agent_deadline` and `agent_signature`. The user trusts the agent in Portal, then confirms the connection, which Portal sends from their account with its fee.
+4. Check `get_agent_registry_status`. Do not call `link_agent` for this request.
+
+The consent lasts 24 hours, never past the local policy's expiry, and ends earlier if this agent's registry nonce changes. A policy that expires within 15 minutes signs nothing. The consent names one parent, and the registry accepts it only in a `link` sent by that parent or signed by it, so the URL gives nobody else a way to link this agent. A parent missing from local policy, an expired policy or a disabled wallet signs nothing.
+
+A signed consent cannot be withdrawn from MCP. Removing the parent from policy, disabling the wallet or renewing the policy stops new signatures but leaves an issued URL usable until its `agent_deadline`. Treat the URL like an approval and share it only with that parent's owner. If a connection you did not want goes through, unlink it from the parent in Portal. `unlink_agent` works too, but only if local policy sets `allowUnlink`; allowing a parent does not allow unlinking.
+
+Any `link` or `unlink` changes this agent's registry nonce and voids its outstanding consents. So `sign_agent_link` refuses with `operation_pending` while a `link_agent` or `unlink_agent` request may still land, and names the request. A request that is signed but was never sent is cleared by retrying it with the same `request_id`, or with `wallet operation resolve <request_id> --replace` once its deadline has passed. A request that has not been sent yet, such as one awaiting local approval, does not block signing, but the result names it in `warning`. An expired local policy is refused before any registry read.
+
+For an agent that is not deployed yet, `sign_agent_link` signs nothing and returns `registry_agent_not_deployed`, because the registry checks the agent's signature through its deployed account. Use `prepare_agent_link` and the flow below instead.
+
+## Connect with a Portal approval
 
 1. Run setup and fund your agent account for gas (native CENT, or an approved token through the paymaster).
-2. Call `prepare_agent_link`. Open the returned first-party Portal `/agents` URL. A prod-staging reviewer can open the same `/agents` path and query on the prod-staging Portal origin; do not send signatures through a URL.
+2. Call `prepare_agent_link`. Open the returned first-party Portal `/agents` URL. A prod-staging reviewer can open the same `/agents` path and query on the prod-staging Portal origin. Never send a parent signature through a URL.
 3. Check both full smart-account addresses. Portal reads the digest itself and signs its bytes using the EOA or passkey wrapper. Approvals last 15 minutes.
 4. Copy the approval JSON into `link_agent` with a new `request_id` UUID, optional `gas_token` and `wait_for_confirmation`. This still requires authenticated local policy.
 5. Reuse the same UUID only for identical retries. `get_agent_operation` reconciles the request; `get_agent_registry_status` reads the current relationship. Historical completion and the current relationship can differ after a later unlink.
@@ -14,7 +31,7 @@ The agent can be undeployed: factory deployment occurs before its first `link` e
 
 ## Local permissions
 
-Setup can authorize selected Portal parent smart-account addresses and optional unlinking. The optional authenticated policy field is:
+Setup can authorize selected Portal parent smart-account addresses and optional unlinking. The same parent list decides which parents the agent may sign consent for. The optional authenticated policy field is:
 
 ```json
 "agentRegistry": {
