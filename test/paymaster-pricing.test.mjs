@@ -12,12 +12,12 @@ const token = (address, symbol, decimals) => ({ address, symbol, name: symbol, d
 const schedule = g => g <= 200_000n ? 26_000n : 26_000n + ((g - 200_000n) * 38_000n) / 600_000n;
 
 /** A chain whose paymaster prices by its USDC schedule and whose pools quote 1 USDC unit = 10^9 WCENT wei and 1 OTHER wei = 2 WCENT wei. */
-function fakeCtx({ overhead = 50_000n, pool = 2n } = {}) {
+function fakeCtx({ overhead = 50_000n, pool = 2n, allowed = true } = {}) {
   const calls = [];
   const config = structuredClone(MAINNET);
   return { calls, config, client: { readContract: async ({ address, functionName, args }) => {
     calls.push([functionName, args]);
-    if (address === PAYMASTER) return { usdcToken: USDC, usdcPoolFee: 500, overheadGas: overhead, maxVerificationGas: 2_000_000n, requiredPaymentUsdc: schedule(args?.[0] ?? 0n) }[functionName];
+    if (address === PAYMASTER) return { usdcToken: () => USDC, usdcPoolFee: () => 500, overheadGas: () => overhead, maxVerificationGas: () => 2_000_000n, requiredPaymentUsdc: () => schedule(args[0]), allowedPaymentToken: () => allowed }[functionName]();
     const q = args[0];
     if (functionName === "quoteExactInputSingle") return [q.tokenIn === USDC ? q.amountIn * 10n ** 9n : q.amountIn * pool, 0n, 0, 0n];
     if (functionName === "quoteExactOutputSingle") return [q.amount / 2n, 0n, 0, 0n];
@@ -46,6 +46,15 @@ test("gas paid in WCENT or another token covers the USDC amount's WCENT quote wi
   // The paymaster quotes other tokens through its default 0.3% pool.
   assert.ok(ctx.calls.filter(([fn, args]) => fn.startsWith("quote") && args[0].tokenIn === OTHER).every(([, args]) => args[0].fee === 3000));
   await assert.rejects(computeGasTokenAmount(fakeCtx({ pool: 0n }), cfg, token(OTHER, "WETH", 18), 36_666n), /Could not price gas in WETH/);
+});
+
+test("a token off the paymaster's allowlist is refused before pricing, however its pool quotes", async () => {
+  const ctx = fakeCtx({ allowed: false }), cfg = await getPaymasterConfig(ctx);
+  await assert.rejects(computeGasTokenAmount(ctx, cfg, token(OTHER, "MEME", 18), 36_666n), /The paymaster does not accept MEME for gas/);
+  assert.ok(ctx.calls.some(([fn, args]) => fn === "allowedPaymentToken" && args[0] === OTHER));
+  // USDC and WCENT need no allowlist entry.
+  assert.equal(await computeGasTokenAmount(ctx, cfg, token(USDC, "USDC", 6), 36_666n), 36_666n);
+  assert.ok(await computeGasTokenAmount(ctx, cfg, token(WCENT, "WCENT", 18), 36_666n) > 0n);
 });
 
 test("a token-paid operation pays the schedule for its own limits, whatever the base fee", async t => {

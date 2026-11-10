@@ -259,8 +259,8 @@ const QUOTE_MARGIN_PERCENT = 102n;
 
 /**
  * The token amount that satisfies the paymaster's check for `requiredUsdc`, mirroring it: USDC is compared
- * directly; WCENT must cover the USDC amount's WCENT quote; any other token must quote to that WCENT through
- * the paymaster's default pool.
+ * directly; WCENT must cover the USDC amount's WCENT quote; any other token must be on the paymaster's
+ * allowlist and quote to that WCENT through its default pool.
  */
 export async function computeGasTokenAmount(
   ctx: Ctx,
@@ -275,6 +275,9 @@ export async function computeGasTokenAmount(
   if (requiredCent === 0n) throw new Error("The paymaster's USDC quote returned zero");
   const target = (requiredCent * QUOTE_MARGIN_PERCENT) / 100n;
   if (token.address.toLowerCase() === ctx.config.manifest.contracts.wcent.address.toLowerCase()) return target;
+  // Beyond USDC and WCENT, the paymaster accepts only tokens on its allowlist, whatever their pools quote.
+  const allowed = await ctx.client.readContract({ address: ctx.config.manifest.contracts.unifiedTokenPaymaster.address, abi: paymasterAbi, functionName: "allowedPaymentToken", args: [token.address] });
+  if (!allowed) throw new Error(`The paymaster does not accept ${token.symbol} for gas. Pay gas in ${ctx.config.identity.nativeSymbol}, USDC or another accepted token`);
   let amount = await quoteExactOutputToWcent(ctx, token.address, DEFAULT_POOL_FEE, target);
   for (let i = 0; i < 5; i++) {
     if (await quoteExactInputToWcent(ctx, token.address, DEFAULT_POOL_FEE, amount) >= target) return amount;

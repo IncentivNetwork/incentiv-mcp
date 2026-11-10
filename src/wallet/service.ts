@@ -308,7 +308,7 @@ export class WalletService {
       // Local checks decide before any registry read, and their refusals take the same shape as the registry's.
       let local: Awaited<ReturnType<WalletService["linkConsentChecks"]>>;
       try { local = await this.linkConsentChecks(s, requested); } catch (error) {
-        if (error instanceof WalletError && LINK_CONSENT_REFUSALS.includes(error.code)) return linkRefusal({ agent: s.envelope.account, requested_parent: requested }, [error.code, error.message]);
+        if (error instanceof WalletError && LINK_CONSENT_REFUSALS.includes(error.code)) return linkRefusal({ agent: s.envelope.account, requested_parent: requested }, [error.code, error.detail]);
         throw error;
       }
       const { limits, queued } = local;

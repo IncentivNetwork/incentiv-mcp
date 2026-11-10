@@ -875,6 +875,8 @@ test("sign_agent_link signs nothing for a parent that local policy or the regist
   const denied = await signedLinkFixture(t, false);
   const refused = await denied.service.signAgentLink(parent);
   assert.equal(refused.link_blocked, "registry_parent_not_allowed"); assert.equal(refused.portal_url, undefined); assert.deepEqual(denied.calls, []);
+  // The refusal's code is in link_blocked; next_action is the plain instruction.
+  assert.match(refused.next_action, /^Local wallet policy does not allow this parent\./);
   for (const [status, code] of [[{ parent_agent_count: "5" }, "registry_limit_reached"], [{ parent_eligible: false }, "registry_ineligible"], [{ parent_is_agent: true }, "registry_ineligible"], [{ parent }, "registry_already_linked"]]) {
     const f = await signedLinkFixture(t, true, status);
     const blocked = await f.service.signAgentLink(parent);

@@ -593,7 +593,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
             sufficient: balance !== undefined ? balance >= amount : undefined,
           });
         } catch {
-          // No WCENT pool, so this token cannot pay gas.
+          // Not on the paymaster's allowlist, or no WCENT pool, so this token cannot pay gas.
         }
       }
       return ok({

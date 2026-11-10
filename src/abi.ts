@@ -95,6 +95,7 @@ export const paymasterAbi = parseAbi([
   "function minPaymentUsdc() view returns (uint256)",
   "function overheadGas() view returns (uint256)",
   "function requiredPaymentUsdc(uint256 billableGas) view returns (uint256)",
+  "function allowedPaymentToken(address token) view returns (bool)",
   "function maxVerificationGas() view returns (uint256)",
   "function getDeposit() view returns (uint256)",
 ]);
