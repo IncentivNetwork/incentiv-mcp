@@ -63,8 +63,8 @@ export function tokenLimits(limits: Limits, token: string) {
 export function addSpend(spend: Spend, token: string, amount: bigint): void {
   const key = token.toLowerCase(); spend[key] = (BigInt(spend[key] ?? "0") + amount).toString();
 }
-/** Whether authenticated local policy lets this agent link to `parent`, by sending the link or signing consent for it. */
 export const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+/** Whether authenticated local policy lets this agent link to `parent`, by sending the link or signing consent for it. */
 export function registryParentAllowed(limits: Limits, parent: string | undefined) {
   return !!parent && !!limits.agentRegistry?.parents.some(a => sameAddress(a, parent));
 }

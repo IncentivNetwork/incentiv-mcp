@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { createPublicClient, custom, encodeAbiParameters, encodeEventTopics, HttpRequestError, recoverMessageAddress, decodeFunctionData, encodeFunctionData, encodeErrorResult } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { MAINNET, configurationId, parseConfig, withoutAgentRegistry } from "../src/config.ts";
@@ -823,7 +824,29 @@ test("a signed but unsent registry request is named with the retry that clears i
   f.service.submit = submit;
   const refused = await f.service.signAgentLink(parent);
   assert.equal(refused.link_blocked, "operation_pending"); assert.match(refused.next_action, new RegExp(`Retry link_agent with that request_id.*${id}|${id}.*Retry link_agent with that request_id`)); assert.deepEqual(f.calls, []);
+  // Once its deadline passes, a retry cannot send it, so the refusal names the resolve command instead.
+  const now = Date.now;
+  Date.now = () => now() + 60 * 60 * 1000;
+  try {
+    const stale = await f.service.signAgentLink(parent);
+    assert.equal(stale.link_blocked, "operation_pending"); assert.match(stale.next_action, new RegExp(`wallet operation resolve ${id} --replace`));
+  } finally { Date.now = now; }
   assert.equal((await f.service.send("link_agent", { request_id: id, approval: f.approval })).status, "submitted");
+});
+
+test("an expired policy is refused before any registry read, deployed or not", async t => {
+  for (const status of [{}, { deployed: false, agent_eligible: false }]) {
+    const f = await signedLinkFixture(t, true, status, { expiresAt: Date.now() - 1000 });
+    const refused = await f.service.signAgentLink(parent);
+    assert.equal(refused.link_blocked, "policy_expired"); assert.deepEqual(f.calls, []);
+  }
+});
+
+test("a damaged journal stays an error rather than becoming a link refusal", async t => {
+  const f = await signedLinkFixture(t);
+  await f.store.session(async s => writeFile(join(s.directory, "operations", "journal.json"), "{}"));
+  await assert.rejects(f.service.signAgentLink(parent), { code: "wallet_recovery_required" });
+  assert.deepEqual(f.calls, []);
 });
 
 test("a registry request still awaiting local approval does not block consent but is named in a warning", async t => {
