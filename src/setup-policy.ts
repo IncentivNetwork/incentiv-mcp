@@ -6,7 +6,12 @@ import { limitsSchema, type Limits } from "./wallet/policy.js";
 
 export type Ask = (question: string) => Promise<string>;
 export type Tell = (message: string) => void;
-export const technicalLimits = { maxSlippageBps: 50, maxQuoteDeviationBps: 50, maxFeePerGas: "100000000000000", maxGasUnits: "1000000", maxBatchCalls: 4 };
+/**
+ * Defaults for the advanced limits. Gas units count every limit of an operation, including the paymaster's own
+ * verification and post-operation limits when gas is paid in a token: a USDC-paid first operation that deploys
+ * and links an agent declared 1,114,937 units on mainnet, so the default leaves room above that.
+ */
+export const technicalLimits = { maxSlippageBps: 50, maxQuoteDeviationBps: 50, maxFeePerGas: "100000000000000", maxGasUnits: "1500000", maxBatchCalls: 4 };
 
 /** Policy allowances may be zero. Never round or parse amounts through floating point. */
 export function allowance(text: string, decimals: number): string {
@@ -112,7 +117,7 @@ export async function promptPolicy(config: Config, resolveToken: (ref: string) =
     return amount;
   });
   const technical = { ...technicalLimits };
-  tell("Advanced defaults: 0.5% swap slippage, 0.5% quote deviation, 1,000,000 gas units, 100,000 gwei fee ceiling, 4 calls. Your total gas budget still applies.");
+  tell(`Advanced defaults: ${technicalLimits.maxSlippageBps / 100}% swap slippage, ${technicalLimits.maxQuoteDeviationBps / 100}% quote deviation, ${Number(technicalLimits.maxGasUnits).toLocaleString("en-US")} gas units, ${Number(formatUnits(BigInt(technicalLimits.maxFeePerGas), 9)).toLocaleString("en-US")} gwei fee ceiling, ${technicalLimits.maxBatchCalls} calls. Your total gas budget still applies.`);
   if (await yesNo(ask, tell, "Edit these advanced limits?")) {
     const integer = (label: string, min: number, max: number, current: number) => answer(ask, tell, `${label} [${current}]: `, text => {
       const value = Number(text || current);

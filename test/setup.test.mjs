@@ -7,7 +7,7 @@ import { encodeFunctionData } from "viem";
 import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
-import { allowance, answer, promptPolicy, setupTargets } from "../src/setup-policy.ts";
+import { allowance, answer, promptPolicy, setupTargets, technicalLimits } from "../src/setup-policy.ts";
 import { connectionFor, clientConfigPath, mergeConnection, saveClientConfig, connectClient } from "../src/setup-client.ts";
 import { setupWallet, checkRuntime } from "../src/setup.ts";
 import { parseWalletProfileArgs } from "../src/wallet-profile.ts";
@@ -215,4 +215,16 @@ test("registry setup deduplicates parent addresses after case normalization", as
   const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "y", `${parent.toLowerCase()},${parent}`, "y"];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, () => {});
   assert.deepEqual(policy.agentRegistry.parents, [parent]);
+});
+
+test("setup's default gas-unit limit admits a token-paid first operation that deploys and links an agent", async () => {
+  // Declared on mainnet by a USDC-paid deploy + link (2026-11-10, tx 0x3a6e14f9…): 382,120 verification, 327,100 call,
+  // 55,717 pre-verification, and the paymaster's 300,000 verification and 50,000 post-operation limits.
+  const firstLink = 382_120n + 327_100n + 55_717n + 300_000n + 50_000n;
+  assert.ok(BigInt(technicalLimits.maxGasUnits) >= firstLink * 13n / 10n, "the default keeps at least 30% headroom over a measured first link");
+  const told = [];
+  const asked = [];
+  const answers = ["", "", "n", "1", "1", "1", "1", "1", "1", "1", "1", "1", "n", "n"];
+  await promptPolicy(MAINNET, async ref => ({ address: ref === "CENT" ? "native" : MAINNET.manifest.canonicalTokens.USDC.address, symbol: ref, name: ref, decimals: ref === "CENT" ? 18 : 6 }), async q => { asked.push(q); return answers.shift() ?? "n"; }, m => told.push(m)).catch(() => {});
+  assert.ok(told.some(m => m.includes("1,500,000 gas units") && m.includes("100,000 gwei fee ceiling")), "setup states the defaults it applies");
 });
