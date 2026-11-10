@@ -117,6 +117,12 @@ export class WalletService {
     await this.canSubmit(s, r);
     if (!r.operation || !r.userOpHash) throw new WalletError("wallet_recovery_required", "Signed operation is missing");
     if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", "Signed operation deadline expired; review a same-nonce replacement with wallet operation resolve --replace");
+    // A registry request signed under pins this release no longer approves cannot be sent, and approving the
+    // new pins waits for its nonce, so only a same-nonce replacement clears it.
+    if (isRegistryIntent(r.intent)) try { assertRegistryApproved(this.ctx.config, s.envelope); } catch (error) {
+      if (!(error instanceof WalletError) || error.code !== "capability_manifest_unapproved") throw error;
+      throw new WalletError(error.code, `Registry request ${r.requestId} was signed before this release changed the Agent Registry pins, so it cannot be sent. Clear it with wallet operation resolve ${r.requestId} --replace in your local terminal, then run wallet capabilities approve`);
+    }
     await this.revalidate(s, journal, r);
     // Reconcile happened under the same cross-process lock before this retry.
     r.attempts++;

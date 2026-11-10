@@ -7,7 +7,7 @@ import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { MAINNET } from '../src/config.ts';
 import { deriveSmartAccount } from '../src/network.ts';
 import { accountFactoryAbi } from '../src/abi.ts';
-import { agentRegistryAbi, hasRegistryEvent, registryCall, verifyRegistryIntent } from '../src/agent-registry.ts';
+import { agentRegistryAbi, assertAgentSignature, hasRegistryEvent, readAgentLinkDigest, registryCall, verifyRegistryIntent } from '../src/agent-registry.ts';
 import { computeUserOpHash, userOpToJson, encodeExecuteBatch } from '../src/userop.ts';
 
 import { Ctx } from '../src/context.ts';
@@ -69,6 +69,12 @@ const unlinked = await submit(unlink, false);
 assert.ok(hasRegistryEvent(MAINNET, unlink, agent, unlinked.receipt.logs));
 assert.equal(await client.readContract({ address: registry, abi: agentRegistryAbi, functionName: 'parentOf', args: [agent] }), `0x${'00'.repeat(20)}`);
 console.log('PASS: agent unlink through a real EntryPoint user operation');
+// sign_agent_link hands Portal the agent owner's bare EIP-191 signature over the registry's AgentLink digest.
+const consentBlock = (await client.getBlock()).number;
+const consent = await readAgentLinkDigest(client, MAINNET, agent, parent, BigInt(deadline), consentBlock);
+await assertAgentSignature(client, agent, consent.digest, await agentOwner.signMessage({ message: { raw: consent.digest } }), consentBlock);
+await assert.rejects(assertAgentSignature(client, agent, consent.digest, await parentOwner.signMessage({ message: { raw: consent.digest } }), consentBlock), { code: 'registry_agent_signature_invalid' });
+console.log('PASS: the deployed agent accepts sign_agent_link consent through ERC-1271 and matches the local AgentLink digest');
 const fresh = await client.getBlock();
 await assert.rejects(verifyRegistryIntent(client, MAINNET, { account: agent }, intent, { block: fresh.number, timestamp: Number(fresh.timestamp), deployed: true }), { code: 'registry_approval_stale' });
 console.log('PASS: old parent approval rejected after link/unlink consumed registry nonces');

@@ -410,6 +410,30 @@ test("a wallet that approved older registry pins keeps working and approves new 
   assert.equal((await f.service.registryStatus()).deployed, false);
 });
 
+test("a registry request signed under older pins names the replacement that clears it after a pin update", async t => {
+  const next = structuredClone(MAINNET), id = randomUUID(), replace = new RegExp(`wallet operation resolve ${id} --replace`);
+  next.manifest.agentRegistry.implementation.codeHash = `0x${"12".repeat(32)}`;
+  next.manifest.manifestId = configurationId(next.manifest, "manifestId");
+  const old = await registryFixture(t), submit = old.service.submit;
+  old.service.submit = async () => {}; // The process stops between signing and submission.
+  assert.equal((await old.service.send("link_agent", { request_id: id, approval: old.approval })).status, "signed");
+  old.service.submit = submit;
+
+  // Under the new release the signed link can't be sent, and approving the new pins waits for its nonce: both name the way out.
+  const f = await fixture(t, { root: old.root, existing: true, config: next }), previous = withoutAgentRegistry(next);
+  await assert.rejects(f.service.resolve(id, password), error => error.code === "capability_manifest_unapproved" && replace.test(error.message));
+  await assert.rejects(approveCapabilities(f.store, previous, next, password, digest(await reviewCapabilities(f.store, previous, next))), error => error.code === "operation_pending" && replace.test(error.message));
+  assert.equal(f.submissions.length, 0);
+
+  // That replacement goes through, and then the new pins can be approved.
+  const record = (await f.service.reviewReplacement(id, true)).records[0];
+  assert.equal((await f.service.replace(id, password, digest(record))).status, "superseding");
+  f.chain.receipt = async r => r.userOpHash === record.replacement.userOpHash ? { success: true, actualGasCost: 400n, transactionHash: `0x${"44".repeat(32)}` } : undefined;
+  assert.equal((await f.service.operation(id)).status, "superseded");
+  await approveCapabilities(f.store, previous, next, password, digest(await reviewCapabilities(f.store, previous, next)));
+  assert.equal((await f.store.createOrLoad()).manifest_id, next.manifest.manifestId);
+});
+
 test("a changed base manifest is still refused even with a registry-free approval on record", async t => {
   const f = await fixture(t), changed = structuredClone(MAINNET);
   changed.manifest.contracts.swapRouter.codeHash = `0x${"56".repeat(32)}`;
