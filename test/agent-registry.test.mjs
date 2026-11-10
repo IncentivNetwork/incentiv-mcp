@@ -388,12 +388,25 @@ test("a signed link the registry no longer accepts names the replacement that fr
   f.service.submit = submit;
   f.chain.verifyRegistry = async () => { throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval"); };
   const replace = new RegExp(`wallet operation resolve ${id} --replace.*fresh Portal approval with a new request ID`);
-  await assert.rejects(f.service.send("link_agent", args), error => error.code === "registry_approval_stale" && /^registry_approval_stale: Parent nonce changed\. Signed/.test(error.message) && replace.test(error.message));
+  await assert.rejects(f.service.send("link_agent", args), error => error.code === "registry_approval_stale" && /^registry_approval_stale: Parent nonce changed; obtain a fresh Portal approval\. Signed request/.test(error.message) && replace.test(error.message));
   await assert.rejects(f.service.resolve(id, password), error => error.code === "registry_approval_stale" && replace.test(error.message));
   assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
-  // A temporary RPC failure is not a reason to replace anything.
-  f.chain.verifyRegistry = async () => { throw new WalletError("registry_rpc_unavailable", "RPC down"); };
-  await assert.rejects(f.service.send("link_agent", args), error => error.code === "registry_rpc_unavailable" && !/--replace/.test(error.message));
+  // Refusals that can clear, such as a temporary RPC failure, an unverifiable read or a full parent, are not a reason to replace anything.
+  for (const [code, message] of [["registry_rpc_unavailable", "RPC down"], ["registry_verification_failed", "Registry state could not be verified"], ["registry_limit_reached", "Parent has reached its agent limit; unlink an agent in Portal first"]]) {
+    f.chain.verifyRegistry = async () => { throw new WalletError(code, message); };
+    await assert.rejects(f.service.send("link_agent", args), error => error.code === code && error.message === `${code}: ${message}`);
+  }
+  assert.equal((await f.service.operation(id)).status, "signed");
+});
+
+test("a signed registry request names the replacement that frees its nonce after a release drops the registry", async t => {
+  const id = randomUUID(), old = await registryFixture(t), submit = old.service.submit;
+  old.service.submit = async () => {}; // The process stops between signing and submission.
+  assert.equal((await old.service.send("link_agent", { request_id: id, approval: old.approval })).status, "signed");
+  old.service.submit = submit;
+  const f = await fixture(t, { root: old.root, existing: true, config: withoutAgentRegistry(MAINNET) });
+  await assert.rejects(f.service.resolve(id, password), error => error.code === "registry_unavailable" && new RegExp(`does not include the Agent Registry.*wallet operation resolve ${id} --replace`).test(error.message));
+  assert.equal(f.submissions.length, 0);
 });
 
 test("a wallet that approved older registry pins keeps working and approves new pins without a config file", async t => {
@@ -778,6 +791,21 @@ test("registry reverts expose actionable error and fresh-consent guidance throug
   assert.equal(result.status, "reverted");
   assert.equal(result.registry_error, "registry_approval_invalid");
   assert.match(result.next_action, /fresh approval in Portal/);
+});
+
+test("a reverted unlink or a link refused for another reason is not sent to Portal for a fresh approval", async t => {
+  const f = await registryFixture(t), id = randomUUID();
+  assert.equal((await f.service.send("unlink_agent", { request_id: id, parent })).status, "submitted");
+  f.setReceipt({ success: false, actualGasCost: 200n, transactionHash: `0x${"11".repeat(32)}`, registryError: "registry_link_changed" });
+  const unlinked = await f.service.operation(id);
+  assert.equal(unlinked.status, "reverted"); assert.equal(unlinked.registry_error, "registry_link_changed");
+  assert.match(unlinked.next_action, /no longer linked.*no Portal approval is needed/); assert.doesNotMatch(unlinked.next_action, /fresh approval/);
+
+  const g = await registryFixture(t), linkId = randomUUID();
+  await g.service.send("link_agent", { request_id: linkId, approval: g.approval });
+  g.setReceipt({ success: false, actualGasCost: 200n, transactionHash: `0x${"22".repeat(32)}`, registryError: "registry_limit_reached" });
+  const limited = await g.service.operation(linkId);
+  assert.equal(limited.registry_error, "registry_limit_reached"); assert.match(limited.next_action, /refused this link \(registry_limit_reached\).*get_agent_registry_status/);
 });
 
 test("the agent-link digest matches the mainnet registry", () => {

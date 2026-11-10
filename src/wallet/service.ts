@@ -72,9 +72,10 @@ export class WalletService {
     if (Object.entries(validated.spend).some(([token, amount]) => BigInt(balances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "Balance cannot cover input plus maximum gas");
     if (state.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Gas fee no longer covers the current base fee");
     if (isRegistryIntent(r.intent)) await this.chain.verifyRegistry(s.envelope, r.intent, state).catch((error: unknown) => {
-      // The registry no longer accepts these signed bytes, yet they still hold the nonce, so a fresh request would be refused until they are replaced.
-      if (!(error instanceof WalletError) || !error.code.startsWith("registry_") || error.code === "registry_rpc_unavailable") throw error;
-      throw new WalletError(error.code, `${error.message.slice(error.code.length + 2).replace(/[.;]? obtain a fresh (Portal )?approval$/i, "")}. Signed request ${r.requestId} cannot be sent but still holds the account nonce. Clear it with wallet operation resolve ${r.requestId} --replace in your local terminal${r.intent.kind === "link_agent" ? ", then use a fresh Portal approval with a new request ID" : ""}`);
+      // These signed bytes can never succeed, yet they still hold the nonce, so a fresh request would be refused until they are replaced.
+      // Other refusals, such as an unverifiable read or a full parent, can clear, so the request stays retryable as it is.
+      if (!(error instanceof WalletError) || !UNSENDABLE_REGISTRY_ERRORS.includes(error.code)) throw error;
+      throw new WalletError(error.code, `${error.detail}. Signed request ${r.requestId} cannot be sent but still holds the account nonce, so first clear it with wallet operation resolve ${r.requestId} --replace in your local terminal${r.intent.kind === "link_agent" ? ", then use a fresh Portal approval with a new request ID" : ""}`);
     });
     if (r.intent.kind === "swap") await this.chain.verifySwap(s.envelope, r.intent, limits, state);
     await this.chain.simulate(validated);
@@ -121,11 +122,13 @@ export class WalletService {
     await this.canSubmit(s, r);
     if (!r.operation || !r.userOpHash) throw new WalletError("wallet_recovery_required", "Signed operation is missing");
     if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", "Signed operation deadline expired; review a same-nonce replacement with wallet operation resolve --replace");
-    // A registry request signed under pins this release no longer approves cannot be sent, and approving the
-    // new pins waits for its nonce, so only a same-nonce replacement clears it.
+    // A registry request signed under pins this release no longer approves, or before a release without the registry,
+    // cannot be sent; approving new pins waits for its nonce, so only a same-nonce replacement clears it.
     if (isRegistryIntent(r.intent)) try { assertRegistryApproved(this.ctx.config, s.envelope); } catch (error) {
-      if (!(error instanceof WalletError) || error.code !== "capability_manifest_unapproved") throw error;
-      throw new WalletError(error.code, `Registry request ${r.requestId} was signed before this release changed the Agent Registry pins, so it cannot be sent. Clear it with wallet operation resolve ${r.requestId} --replace in your local terminal, then run wallet capabilities approve`);
+      if (!(error instanceof WalletError)) throw error;
+      if (error.code === "capability_manifest_unapproved") throw new WalletError(error.code, `Registry request ${r.requestId} was signed before this release changed the Agent Registry pins, so it cannot be sent. Clear it with wallet operation resolve ${r.requestId} --replace in your local terminal, then run wallet capabilities approve`);
+      if (error.code === "registry_unavailable") throw new WalletError(error.code, `Registry request ${r.requestId} was signed, but this release does not include the Agent Registry, so it cannot be sent. Clear it with wallet operation resolve ${r.requestId} --replace in your local terminal`);
+      throw error;
     }
     await this.revalidate(s, journal, r);
     // Reconcile happened under the same cross-process lock before this retry.
@@ -487,6 +490,18 @@ export class WalletService {
 }
 const MAX_LINK_ATTEMPTS = 8;
 const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable"];
+/** Registry refusals that the same signed bytes can never get past. */
+const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed"];
+const PORTAL_APPROVAL_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid"];
+/** What an agent should do after the registry reverted its request; only a link's parent consent comes from a Portal approval. */
+function registryNextAction(kind: Intent["kind"], code: string) {
+  if (kind === "unlink_agent") return code === "registry_link_changed"
+    ? "This agent is no longer linked to that parent, so there was nothing to unlink. Check get_agent_registry_status; no Portal approval is needed."
+    : `The registry refused this unlink (${code}). Check get_agent_registry_status before retrying with a new request UUID; no Portal approval is needed.`;
+  return PORTAL_APPROVAL_ERRORS.includes(code)
+    ? "Refresh registry status. Invalid or expired parent consent requires a fresh approval in Portal and a new request UUID."
+    : `The registry refused this link (${code}). Check get_agent_registry_status before asking the user for a fresh Portal approval with a new request UUID.`;
+}
 const GAS_FIXABLE_ERRORS = ["policy_denied", "simulation_failed", "validation_failed"];
 const nativeGasHint = (cfg: Config, gasToken: string) => gasToken === "native" ? "" : ` To pay gas in ${cfg.identity.nativeSymbol} instead, review again with --native-gas.`;
 
@@ -503,5 +518,5 @@ function result(r: OperationRecord) {
   const eventMissing = r.status === "confirmed" && r.lastError === "registry_event_missing";
   const registryError = eventMissing || (r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_")) ? r.lastError : undefined;
   const interrupted = r.status === "approval_required" && TEMPORARY_ERRORS.includes(r.lastError ?? "");
-  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: "Refresh registry status. Invalid or expired parent consent requires a fresh approval in Portal and a new request UUID." } : interrupted ? { next_action: `A temporary RPC failure interrupted this request. Retry with the same request ID${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
+  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `A temporary RPC failure interrupted this request. Retry with the same request ID${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }
