@@ -366,6 +366,36 @@ test("an RPC failure keeps a link request and its local approval retryable", asy
   assert.equal(sent.status, "submitted"); assert.equal(sent.last_error, undefined);
 });
 
+test("an RPC failure after an unapproved request is rebuilt drops reasons that may no longer describe it", async t => {
+  const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval }, simulate = f.chain.simulate;
+  assert.ok((await f.service.send("link_agent", args)).reasons.length);
+  // The retry rebuilds the operation, then the RPC fails before its policy is evaluated.
+  f.chain.simulate = async () => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); };
+  await assert.rejects(f.service.send("link_agent", args), { code: "rpc_unavailable" });
+  const interrupted = await f.service.operation(id);
+  assert.equal(interrupted.status, "approval_required"); assert.equal(interrupted.reasons, undefined); assert.match(interrupted.next_action, /not needed/);
+  await assert.rejects(f.service.approve(id, password, digest((await f.service.review(id)).records[0])), { code: "validation_failed" });
+  // Retrying evaluates the rebuilt operation and reports its own reasons.
+  f.chain.simulate = simulate;
+  const retried = await f.service.send("link_agent", args);
+  assert.equal(retried.status, "approval_required"); assert.ok(retried.reasons.includes("registry_parent_not_allowed"));
+});
+
+test("a signed link the registry no longer accepts names the replacement that frees its nonce", async t => {
+  const f = await registryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval }, submit = f.service.submit;
+  f.service.submit = async () => {}; // The process stops between signing and submission.
+  assert.equal((await f.service.send("link_agent", args)).status, "signed");
+  f.service.submit = submit;
+  f.chain.verifyRegistry = async () => { throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval"); };
+  const replace = new RegExp(`wallet operation resolve ${id} --replace.*fresh Portal approval with a new request ID`);
+  await assert.rejects(f.service.send("link_agent", args), error => error.code === "registry_approval_stale" && /^registry_approval_stale: Parent nonce changed\. Signed/.test(error.message) && replace.test(error.message));
+  await assert.rejects(f.service.resolve(id, password), error => error.code === "registry_approval_stale" && replace.test(error.message));
+  assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
+  // A temporary RPC failure is not a reason to replace anything.
+  f.chain.verifyRegistry = async () => { throw new WalletError("registry_rpc_unavailable", "RPC down"); };
+  await assert.rejects(f.service.send("link_agent", args), error => error.code === "registry_rpc_unavailable" && !/--replace/.test(error.message));
+});
+
 test("a wallet that approved older registry pins keeps working and approves new pins without a config file", async t => {
   const next = structuredClone(MAINNET), code = "capability_manifest_unapproved", id = randomUUID(), base = withoutAgentRegistry(MAINNET);
   next.manifest.agentRegistry.implementation.codeHash = `0x${"12".repeat(32)}`;
@@ -856,6 +886,20 @@ test("a signed but unsent registry request is named with the retry that clears i
     assert.equal(stale.link_blocked, "operation_pending"); assert.match(stale.next_action, new RegExp(`wallet operation resolve ${id} --replace`));
   } finally { Date.now = now; }
   assert.equal((await f.service.send("link_agent", { request_id: id, approval: f.approval })).status, "submitted");
+});
+
+test("a registry request the network may have dropped is named with the resend that settles it", async t => {
+  const f = await signedLinkFixture(t), id = randomUUID(), relay = f.chain.relay;
+  f.chain.relay = async (...a) => { await relay(...a); throw new Error("lost response"); };
+  assert.equal((await f.service.send("link_agent", { request_id: id, approval: f.approval })).status, "submission_unknown");
+  f.chain.relay = relay;
+  const refused = await f.service.signAgentLink(parent);
+  assert.equal(refused.link_blocked, "operation_pending"); assert.match(refused.next_action, new RegExp(`${id}.*Retry link_agent with that request_id to send it again`)); assert.doesNotMatch(refused.next_action, /until it settles/);
+  const now = Date.now;
+  Date.now = () => now() + 60 * 60 * 1000;
+  try { assert.match((await f.service.signAgentLink(parent)).next_action, new RegExp(`never confirmed.*wallet operation resolve ${id} --replace`)); }
+  finally { Date.now = now; }
+  assert.deepEqual(f.calls, []);
 });
 
 test("an expired policy is refused before any registry read, deployed or not", async t => {

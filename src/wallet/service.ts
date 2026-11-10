@@ -71,7 +71,11 @@ export class WalletService {
     if (r.approval && !this.approved(s, r)) throw new WalletError("approval_required", "Exact-operation approval expired or policy changed; reservation preserved");
     if (Object.entries(validated.spend).some(([token, amount]) => BigInt(balances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "Balance cannot cover input plus maximum gas");
     if (state.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Gas fee no longer covers the current base fee");
-    if (isRegistryIntent(r.intent)) await this.chain.verifyRegistry(s.envelope, r.intent, state);
+    if (isRegistryIntent(r.intent)) await this.chain.verifyRegistry(s.envelope, r.intent, state).catch((error: unknown) => {
+      // The registry no longer accepts these signed bytes, yet they still hold the nonce, so a fresh request would be refused until they are replaced.
+      if (!(error instanceof WalletError) || !error.code.startsWith("registry_") || error.code === "registry_rpc_unavailable") throw error;
+      throw new WalletError(error.code, `${error.message.slice(error.code.length + 2).replace(/[.;]? obtain a fresh (Portal )?approval$/i, "")}. Signed request ${r.requestId} cannot be sent but still holds the account nonce. Clear it with wallet operation resolve ${r.requestId} --replace in your local terminal${r.intent.kind === "link_agent" ? ", then use a fresh Portal approval with a new request ID" : ""}`);
+    });
     if (r.intent.kind === "swap") await this.chain.verifySwap(s.envelope, r.intent, limits, state);
     await this.chain.simulate(validated);
     await this.canSubmit(s, r);
@@ -225,7 +229,8 @@ export class WalletService {
       } catch (error) {
         // An RPC outage says nothing about the request, so its ID and any local approval stay usable.
         const failure = error instanceof WalletError ? error : isTransportFailure(error) ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : undefined;
-        if (r.status === "preparing" && TEMPORARY_ERRORS.includes(failure?.code ?? "")) { r.lastError = failure!.code; await journal.transition(r, "approval_required"); }
+        // Without an approval the operation may have been rebuilt, so earlier reasons may not describe it; a retry evaluates it again.
+        if (r.status === "preparing" && TEMPORARY_ERRORS.includes(failure?.code ?? "")) { r.lastError = failure!.code; if (!r.approval) delete r.reasons; await journal.transition(r, "approval_required"); }
         else if (r.status === "preparing") { r.lastError = failure?.code ?? "validation_failed"; await journal.transition(r, "failed"); }
         if (failure) throw failure;
         throw new WalletError("validation_failed", "Local operation preparation failed");
@@ -279,8 +284,11 @@ export class WalletService {
     const registry = (await Journal.open(s)).data.records.filter(r => isRegistryIntent(r.intent) && !terminal(r.status));
     // A link or unlink that may still land would change this agent's registry nonce, voiding any consent signed now.
     const pending = registry.find(r => ownsNonce(r.status));
-    if (pending?.status === "signed" && pending.deadline && pending.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", `Registry request ${pending.requestId} was signed but never submitted, and its deadline has passed. Resolve it with wallet operation resolve ${pending.requestId} --replace in your local terminal, then call sign_agent_link again`);
+    // A signed request, or one the network may have dropped, settles only when it is sent again or replaced.
+    const resendable = pending?.status === "signed" || pending?.status === "submission_unknown";
+    if (resendable && pending.deadline && pending.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", `Registry request ${pending.requestId} was ${pending.status === "signed" ? "signed but never submitted" : "never confirmed"}, and its deadline has passed. Resolve it with wallet operation resolve ${pending.requestId} --replace in your local terminal, then call sign_agent_link again`);
     if (pending?.status === "signed") throw new WalletError("operation_pending", `Registry request ${pending.requestId} is signed but was never submitted. Retry ${pending.intent.kind} with that request_id to submit it, then call sign_agent_link again`);
+    if (pending?.status === "submission_unknown") throw new WalletError("operation_pending", `Registry request ${pending.requestId} was submitted but has not been confirmed and may have been dropped. Retry ${pending.intent.kind} with that request_id to send it again, check it with get_agent_operation, then call sign_agent_link again`);
     if (pending) throw new WalletError("operation_pending", `Registry request ${pending.requestId} is still unresolved. Check it with get_agent_operation until it settles, then call sign_agent_link again`);
     return { limits, queued: registry.map(r => r.requestId) };
   }
