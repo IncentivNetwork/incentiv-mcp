@@ -371,12 +371,12 @@ test("bridge tools require an outbound destination and encode exact amounts in b
 });
 
 test("paymaster configuration cannot leak across network configurations", async () => {
-  const make = (coefficient) => ({ config: structuredClone(MAINNET), client: { readContract: async ({ functionName }) =>
-    functionName === "usdcToken" ? MAINNET.manifest.canonicalTokens.USDC.address : functionName === "gasEstimateCoefficient" ? coefficient : 1n } });
+  const make = (overhead) => ({ config: structuredClone(MAINNET), client: { readContract: async ({ functionName }) =>
+    functionName === "usdcToken" ? MAINNET.manifest.canonicalTokens.USDC.address : functionName === "overheadGas" ? overhead : 1n } });
   const a = make(100n), b = make(200n);
-  assert.equal((await getPaymasterConfig(a)).gasEstimateCoefficient, 100n);
-  assert.equal((await getPaymasterConfig(b)).gasEstimateCoefficient, 200n);
-  assert.equal((await getPaymasterConfig(a)).gasEstimateCoefficient, 100n);
+  assert.equal((await getPaymasterConfig(a)).overheadGas, 100n);
+  assert.equal((await getPaymasterConfig(b)).overheadGas, 200n);
+  assert.equal((await getPaymasterConfig(a)).overheadGas, 100n);
 });
 
 test("get_network_status preserves legacy fields and serves a complete verifiable handshake", async (t) => {

@@ -90,11 +90,11 @@ export const wcentAbi = parseAbi([
 export const paymasterAbi = parseAbi([
   "function quoter() view returns (address)",
   "function wcent() view returns (address)",
-  "function gasEstimateCoefficient() view returns (uint256)",
   "function usdcToken() view returns (address)",
   "function usdcPoolFee() view returns (uint24)",
   "function minPaymentUsdc() view returns (uint256)",
-  "function minTransactionGas() view returns (uint256)",
+  "function overheadGas() view returns (uint256)",
+  "function requiredPaymentUsdc(uint256 billableGas) view returns (uint256)",
   "function maxVerificationGas() view returns (uint256)",
   "function getDeposit() view returns (uint256)",
 ]);

@@ -26,7 +26,7 @@ import {
   computeGasTokenAmount,
   getFees,
   getPaymasterConfig,
-  requiredCentFor,
+  requiredPaymentUsdc,
   userOpFromJson,
   userOpToJson,
   waitForUserOp,
@@ -569,7 +569,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
       const [pmCfg, fees, known] = await Promise.all([getPaymasterConfig(ctx), getFees(ctx), ctx.knownTokens()]);
       // Representative gas for a sponsored token transfer.
       const sample = { callGasLimit: 350_000n, verificationGasLimit: 400_000n, preVerificationGas: 60_000n };
-      const requiredCent = requiredCentFor(pmCfg, sample, fees.maxFeePerGas);
+      const requiredUsdc = await requiredPaymentUsdc(ctx, pmCfg, sample);
       const options: Record<string, unknown>[] = [
         {
           token: cfg.identity.nativeSymbol,
@@ -582,7 +582,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
         if (listed.address === NATIVE || listed.address.toLowerCase() === cfg.manifest.contracts.wcent.address.toLowerCase()) continue;
         try {
           const t = await ctx.resolveToken(listed.address);
-          const amount = await computeGasTokenAmount(ctx, pmCfg, t, requiredCent);
+          const amount = await computeGasTokenAmount(ctx, pmCfg, t, requiredUsdc);
           const balance = account ? await tokenBalance(ctx, t, account) : undefined;
           options.push({
             token: t.symbol,

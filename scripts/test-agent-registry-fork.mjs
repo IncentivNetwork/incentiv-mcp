@@ -8,7 +8,7 @@ import { MAINNET } from '../src/config.ts';
 import { deriveSmartAccount } from '../src/network.ts';
 import { accountFactoryAbi } from '../src/abi.ts';
 import { agentRegistryAbi, assertAgentSignature, hasRegistryEvent, readAgentLinkDigest, registryCall, verifyRegistryIntent } from '../src/agent-registry.ts';
-import { computeGasTokenAmount, computeUserOpHash, encodeExecuteBatch, getPaymasterConfig, requiredCentFor, userOpToJson } from '../src/userop.ts';
+import { computeGasTokenAmount, computeUserOpHash, encodeExecuteBatch, getPaymasterConfig, requiredPaymentUsdc, userOpToJson } from '../src/userop.ts';
 import { validateOperation } from '../src/wallet/validate.ts';
 
 import { Ctx } from '../src/context.ts';
@@ -191,11 +191,12 @@ const tokenIntent = { intentSchemaVersion: 1, kind: 'link_agent', token: usdc, g
 const forkCtx = new Ctx({ ...MAINNET, endpoints: { ...MAINNET.endpoints, rpcUrls: [rpc] } });
 const pm = await getPaymasterConfig(forkCtx);
 const verificationGasLimit = pm.maxVerificationGas !== 0n && pm.maxVerificationGas < 1000000n ? pm.maxVerificationGas : 1000000n;
-// Anvil lowers the base fee on every empty block; restore mainnet's, since the wallet's token price scales with it.
-await client.request({ method: 'anvil_setNextBlockBaseFeePerGas', params: [toHex(forkHead.baseFeePerGas)] });
+// Price at a quarter of mainnet's base fee, below this year's low: the paymaster's USDC schedule does not depend on it,
+// so a price that scaled with the base fee would be refused here as "Payment below minimum".
+await client.request({ method: 'anvil_setNextBlockBaseFeePerGas', params: [toHex(forkHead.baseFeePerGas / 4n)] });
 await client.request({ method: 'anvil_mine', params: ['0x1'] });
 const quoteBlock = await client.getBlock();
-const gasCharge = await computeGasTokenAmount(forkCtx, pm, { address: usdc, symbol: 'USDC', name: 'USD Coin', decimals: 6 }, requiredCentFor(pm, { callGasLimit: 500000n, verificationGasLimit, preVerificationGas: 100000n }, quoteBlock.baseFeePerGas * 2n + 1000000000n));
+const gasCharge = await computeGasTokenAmount(forkCtx, pm, { address: usdc, symbol: 'USDC', name: 'USD Coin', decimals: 6 }, await requiredPaymentUsdc(forkCtx, pm, { callGasLimit: 500000n, preVerificationGas: 100000n }));
 const tokenCalls = [{ to: usdc, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [paymasterAddress, gasCharge] }) }, registryCall(MAINNET, agent3, tokenIntent)];
 const tokenSent = await sendOp({ sender: agent3, owner: agent3Owner, calls: tokenCalls, deploy: true, paymaster: { address: paymasterAddress, verificationGasLimit } });
 // The wallet's own validator accepts the operation that the real paymaster just paid for.
@@ -205,7 +206,26 @@ assert.equal(tokenResult.success, true); assert.equal(tokenResult.registryError,
 assert.equal(await parentOf(agent3), parent.toLowerCase());
 assert.equal(await client.getBalance({ address: agent3 }), 0n, 'The agent paid no native gas');
 assert.equal(await client.readContract({ address: usdc, abi: erc20Abi, functionName: 'balanceOf', args: [agent3] }), funded - gasCharge);
-console.log(`PASS: USDC-paid first operation deploys and links the agent through the real paymaster (charged ${gasCharge} USDC units, verification gas ${verificationGasLimit}); wallet validation and receipt agree`);
+console.log(`PASS: USDC-paid first operation deploys and links the agent through the real paymaster at a base fee of ${quoteBlock.baseFeePerGas / 10n ** 9n} gwei (charged ${gasCharge} USDC units by the paymaster's schedule); wallet validation and receipt agree`);
+
+// WCENT gas: the paymaster converts the USDC schedule to WCENT with a live pool quote, so the wallet's margin must cover it.
+const wcent = MAINNET.manifest.contracts.wcent.address, wcentAbi = parseAbi(['function deposit() payable']);
+await client.request({ method: 'anvil_setBalance', params: [agent3, toHex(10n ** 22n)] });
+await client.request({ method: 'anvil_impersonateAccount', params: [agent3] });
+const agent3Wallet = createWalletClient({ chain, account: agent3, transport: http(rpc, { timeout: 60000 }) });
+await client.waitForTransactionReceipt({ hash: await agent3Wallet.writeContract({ address: wcent, abi: wcentAbi, functionName: 'deposit', value: 10n ** 21n, gas: 200000n }) });
+await client.request({ method: 'anvil_stopImpersonatingAccount', params: [agent3] });
+await client.request({ method: 'anvil_setBalance', params: [agent3, '0x0'] });
+const wcentBefore = await client.readContract({ address: wcent, abi: erc20Abi, functionName: 'balanceOf', args: [agent3] });
+const wcentCharge = await computeGasTokenAmount(forkCtx, pm, { address: wcent, symbol: 'WCENT', name: 'Wrapped CENT', decimals: 18 }, await requiredPaymentUsdc(forkCtx, pm, { callGasLimit: 500000n, preVerificationGas: 100000n }));
+const unlink3 = { ...unlink, token: wcent, gasToken: wcent, registryParent: parent };
+const wcentSent = await sendOp({ sender: agent3, owner: agent3Owner, calls: [{ to: wcent, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [paymasterAddress, wcentCharge] }) }, registryCall(MAINNET, agent3, unlink3)], paymaster: { address: paymasterAddress, verificationGasLimit } });
+validateOperation(MAINNET, { account: agent3, owner: agent3Owner.address, approvedCapabilityManifestId: MAINNET.manifest.manifestId }, unlink3, userOpToJson({ ...wcentSent.op, signature: '0x' }), { nonce: wcentSent.op.nonce, deployed: true, hash: wcentSent.hash });
+const wcentResult = await decodeReceipt(wcentSent, unlink3);
+assert.equal(wcentResult.success, true); assert.equal(await parentOf(agent3), zeroAddress);
+assert.equal(await client.getBalance({ address: agent3 }), 0n, 'The agent paid no native gas');
+assert.equal(await client.readContract({ address: wcent, abi: erc20Abi, functionName: 'balanceOf', args: [agent3] }), wcentBefore - wcentCharge);
+console.log(`PASS: WCENT-paid unlink through the real paymaster's live USDC-to-WCENT quote (charged ${wcentCharge} WCENT wei)`);
 
 
 } finally { await client.request({ method: 'evm_revert', params: [snapshot] }); }
