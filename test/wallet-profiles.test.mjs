@@ -38,10 +38,10 @@ test("profiles require an explicit startup argument and reject misplaced, duplic
   ]) assert.throws(() => parseWalletProfileArgs(args));
 });
 
-test("named-profile MCP retains all 29 tools without creating or loading a wallet", async () => {
+test("named-profile MCP retains all 34 tools without creating or loading a wallet", async () => {
   const bundle = await createLocalStdioMcpServer(new Ctx(MAINNET), "profile-catalog-test");
   try {
-    assert.equal(bundle.catalog.length, 29);
+    assert.equal(bundle.catalog.length, 34);
     assert.deepEqual(bundle.catalog.filter(t => ["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation"].includes(t.name)).map(t => t.name), ["create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation"]);
   } finally { await bundle.server.close(); }
 });

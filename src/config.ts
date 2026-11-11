@@ -11,9 +11,16 @@ const text = z.string().min(1).max(200);
 const symbol = z.string().regex(/^[A-Z0-9]+$/);
 const chainId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const url = z.string().url().refine((value) => {
+  if (!URL.canParse(value)) return false;
   const parsed = new URL(value);
   return ["https:", "http:"].includes(parsed.protocol) && !parsed.username && !parsed.password && !parsed.hash;
 }, "Expected an HTTP(S) URL without credentials or a fragment").transform(value => new URL(value).href);
+/** Agent links carry the agent's signed consent, so only an Incentiv HTTPS host may receive them. */
+const portalUrl = url.refine((value) => {
+  if (!URL.canParse(value)) return false;
+  const { protocol, hostname, port } = new URL(value);
+  return protocol === "https:" && !port && (hostname === "incentiv.io" || hostname.endsWith(".incentiv.io"));
+}, "Expected an https://*.incentiv.io URL");
 const rpcUrls = z.array(url).min(1).refine((values) => new Set(values).size === values.length, "Duplicate RPC URL");
 const key = z.string().regex(/^[a-z0-9_-]+$/);
 
@@ -30,6 +37,7 @@ export const manifestSchema = z.strictObject({
     contractRegistry: pin, transferGate: pin, bulkBalanceReader: pin, unifiedTokenPaymaster: pin,
     wcent: pin, swapRouter: pin, quoter: pin,
   }),
+  agentRegistry: z.strictObject({ proxy: pin, implementation: pin }).optional(),
   canonicalTokens: z.record(symbol, pin),
   bridge: z.strictObject({
     enabled: z.boolean(), incentivDomain: z.number().int().nonnegative().max(0xffffffff), mailbox: pin.optional(),
@@ -53,6 +61,8 @@ const configSchema = z.strictObject({
   accountCreationCode: z.custom<Hex>((v) => typeof v === "string" && /^0x(?:[0-9a-f]{2})+$/.test(v)),
   endpoints: z.strictObject({
     rpcUrls, bundlerUrl: url, explorerApiUrl: url, explorerUrl: url,
+    // Where agent links open; required when the manifest enables the Agent Registry.
+    portalUrl: portalUrl.optional(),
     remoteChains: z.record(key, z.strictObject({ rpcUrls, explorerUrl: url })),
   }),
 });
@@ -96,6 +106,7 @@ export function parseConfig(input: unknown): Config {
   if (configurationId(manifest, "manifestId") !== manifest.manifestId) throw new Error("Invalid manifestId");
   if (manifest.networkId !== identity.networkId) throw new Error("Manifest belongs to a different network identity");
   if (keccak256(cfg.accountCreationCode) !== identity.accountInitCodeHash) throw new Error("Account creation bytecode hash mismatch");
+  if (manifest.agentRegistry && !endpoints.portalUrl) throw new Error("Agent Registry requires endpoints.portalUrl");
   if (manifest.bridge.enabled && (!manifest.bridge.mailbox || !manifest.bridge.routes.length)) {
     throw new Error("Enabled bridge requires a mailbox and routes");
   }
@@ -111,7 +122,7 @@ export function parseConfig(input: unknown): Config {
   if (canonicalJson(remoteNames) !== canonicalJson(Object.keys(endpoints.remoteChains).sort())) {
     throw new Error("Remote endpoints must match the declared remote chains");
   }
-  for (const pins of [localContractPins(cfg), ...remoteNames.map((name) => remoteContractPins(cfg, name))]) {
+  for (const pins of [[...localContractPins(cfg), ...registryContractPins(cfg)], ...remoteNames.map((name) => remoteContractPins(cfg, name))]) {
     const seen = new Map<string, Hex>();
     for (const p of pins) {
       const previous = seen.get(p.address.toLowerCase());
@@ -129,12 +140,34 @@ export function localContractPins(cfg: Config): ContractPin[] {
     ...(m.bridge.enabled ? [m.bridge.mailbox!, ...m.bridge.routes.flatMap((r) => [r.localRouter, ...(r.incentivToken ? [r.incentivToken] : [])])] : [])];
 }
 
+/** Checked before registry operations and capability approval, so a registry upgrade cannot stop unrelated wallet use. */
+export function registryContractPins(cfg: Config): ContractPin[] {
+  const registry = cfg.manifest.agentRegistry;
+  return registry ? [registry.proxy, registry.implementation] : [];
+}
+
 export function remoteContractPins(cfg: Config, chain: string): ContractPin[] {
   return cfg.manifest.bridge.enabled
     ? cfg.manifest.bridge.routes.filter((r) => r.remoteChain === chain).flatMap((r) => [r.remoteToken, r.remoteRouter]) : [];
 }
 
 export const MAINNET = parseConfig(mainnet);
+
+/** This configuration as earlier releases approved it, before the optional Agent Registry capability. */
+export function withoutAgentRegistry(config: Config): Config {
+  const base = parseConfig(config);
+  delete base.manifest.agentRegistry;
+  base.manifest.manifestId = configurationId(base.manifest, "manifestId");
+  return parseConfig(base);
+}
+
+const registryFreeIds = new WeakMap<Config, Hex>();
+/** The manifest ID of withoutAgentRegistry(config), computed once per configuration. */
+export function registryFreeManifestId(config: Config): Hex {
+  let id = registryFreeIds.get(config);
+  if (!id) registryFreeIds.set(config, id = withoutAgentRegistry(config).manifest.manifestId);
+  return id;
+}
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config {
   const partialOverrides = ["CHAIN_ID", "ENTRY_POINT", "ACCOUNT_FACTORY", "CONTRACT_REGISTRY", "TRANSFER_GATE",
@@ -149,7 +182,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config
   if (environment.INCENTIV_RPC_URL) e.rpcUrls = [environment.INCENTIV_RPC_URL];
   for (const [name, property] of [
     ["INCENTIV_BUNDLER_URL", "bundlerUrl"], ["INCENTIV_EXPLORER_API_URL", "explorerApiUrl"],
-    ["INCENTIV_EXPLORER_URL", "explorerUrl"],
+    ["INCENTIV_EXPLORER_URL", "explorerUrl"], ["INCENTIV_PORTAL_URL", "portalUrl"],
   ] as const) {
     if (environment[name]) e[property] = environment[name];
   }

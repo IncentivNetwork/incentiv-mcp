@@ -1,3 +1,4 @@
+import { AGENT_LINK_MIN_SECONDS, AGENT_LINK_REQUEST_SECONDS, assertAgentSignature, assertRegistryApproved, freshBlockTime, hasRegistryEvent, linkBlocker, parentBlocker, readAgentLinkDigest, isContractRejection, isRegistryIntent, isTransportFailure, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
 import { createPublicClient, decodeEventLog, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
@@ -10,11 +11,16 @@ import { type Limits, type Spend } from "./policy.js";
 import type { validateOperation } from "./validate.js";
 
 const operationEvent = parseAbiItem("event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)");
+const beforeExecutionEvent = parseAbiItem("event BeforeExecution()");
+const revertReasonEvent = parseAbiItem("event UserOperationRevertReason(bytes32 indexed userOpHash,address indexed sender,uint256 nonce,bytes revertReason)");
+
+/** A node or network problem that a retry can clear, as opposed to an answer from the chain. */
+export { isTransportFailure };
 const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() === String(values[0]).toLowerCase());
 export const SWAP_DEADLINE_SECONDS = 60;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
 export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
-export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex }
+export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string }
 
 export class WalletChain {
   readonly clients: PublicClient[];
@@ -49,7 +55,15 @@ export class WalletChain {
     if (!same(decimals)) throw new WalletError("validation_failed", "Token decimals disagree");
     return { address: entry[1].address.toLowerCase() as Address, symbol: entry[0], name: entry[0], decimals: Number(decimals[0]) };
   }
-  async normalize(kind: "transfer" | "swap", args: Record<string, unknown>): Promise<Intent> {
+  async normalize(kind: Intent["kind"], args: Record<string, unknown>): Promise<Intent> {
+    if (kind === "link_agent" || kind === "unlink_agent") {
+      registryCapability(this.ctx.config);
+      const gas = await this.token(String(args.gas_token ?? "native"));
+      const approval = kind === "link_agent" ? registryApprovalSchema.parse(args.approval) : undefined;
+      const parent = getAddress(String(approval?.parent ?? args.parent)).toLowerCase();
+      return { intentSchemaVersion: 1, kind, token: gas.address, amount: "0", gasToken: gas.address, slippageBps: 0, feeTier: 3000,
+        registryParent: parent, ...(approval ? { registryApproval: { ...approval, registry: approval.registry.toLowerCase(), parent, agent: approval.agent.toLowerCase(), parent_signature: approval.parent_signature.toLowerCase() } } : {}) };
+    }
     const token = await this.token(String(kind === "transfer" ? args.token : args.token_in));
     const gas = await this.token(String(args.gas_token ?? "native"));
     const amount = exactAmount(String(kind === "transfer" ? args.amount : args.amount_in), token.decimals);
@@ -94,8 +108,7 @@ export class WalletChain {
     if (BigInt(intent.minimumOut!) > low || BigInt(intent.minimumOut!) * 10_000n < high * BigInt(10_000 - intent.slippageBps)) throw new WalletError("validation_failed", "Absolute minimum output is incompatible with the quotes and slippage bound");
   }
   async verifySwap(wallet: WalletEnvelope, intent: Intent, limits: Limits, state: ChainState): Promise<void> {
-    const now = Math.floor(Date.now() / 1000);
-    if (!Number.isSafeInteger(state.timestamp) || state.timestamp < now - 60 || state.timestamp > now + 30) throw new WalletError("validation_failed", "Swap RPC block is stale or in the future");
+    freshBlockTime(state.timestamp, ["validation_failed", "Swap RPC block is stale or in the future"]);
     await this.quote(intent, limits, state.block);
     const cfg = this.ctx.config, contracts = cfg.manifest.contracts;
     const input = await this.token(intent.token), output = await this.token(intent.tokenOut!);
@@ -132,9 +145,60 @@ export class WalletChain {
       }
     }));
   }
+  private async registryRead<T>(wallet: WalletEnvelope, read: () => Promise<T>): Promise<T> {
+    assertRegistryApproved(this.ctx.config, wallet);
+    try { return await read(); } catch (error) {
+      if (error instanceof WalletError) throw error;
+      if (isTransportFailure(error)) throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry this request");
+      // Reverts, malformed return data and local faults repeat on retry, so they close the request.
+      if (isContractRejection(error)) throw new WalletError("registry_verification_failed", "The registry refused a read, so it may have changed");
+      throw new WalletError("registry_verification_failed", "Registry state could not be verified");
+    }
+  }
+  async verifyRegistry(wallet: WalletEnvelope, intent: Intent, state?: ChainState) {
+    await this.registryRead(wallet, async () => {
+      const current = state ?? await this.state(wallet);
+      await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, current)));
+    });
+  }
+  async registryStatus(wallet: WalletEnvelope, parent?: Address) {
+    return this.registryRead(wallet, async () => this.registryStatusAt(wallet, await this.state(wallet), parent));
+  }
+  /** The registry status at `state`'s block, agreed by every RPC after each verifies the deployment. */
+  private async registryStatusAt(wallet: WalletEnvelope, state: ChainState, parent?: Address) {
+    const results = await Promise.all(this.clients.map(async client => {
+      await verifyRegistryDeployment(client, this.ctx.config, state.block);
+      return registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block);
+    }));
+    if (!same(results.map(r => JSON.stringify(r)))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+    return { ...results[0], deployed: state.deployed };
+  }
+  /**
+   * The registry status for `parent` and, when this deployed agent may consent to it, the AgentLink digest,
+   * both read at one block every RPC agrees on. A registry blocker is returned first, since renewing the
+   * policy would not clear it. The deadline runs from that block's time and never passes `notAfter` (Unix
+   * seconds), so the consent cannot outlive the local policy that allowed it; a policy ending too soon is
+   * refused against the same clock.
+   */
+  async agentLinkConsent(wallet: WalletEnvelope, parent: Address, notAfter?: number) {
+    return this.registryRead(wallet, async () => {
+      const state = await this.state(wallet), status = await this.registryStatusAt(wallet, state, parent);
+      const blocked = linkBlocker(status, state.deployed) ?? parentBlocker(status, parent);
+      // Only a deployed agent signs, so only then do the block's time and the policy's expiry matter.
+      if (blocked || !state.deployed) return { status, blocked };
+      const now = freshBlockTime(state.timestamp), deadline = Math.min(now + AGENT_LINK_REQUEST_SECONDS, notAfter ?? Number.MAX_SAFE_INTEGER);
+      if (deadline < now + AGENT_LINK_MIN_SECONDS) return { status, blocked: ["policy_expired", "Local wallet policy has expired or expires too soon. Renew it with incentiv-mcp setup in your local terminal"] as [string, string] };
+      const results = await Promise.all(this.clients.map(client => readAgentLinkDigest(client, this.ctx.config, wallet.account as Address, parent, BigInt(deadline), state.block)));
+      if (!same(results.map(r => `${r.nonce}:${r.digest}`))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+      return { status, blocked, consent: { ...results[0], deadline: BigInt(deadline), block: state.block } };
+    });
+  }
+  async verifyAgentLinkSignature(wallet: WalletEnvelope, digest: Hex, signature: Hex, block: bigint) {
+    await this.registryRead(wallet, () => Promise.all(this.clients.map(client => assertAgentSignature(client, wallet.account as Address, digest, signature, block))));
+  }
   async build(wallet: WalletEnvelope, intent: Intent, state: ChainState, deadline?: number) {
     const input = await this.token(intent.token), gasToken = await this.token(intent.gasToken);
-    const calls = intent.kind === "transfer" ? (input.address === "native" ? [{ to: intent.to as Address, value: BigInt(intent.amount), data: "0x" as Hex }] : [{ to: input.address, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [intent.to as Address, BigInt(intent.amount)] }) }]) : buildSwapCalls(this.ctx, input, await this.token(intent.tokenOut!), planRoute(this.ctx, input, await this.token(intent.tokenOut!), intent.feeTier), BigInt(intent.amount), BigInt(intent.minimumOut!), wallet.account as Address, true, BigInt(deadline!));
+    const calls = isRegistryIntent(intent) ? [registryCall(this.ctx.config, wallet.account as Address, intent)] : intent.kind === "transfer" ? (input.address === "native" ? [{ to: intent.to as Address, value: BigInt(intent.amount), data: "0x" as Hex }] : [{ to: input.address, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [intent.to as Address, BigInt(intent.amount)] }) }]) : buildSwapCalls(this.ctx, input, await this.token(intent.tokenOut!), planRoute(this.ctx, input, await this.token(intent.tokenOut!), intent.feeTier), BigInt(intent.amount), BigInt(intent.minimumOut!), wallet.account as Address, true, BigInt(deadline!));
     return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, calls, gasToken, state });
   }
   async simulate(validated: ReturnType<typeof validateOperation>): Promise<void> {
@@ -149,12 +213,12 @@ export class WalletChain {
       for (const key of ["callGasLimit", "verificationGasLimit", "preVerificationGas"] as const) if (BigInt(estimate[key]) > op[key] || BigInt(estimate[key]) <= 0n) throw new Error();
     } catch { throw new WalletError("simulation_failed", "The exact validated operation failed simulation or exceeds its gas allocation"); }
   }
-  async buildReplacement(wallet: WalletEnvelope, original: OperationRecord, state: ChainState) {
+  async buildReplacement(wallet: WalletEnvelope, original: OperationRecord, state: ChainState, gasToken = original.intent.gasToken) {
     const old = userOpFromWire(original.operation!);
     if (state.nonce !== old.nonce) throw new WalletError("operation_pending", "The original nonce has moved; locate its receipt before resolution");
     const bump = (n: bigint) => n * 120n / 100n + 1n;
     const fees = { ...state.fees, maxFeePerGas: state.fees.maxFeePerGas > bump(old.maxFeePerGas) ? state.fees.maxFeePerGas : bump(old.maxFeePerGas), maxPriorityFeePerGas: state.fees.maxPriorityFeePerGas > bump(old.maxPriorityFeePerGas) ? state.fees.maxPriorityFeePerGas : bump(old.maxPriorityFeePerGas) };
-    return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, state: { ...state, fees }, calls: [{ to: wallet.account as Address, value: 0n, data: "0x" }] });
+    return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, state: { ...state, fees }, calls: [{ to: wallet.account as Address, value: 0n, data: "0x" }], gasToken: await this.token(gasToken) });
   }
   async relay(operation: Record<string, string>, beforeSubmit?: () => Promise<void>): Promise<string> {
     await beforeSubmit?.();
@@ -180,7 +244,38 @@ export class WalletChain {
       } catch { return []; }
     }));
     if (matches.some(m => m.length !== 1) || !same(matches.map(m => `${m[0].success}:${m[0].actualGasCost}`))) throw new Error("Receipt event mismatch");
-    return matches[0][0];
+    let registryError: string | undefined;
+    if (isRegistryIntent(record.intent) && record.userOpHash !== record.replacement?.userOpHash) {
+      const errors: (string | undefined)[] = [];
+      for (const receipt of receipts) {
+        const index = receipt.logs.findIndex(log => {
+          try { return log.address.toLowerCase() === this.ctx.config.identity.entryPoint.address.toLowerCase() && decodeEventLog({ abi: [operationEvent], ...log }).args.userOpHash === record.userOpHash; } catch { return false; }
+        });
+        let start = index - 1;
+        while (start >= 0) {
+          const log = receipt.logs[start];
+          try { if (log.address.toLowerCase() === this.ctx.config.identity.entryPoint.address.toLowerCase()) { decodeEventLog({ abi: [operationEvent, beforeExecutionEvent], ...log }); break; } } catch { /* another event */ }
+          start--;
+        }
+        // Exclude validation/setup logs before BeforeExecution, including for the first operation.
+        // Without that boundary this operation's logs cannot be isolated, so its registry event counts as missing.
+        const logs = start < 0 ? [] : receipt.logs.slice(start + 1, index);
+        // The EntryPoint result settles the nonce either way, so a missing event is reported rather than blocking the wallet.
+        let code = matches[0][0].success && !hasRegistryEvent(this.ctx.config, record.intent, record.operation.sender, logs) ? "registry_event_missing" : undefined;
+        // Revert reasons are keyed by userOpHash, so they are safe to read from the whole bundle prefix.
+        for (const log of start < 0 ? receipt.logs.slice(0, index) : logs) {
+          if (log.address.toLowerCase() !== this.ctx.config.identity.entryPoint.address.toLowerCase()) continue;
+          try {
+            const { args } = decodeEventLog({ abi: [revertReasonEvent], ...log });
+            if (args.userOpHash === record.userOpHash && args.sender.toLowerCase() === record.operation.sender.toLowerCase() && args.nonce === BigInt(record.nonce!)) code = registryRevertCode(args.revertReason);
+          } catch { /* unrelated log */ }
+        }
+        errors.push(code);
+      }
+      if (!same(errors)) throw new Error("Registry revert reason disagrees across RPCs");
+      registryError = errors[0];
+    }
+    return { ...matches[0][0], ...(registryError ? { registryError } : {}) };
   }
 }
 export function exactAmount(text: string, decimals: number): bigint {

@@ -26,7 +26,7 @@ import {
   computeGasTokenAmount,
   getFees,
   getPaymasterConfig,
-  requiredCentFor,
+  requiredPaymentUsdc,
   userOpFromJson,
   userOpToJson,
   waitForUserOp,
@@ -202,6 +202,8 @@ export interface ToolDoc {
   description?: string;
   params: { name: string; required: boolean }[];
   readOnly: boolean;
+  /** Signs with the wallet key without changing chain state. */
+  signs?: boolean;
 }
 
 /** Register the keyless public tool surface and return its documentation catalog. */
@@ -567,7 +569,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
       const [pmCfg, fees, known] = await Promise.all([getPaymasterConfig(ctx), getFees(ctx), ctx.knownTokens()]);
       // Representative gas for a sponsored token transfer.
       const sample = { callGasLimit: 350_000n, verificationGasLimit: 400_000n, preVerificationGas: 60_000n };
-      const requiredCent = requiredCentFor(pmCfg, sample, fees.maxFeePerGas);
+      const requiredUsdc = await requiredPaymentUsdc(ctx, pmCfg, sample);
       const options: Record<string, unknown>[] = [
         {
           token: cfg.identity.nativeSymbol,
@@ -580,7 +582,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
         if (listed.address === NATIVE || listed.address.toLowerCase() === cfg.manifest.contracts.wcent.address.toLowerCase()) continue;
         try {
           const t = await ctx.resolveToken(listed.address);
-          const amount = await computeGasTokenAmount(ctx, pmCfg, t, requiredCent);
+          const amount = await computeGasTokenAmount(ctx, pmCfg, t, requiredUsdc);
           const balance = account ? await tokenBalance(ctx, t, account) : undefined;
           options.push({
             token: t.symbol,
@@ -591,12 +593,12 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
             sufficient: balance !== undefined ? balance >= amount : undefined,
           });
         } catch {
-          // No WCENT pool, so this token cannot pay gas.
+          // Not on the paymaster's allowlist, or no WCENT pool, so this token cannot pay gas.
         }
       }
       return ok({
         account,
-        note: "Estimates assume a typical single-transfer user operation. Pass gas_token to review_transfer/place_transfer/review_swap/place_swap to use one.",
+        note: "Estimates assume a typical single-transfer user operation. Pass gas_token to send_transfer, send_swap, link_agent or unlink_agent to use one.",
         options,
       });
     }),

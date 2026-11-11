@@ -1,6 +1,6 @@
 {
   "name": "incentiv-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0-rc.1",
   "description": "Incentiv MCP: a local server with chain tools and an encrypted, policy-constrained wallet.",
   "main": "dist/index.js",
   "scripts": {
@@ -53,7 +53,8 @@
     "docs/wallet-storage.md",
     "docs/wallet-usage.md",
     "docs/wallet-policy.example.json",
-    "docs/network-configuration.md"
+    "docs/network-configuration.md",
+    "docs/agent-registry.md"
   ],
   "publishConfig": {
     "access": "public",

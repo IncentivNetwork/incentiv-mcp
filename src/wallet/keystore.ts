@@ -2,7 +2,7 @@ import { WalletError } from "./errors.js";
 import { createCipheriv, createDecipheriv, createECDH, hkdfSync, randomBytes } from "node:crypto";
 import { getAddress, keccak256, type Address } from "viem";
 import { z } from "zod";
-import { canonicalJson, identitySchema, type Config } from "../config.js";
+import { canonicalJson, identitySchema, registryFreeManifestId, type Config } from "../config.js";
 import { assertWalletNetwork, deriveSmartAccount } from "../network.js";
 import { adminSchema, policySchema, type Policy } from "./policy.js";
 
@@ -24,6 +24,8 @@ const metadataSchema = z.strictObject({
   schemaVersion: z.literal(1), walletId: uuid,
   networkIdentity: identitySchema,
   approvedCapabilityManifestId: z.custom<`0x${string}`>((s) => typeof s === "string" && /^0x[0-9a-f]{64}$/.test(s)),
+  // The manifest this approval covers apart from the registry, so a later registry pin update does not stop other wallet use.
+  registryFreeManifestId: z.custom<`0x${string}`>((s) => typeof s === "string" && /^0x[0-9a-f]{64}$/.test(s)).optional(),
   owner: address, account: address, salt: z.literal("0"),
   policy: policySchema,
   keyStorage: z.strictObject({ kind: bindingSchema.shape.storage, creationToken: uuid }),
@@ -75,11 +77,16 @@ export function walletAad(envelope: WalletEnvelope): Buffer {
   return Buffer.from(canonicalJson({ ...metadata, cipher: { name: cipher.name } }), "utf8");
 }
 
-export function sealWallet(cfg: Config, binding: WalletBinding, privateKey: Buffer, wrappingKey: Buffer, policy: Policy = { schemaVersion: 1, enabled: false, configured: false }): WalletEnvelope {
+export type ManifestApproval = Pick<WalletEnvelope, "approvedCapabilityManifestId" | "registryFreeManifestId">;
+export const manifestApproval = ({ approvedCapabilityManifestId, registryFreeManifestId }: ManifestApproval): ManifestApproval =>
+  ({ approvedCapabilityManifestId, ...(registryFreeManifestId ? { registryFreeManifestId } : {}) });
+
+/** Seals under cfg's manifest unless given an existing approval to keep; only a reviewed transition may change it. */
+export function sealWallet(cfg: Config, binding: WalletBinding, privateKey: Buffer, wrappingKey: Buffer, policy: Policy = { schemaVersion: 1, enabled: false, configured: false }, keep?: ManifestApproval): WalletEnvelope {
   const owner = ownerAddress(privateKey);
   const envelope: WalletEnvelope = {
     schemaVersion: 1, walletId: binding.walletId, networkIdentity: structuredClone(cfg.identity),
-    approvedCapabilityManifestId: cfg.manifest.manifestId, owner, account: deriveSmartAccount(cfg, owner), salt: "0",
+    ...(keep ?? { approvedCapabilityManifestId: cfg.manifest.manifestId, ...(cfg.manifest.agentRegistry ? { registryFreeManifestId: registryFreeManifestId(cfg) } : {}) }), owner, account: deriveSmartAccount(cfg, owner), salt: "0",
     policy,
     keyStorage: { kind: binding.storage, creationToken: binding.creationToken },
     keyDerivation: { name: "HKDF-SHA256", salt: randomBytes(16).toString("base64"), info: "incentiv-mcp/wallet/v1" },

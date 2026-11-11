@@ -12,6 +12,8 @@ import {
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import type { Ctx, TokenInfo } from "./context.js";
 import { NATIVE, ZERO32 } from "./context.js";
+import { isTransportFailure } from "./agent-registry.js";
+import { WalletError } from "./wallet/errors.js";
 import {
   accountAbi,
   accountFactoryAbi,
@@ -50,8 +52,8 @@ export interface GasTokenPlan {
   token: TokenInfo;
   /** Amount transferred to the paymaster as the gas payment. */
   tokenAmount: bigint;
-  /** WCENT the payment must quote to. */
-  requiredCent: bigint;
+  /** USDC the paymaster's fee schedule requires for this operation's billable gas. */
+  requiredUsdc: bigint;
 }
 
 export interface PreparedOp {
@@ -186,11 +188,10 @@ export async function getFees(ctx: Ctx): Promise<FeeData> {
 }
 
 export interface PaymasterConfig {
-  gasEstimateCoefficient: bigint;
   usdcToken: Address;
   usdcPoolFee: number;
-  minPaymentUsdc: bigint;
-  minTransactionGas: bigint;
+  /** Fixed gas the paymaster adds to `preVerificationGas + callGasLimit` before applying its USDC schedule. */
+  overheadGas: bigint;
   maxVerificationGas: bigint;
 }
 
@@ -202,37 +203,37 @@ export async function getPaymasterConfig(ctx: Ctx): Promise<PaymasterConfig> {
   const pm = ctx.config.manifest.contracts.unifiedTokenPaymaster.address;
   const read = <T,>(functionName: string) =>
     ctx.client.readContract({ address: pm, abi: paymasterAbi, functionName: functionName as never }) as Promise<T>;
-  const [coeff, usdcToken, usdcPoolFee, minPaymentUsdc, minTransactionGas, maxVerificationGas] = await Promise.all([
-    read<bigint>("gasEstimateCoefficient"),
+  const [usdcToken, usdcPoolFee, overheadGas, maxVerificationGas] = await Promise.all([
     read<Address>("usdcToken"),
     read<number>("usdcPoolFee"),
-    read<bigint>("minPaymentUsdc"),
-    read<bigint>("minTransactionGas"),
+    read<bigint>("overheadGas"),
     read<bigint>("maxVerificationGas"),
   ]);
-  const cfg = {
-    gasEstimateCoefficient: coeff,
-    usdcToken,
-    usdcPoolFee: Number(usdcPoolFee),
-    minPaymentUsdc,
-    minTransactionGas,
-    maxVerificationGas,
-  };
+  const cfg = { usdcToken, usdcPoolFee: Number(usdcPoolFee), overheadGas, maxVerificationGas };
   pmConfigCache.set(ctx.config, { at: Date.now(), cfg });
   return cfg;
 }
 
-/** WCENT the paymaster requires for the given limits. */
-export function requiredCentFor(
+/** The gas the paymaster bills: verification gas is not billed. */
+export function billableGas(cfg: PaymasterConfig, limits: { callGasLimit: bigint; preVerificationGas: bigint }): bigint {
+  return limits.preVerificationGas + limits.callGasLimit + cfg.overheadGas;
+}
+
+/**
+ * The USDC the paymaster requires for these limits, read from its own fee schedule. The schedule is fixed in
+ * USDC, so the price does not move with the base fee.
+ */
+export async function requiredPaymentUsdc(
+  ctx: Ctx,
   cfg: PaymasterConfig,
-  limits: { callGasLimit: bigint; verificationGasLimit: bigint; preVerificationGas: bigint },
-  maxFeePerGas: bigint,
-): bigint {
-  let ver = limits.verificationGasLimit;
-  if (cfg.maxVerificationGas !== 0n && ver > cfg.maxVerificationGas) ver = cfg.maxVerificationGas;
-  let totalGas = limits.callGasLimit + ver + limits.preVerificationGas;
-  if (totalGas < cfg.minTransactionGas) totalGas = cfg.minTransactionGas;
-  return (totalGas * maxFeePerGas * cfg.gasEstimateCoefficient) / 10_000n;
+  limits: { callGasLimit: bigint; preVerificationGas: bigint },
+): Promise<bigint> {
+  return ctx.client.readContract({
+    address: ctx.config.manifest.contracts.unifiedTokenPaymaster.address,
+    abi: paymasterAbi,
+    functionName: "requiredPaymentUsdc",
+    args: [billableGas(cfg, limits)],
+  }) as Promise<bigint>;
 }
 
 async function quoteExactOutputToWcent(ctx: Ctx, tokenIn: Address, fee: number, wcentOut: bigint): Promise<bigint> {
@@ -255,38 +256,51 @@ async function quoteExactInputToWcent(ctx: Ctx, tokenIn: Address, fee: number, a
   return amountOut;
 }
 
-/** Token amount whose WCENT quote satisfies the paymaster's gas and minimum checks. */
+/** Margin for pool movement between this quote and the paymaster's own, at validation. */
+const QUOTE_MARGIN_PERCENT = 102n;
+
+/**
+ * The token amount that satisfies the paymaster's check for `requiredUsdc`, mirroring it: USDC is compared
+ * directly; WCENT must cover the USDC amount's WCENT quote; any other token must be on the paymaster's
+ * allowlist and quote to that WCENT through its default pool.
+ */
 export async function computeGasTokenAmount(
   ctx: Ctx,
   cfg: PaymasterConfig,
   token: TokenInfo,
-  requiredCent: bigint,
+  requiredUsdc: bigint,
 ): Promise<bigint> {
   if (token.address === NATIVE) throw new Error("native CENT does not go through the paymaster");
-  const isUsdc = token.address.toLowerCase() === cfg.usdcToken.toLowerCase();
-  const poolFee = isUsdc && cfg.usdcPoolFee !== 0 ? cfg.usdcPoolFee : DEFAULT_POOL_FEE;
-
-  let target = requiredCent;
-  if (!isUsdc && cfg.minPaymentUsdc !== 0n && cfg.usdcToken !== "0x0000000000000000000000000000000000000000" && cfg.usdcPoolFee !== 0) {
-    const minCent = await quoteExactInputToWcent(ctx, cfg.usdcToken, cfg.usdcPoolFee, cfg.minPaymentUsdc);
-    if (minCent > target) target = minCent;
+  if (token.address.toLowerCase() === cfg.usdcToken.toLowerCase()) return requiredUsdc;
+  const otherGas = `Use a new request ID with gas in ${ctx.config.identity.nativeSymbol} or USDC`;
+  const listedGas = `Use a new request ID with gas in ${ctx.config.identity.nativeSymbol}, USDC or another token get_gas_payment_options lists`;
+  if (cfg.usdcToken === "0x0000000000000000000000000000000000000000" || cfg.usdcPoolFee === 0) throw gasTokenUnavailable(`The paymaster's USDC route is not configured, so it accepts only USDC for gas. ${otherGas}`);
+  const requiredCent = await quoted(() => quoteExactInputToWcent(ctx, cfg.usdcToken, cfg.usdcPoolFee, requiredUsdc), `Could not price gas in ${token.symbol}: the paymaster's USDC-to-WCENT quote failed. ${otherGas}`);
+  if (requiredCent === 0n) throw gasTokenUnavailable(`Could not price gas in ${token.symbol}: the paymaster's USDC quote returned zero. ${otherGas}`);
+  const target = (requiredCent * QUOTE_MARGIN_PERCENT) / 100n;
+  if (token.address.toLowerCase() === ctx.config.manifest.contracts.wcent.address.toLowerCase()) return target;
+  // Beyond USDC and WCENT, the paymaster accepts only tokens on its allowlist, whatever their pools quote.
+  const allowed = await ctx.client.readContract({ address: ctx.config.manifest.contracts.unifiedTokenPaymaster.address, abi: paymasterAbi, functionName: "allowedPaymentToken", args: [token.address] });
+  if (!allowed) throw gasTokenUnavailable(`The paymaster does not accept ${token.symbol} for gas. ${listedGas}`);
+  const noPool = `Could not price gas in ${token.symbol}: no ${token.symbol}/WCENT pool at the paymaster's ${DEFAULT_POOL_FEE / 10_000}% fee quotes it. ${listedGas}`;
+  const tokenIn = token.address;
+  let amount = await quoted(() => quoteExactOutputToWcent(ctx, tokenIn, DEFAULT_POOL_FEE, target), noPool);
+  for (let i = 0; i < 5; i++) {
+    if (await quoted(() => quoteExactInputToWcent(ctx, tokenIn, DEFAULT_POOL_FEE, amount), noPool) >= target) return amount;
+    amount = (amount * 105n) / 100n;
   }
+  throw gasTokenUnavailable(`Could not price gas in ${token.symbol}: its pool does not quote enough WCENT. ${listedGas}`);
+}
 
-  let amount: bigint;
-  if (target === 0n) {
-    amount = 0n;
-  } else {
-    amount = await quoteExactOutputToWcent(ctx, token.address, poolFee, target);
-    // Margin for pool movement, then confirm against the paymaster's own check.
-    amount = (amount * 102n) / 100n;
-    for (let i = 0; i < 5; i++) {
-      const out = await quoteExactInputToWcent(ctx, token.address, poolFee, amount);
-      if (out >= target) break;
-      amount = (amount * 105n) / 100n;
-    }
+/** The paymaster cannot take this token for this operation; retrying the same request will not change that. */
+const gasTokenUnavailable = (detail: string) => new WalletError("gas_token_unavailable", detail);
+
+/** A quoter revert means the pool cannot price the token; an RPC failure is passed on so the request stays retryable. */
+async function quoted(read: () => Promise<bigint>, refusal: string): Promise<bigint> {
+  try { return await read(); } catch (error) {
+    if (isTransportFailure(error)) throw error;
+    throw gasTokenUnavailable(refusal);
   }
-  if (isUsdc && amount < cfg.minPaymentUsdc) amount = cfg.minPaymentUsdc;
-  return amount;
 }
 
 export interface BuildOptions {
@@ -367,16 +381,12 @@ export async function buildUserOpUnsigned(ctx: Ctx, opts: BuildOptions): Promise
     return encodeExecuteBatch(calls);
   };
 
-  // The paymaster quotes the payment during simulation, so seed a realistic
+  // The paymaster checks the payment during simulation, so seed a realistic
   // amount rather than a placeholder.
   let seedAmount: bigint | undefined;
   if (useGasToken && pmCfg) {
-    const seedCent = requiredCentFor(
-      pmCfg,
-      { callGasLimit: 600_000n, verificationGasLimit: 100_000n, preVerificationGas: 100_000n },
-      fees.maxFeePerGas,
-    );
-    seedAmount = await computeGasTokenAmount(ctx, pmCfg, opts.gasToken!, seedCent);
+    const seedUsdc = await requiredPaymentUsdc(ctx, pmCfg, { callGasLimit: 600_000n, preVerificationGas: 100_000n });
+    seedAmount = await computeGasTokenAmount(ctx, pmCfg, opts.gasToken!, seedUsdc);
   }
 
   const op: UserOp = {
@@ -442,9 +452,9 @@ export async function buildUserOpUnsigned(ctx: Ctx, opts: BuildOptions): Promise
       }
     }
     if (useGasToken && pmCfg) {
-      const requiredCent = requiredCentFor(pmCfg, op, op.maxFeePerGas);
-      const tokenAmount = await computeGasTokenAmount(ctx, pmCfg, opts.gasToken!, requiredCent);
-      gasToken = { token: opts.gasToken!, tokenAmount, requiredCent };
+      const requiredUsdc = await requiredPaymentUsdc(ctx, pmCfg, op);
+      const tokenAmount = await computeGasTokenAmount(ctx, pmCfg, opts.gasToken!, requiredUsdc);
+      gasToken = { token: opts.gasToken!, tokenAmount, requiredUsdc };
       op.callData = makeCallData({ token: opts.gasToken!.address as Address, amount: tokenAmount });
     }
   }
