@@ -12,6 +12,8 @@ import {
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import type { Ctx, TokenInfo } from "./context.js";
 import { NATIVE, ZERO32 } from "./context.js";
+import { isTransportFailure } from "./agent-registry.js";
+import { WalletError } from "./wallet/errors.js";
 import {
   accountAbi,
   accountFactoryAbi,
@@ -270,20 +272,35 @@ export async function computeGasTokenAmount(
 ): Promise<bigint> {
   if (token.address === NATIVE) throw new Error("native CENT does not go through the paymaster");
   if (token.address.toLowerCase() === cfg.usdcToken.toLowerCase()) return requiredUsdc;
-  if (cfg.usdcToken === "0x0000000000000000000000000000000000000000" || cfg.usdcPoolFee === 0) throw new Error("The paymaster's USDC route is not configured, so it accepts only USDC for gas");
-  const requiredCent = await quoteExactInputToWcent(ctx, cfg.usdcToken, cfg.usdcPoolFee, requiredUsdc);
-  if (requiredCent === 0n) throw new Error("The paymaster's USDC quote returned zero");
+  const otherGas = `Use a new request ID with gas in ${ctx.config.identity.nativeSymbol} or USDC`;
+  const listedGas = `Use a new request ID with gas in ${ctx.config.identity.nativeSymbol}, USDC or another token get_gas_payment_options lists`;
+  if (cfg.usdcToken === "0x0000000000000000000000000000000000000000" || cfg.usdcPoolFee === 0) throw gasTokenUnavailable(`The paymaster's USDC route is not configured, so it accepts only USDC for gas. ${otherGas}`);
+  const requiredCent = await quoted(() => quoteExactInputToWcent(ctx, cfg.usdcToken, cfg.usdcPoolFee, requiredUsdc), `Could not price gas in ${token.symbol}: the paymaster's USDC-to-WCENT quote failed. ${otherGas}`);
+  if (requiredCent === 0n) throw gasTokenUnavailable(`Could not price gas in ${token.symbol}: the paymaster's USDC quote returned zero. ${otherGas}`);
   const target = (requiredCent * QUOTE_MARGIN_PERCENT) / 100n;
   if (token.address.toLowerCase() === ctx.config.manifest.contracts.wcent.address.toLowerCase()) return target;
   // Beyond USDC and WCENT, the paymaster accepts only tokens on its allowlist, whatever their pools quote.
   const allowed = await ctx.client.readContract({ address: ctx.config.manifest.contracts.unifiedTokenPaymaster.address, abi: paymasterAbi, functionName: "allowedPaymentToken", args: [token.address] });
-  if (!allowed) throw new Error(`The paymaster does not accept ${token.symbol} for gas. Pay gas in ${ctx.config.identity.nativeSymbol}, USDC or another accepted token`);
-  let amount = await quoteExactOutputToWcent(ctx, token.address, DEFAULT_POOL_FEE, target);
+  if (!allowed) throw gasTokenUnavailable(`The paymaster does not accept ${token.symbol} for gas. ${listedGas}`);
+  const noPool = `Could not price gas in ${token.symbol}: no ${token.symbol}/WCENT pool at the paymaster's ${DEFAULT_POOL_FEE / 10_000}% fee quotes it. ${listedGas}`;
+  const tokenIn = token.address;
+  let amount = await quoted(() => quoteExactOutputToWcent(ctx, tokenIn, DEFAULT_POOL_FEE, target), noPool);
   for (let i = 0; i < 5; i++) {
-    if (await quoteExactInputToWcent(ctx, token.address, DEFAULT_POOL_FEE, amount) >= target) return amount;
+    if (await quoted(() => quoteExactInputToWcent(ctx, tokenIn, DEFAULT_POOL_FEE, amount), noPool) >= target) return amount;
     amount = (amount * 105n) / 100n;
   }
-  throw new Error(`Could not price gas in ${token.symbol}: its pool does not quote enough WCENT`);
+  throw gasTokenUnavailable(`Could not price gas in ${token.symbol}: its pool does not quote enough WCENT. ${listedGas}`);
+}
+
+/** The paymaster cannot take this token for this operation; retrying the same request will not change that. */
+const gasTokenUnavailable = (detail: string) => new WalletError("gas_token_unavailable", detail);
+
+/** A quoter revert means the pool cannot price the token; an RPC failure is passed on so the request stays retryable. */
+async function quoted(read: () => Promise<bigint>, refusal: string): Promise<bigint> {
+  try { return await read(); } catch (error) {
+    if (isTransportFailure(error)) throw error;
+    throw gasTokenUnavailable(refusal);
+  }
 }
 
 export interface BuildOptions {

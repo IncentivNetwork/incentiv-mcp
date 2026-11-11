@@ -598,7 +598,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
       }
       return ok({
         account,
-        note: "Estimates assume a typical single-transfer user operation. Pass gas_token to review_transfer/place_transfer/review_swap/place_swap to use one.",
+        note: "Estimates assume a typical single-transfer user operation. Pass gas_token to send_transfer, send_swap, link_agent or unlink_agent to use one.",
         options,
       });
     }),

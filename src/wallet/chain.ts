@@ -1,5 +1,5 @@
-import { AGENT_LINK_MIN_SECONDS, AGENT_LINK_REQUEST_SECONDS, assertAgentSignature, assertRegistryApproved, freshBlockTime, hasRegistryEvent, linkBlocker, parentBlocker, readAgentLinkDigest, isContractRejection, isRegistryIntent, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
-import { BaseError, createPublicClient, decodeEventLog, HttpRequestError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError, TimeoutError, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
+import { AGENT_LINK_MIN_SECONDS, AGENT_LINK_REQUEST_SECONDS, assertAgentSignature, assertRegistryApproved, freshBlockTime, hasRegistryEvent, linkBlocker, parentBlocker, readAgentLinkDigest, isContractRejection, isRegistryIntent, isTransportFailure, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
+import { createPublicClient, decodeEventLog, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
 import { accountAbi, accountFactoryAbi, dexFactoryAbi, dexPoolAbi, entryPointAbi, erc20Abi, quoterAbi, swapRouterAbi, transferGateAbi } from "../abi.js";
@@ -15,10 +15,7 @@ const beforeExecutionEvent = parseAbiItem("event BeforeExecution()");
 const revertReasonEvent = parseAbiItem("event UserOperationRevertReason(bytes32 indexed userOpHash,address indexed sender,uint256 nonce,bytes revertReason)");
 
 /** A node or network problem that a retry can clear, as opposed to an answer from the chain. */
-export function isTransportFailure(error: unknown): boolean {
-  // Some nodes report contract reverts as -32603; an answer from the contract is never retryable.
-  return error instanceof BaseError && !isContractRejection(error) && !!error.walk(cause => [HttpRequestError, TimeoutError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError].some(type => cause instanceof type));
-}
+export { isTransportFailure };
 const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() === String(values[0]).toLowerCase());
 export const SWAP_DEADLINE_SECONDS = 60;
 export const MIN_SWAP_REMAINING_SECONDS = 10;

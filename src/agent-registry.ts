@@ -1,4 +1,4 @@
-import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, InternalRpcError, decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, hashTypedData, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
+import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, HttpRequestError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError, TimeoutError, decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, hashTypedData, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Intent } from "./wallet/journal.js";
@@ -48,6 +48,11 @@ export function isContractRejection(error: unknown): boolean {
   const reverted = error.walk(cause => cause instanceof ContractFunctionRevertedError) as ContractFunctionRevertedError | null;
   if (!reverted) return false;
   return !error.walk(cause => cause instanceof InternalRpcError) || !!reverted.data || !!reverted.signature || /revert/i.test(reverted.reason ?? "");
+}
+/** The RPC failed to answer, so the call may succeed on retry. */
+export function isTransportFailure(error: unknown): boolean {
+  // Some nodes report contract reverts as -32603; an answer from the contract is never retryable.
+  return error instanceof BaseError && !isContractRejection(error) && !!error.walk(cause => [HttpRequestError, TimeoutError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError].some(type => cause instanceof type));
 }
 export const isRegistryIntent = (intent: Intent) => intent.kind === "link_agent" || intent.kind === "unlink_agent";
 export function registryCapability(cfg: Config) {
