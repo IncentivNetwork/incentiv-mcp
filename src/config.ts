@@ -11,9 +11,16 @@ const text = z.string().min(1).max(200);
 const symbol = z.string().regex(/^[A-Z0-9]+$/);
 const chainId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const url = z.string().url().refine((value) => {
+  if (!URL.canParse(value)) return false;
   const parsed = new URL(value);
   return ["https:", "http:"].includes(parsed.protocol) && !parsed.username && !parsed.password && !parsed.hash;
 }, "Expected an HTTP(S) URL without credentials or a fragment").transform(value => new URL(value).href);
+/** Agent links carry the agent's signed consent, so only an Incentiv HTTPS host may receive them. */
+const portalUrl = url.refine((value) => {
+  if (!URL.canParse(value)) return false;
+  const { protocol, hostname, port } = new URL(value);
+  return protocol === "https:" && !port && (hostname === "incentiv.io" || hostname.endsWith(".incentiv.io"));
+}, "Expected an https://*.incentiv.io URL");
 const rpcUrls = z.array(url).min(1).refine((values) => new Set(values).size === values.length, "Duplicate RPC URL");
 const key = z.string().regex(/^[a-z0-9_-]+$/);
 
@@ -30,7 +37,7 @@ export const manifestSchema = z.strictObject({
     contractRegistry: pin, transferGate: pin, bulkBalanceReader: pin, unifiedTokenPaymaster: pin,
     wcent: pin, swapRouter: pin, quoter: pin,
   }),
-  agentRegistry: z.strictObject({ proxy: pin, implementation: pin, portalUrl: url }).optional(),
+  agentRegistry: z.strictObject({ proxy: pin, implementation: pin }).optional(),
   canonicalTokens: z.record(symbol, pin),
   bridge: z.strictObject({
     enabled: z.boolean(), incentivDomain: z.number().int().nonnegative().max(0xffffffff), mailbox: pin.optional(),
@@ -54,6 +61,8 @@ const configSchema = z.strictObject({
   accountCreationCode: z.custom<Hex>((v) => typeof v === "string" && /^0x(?:[0-9a-f]{2})+$/.test(v)),
   endpoints: z.strictObject({
     rpcUrls, bundlerUrl: url, explorerApiUrl: url, explorerUrl: url,
+    // Where agent links open; required when the manifest enables the Agent Registry.
+    portalUrl: portalUrl.optional(),
     remoteChains: z.record(key, z.strictObject({ rpcUrls, explorerUrl: url })),
   }),
 });
@@ -97,6 +106,7 @@ export function parseConfig(input: unknown): Config {
   if (configurationId(manifest, "manifestId") !== manifest.manifestId) throw new Error("Invalid manifestId");
   if (manifest.networkId !== identity.networkId) throw new Error("Manifest belongs to a different network identity");
   if (keccak256(cfg.accountCreationCode) !== identity.accountInitCodeHash) throw new Error("Account creation bytecode hash mismatch");
+  if (manifest.agentRegistry && !endpoints.portalUrl) throw new Error("Agent Registry requires endpoints.portalUrl");
   if (manifest.bridge.enabled && (!manifest.bridge.mailbox || !manifest.bridge.routes.length)) {
     throw new Error("Enabled bridge requires a mailbox and routes");
   }
@@ -172,7 +182,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config
   if (environment.INCENTIV_RPC_URL) e.rpcUrls = [environment.INCENTIV_RPC_URL];
   for (const [name, property] of [
     ["INCENTIV_BUNDLER_URL", "bundlerUrl"], ["INCENTIV_EXPLORER_API_URL", "explorerApiUrl"],
-    ["INCENTIV_EXPLORER_URL", "explorerUrl"],
+    ["INCENTIV_EXPLORER_URL", "explorerUrl"], ["INCENTIV_PORTAL_URL", "portalUrl"],
   ] as const) {
     if (environment[name]) e[property] = environment[name];
   }

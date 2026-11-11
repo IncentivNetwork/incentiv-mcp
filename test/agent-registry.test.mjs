@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { createPublicClient, custom, encodeAbiParameters, encodeEventTopics, HttpRequestError, recoverMessageAddress, decodeFunctionData, encodeFunctionData, encodeErrorResult } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { MAINNET, configurationId, parseConfig, withoutAgentRegistry } from "../src/config.ts";
+import { MAINNET, configurationId, loadConfig, parseConfig, withoutAgentRegistry } from "../src/config.ts";
 import { deriveSmartAccount } from "../src/network.ts";
 import { agentLinkDigest, agentRegistryAbi, assertAgentSignature, hasRegistryEvent, linkBlocker, parentBlocker, readAgentLinkDigest, registryApprovalSchema, registryCall, registryRevertCode, verifyRegistryDeployment, verifyRegistryIntent } from "../src/agent-registry.ts";
 import { intentSchema, Journal, digest, ownsNonce } from "../src/wallet/journal.ts";
@@ -110,8 +110,8 @@ test("registry policy defaults deny connection and unlink while gas budgets stil
   assert.ok(policyViolations(configured, { ...base, gasCharge: 10001n }).includes("gas_payment_limit"));
 });
 
-async function registryFixture(t, allowed = true) {
-  const f = await fixture(t);
+async function registryFixture(t, allowed = true, options = {}) {
+  const f = await fixture(t, options);
   const wallet = await f.store.createOrLoad(), a = await approval({ agent: wallet.smart_account_address ?? wallet.account });
   // publicWallet uses account; obtain the exact address from the authenticated envelope.
   await f.store.session(async s => { a.agent = s.envelope.account; if (allowed) await s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: true }, targets: { [cap.proxy.address.toLowerCase()]: ["0x" + registryCall(MAINNET, a.agent, intent(a)).data.slice(2, 10), encodeFunctionData({ abi: agentRegistryAbi, functionName: "unlink" }).slice(0, 10)] } } }); });
@@ -825,8 +825,8 @@ test("the agent signs only a locally computed digest that the registry agrees wi
   await assert.rejects(assertAgentSignature(client(), agent, read.digest, await stranger.signMessage({ message: { raw: read.digest } }), 123n), { code: "registry_agent_signature_invalid" });
 });
 
-async function signedLinkFixture(t, allowed = true, status = {}, policy = {}) {
-  const f = await registryFixture(t, allowed), calls = [];
+async function signedLinkFixture(t, allowed = true, status = {}, policy = {}, options = {}) {
+  const f = await registryFixture(t, allowed, options), calls = [];
   if (Object.keys(policy).length) await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, ...policy } }));
   f.chain.agentLinkConsent = async (_wallet, requested, notAfter) => {
     calls.push(["consent", requested, notAfter]);
@@ -838,6 +838,18 @@ async function signedLinkFixture(t, allowed = true, status = {}, policy = {}) {
   f.chain.verifyAgentLinkSignature = async (_wallet, digest, signature, block) => { calls.push(["verify", digest, signature, block]); };
   return { ...f, calls };
 }
+
+test("agent links open the configured Portal URL, which an endpoint override changes without re-approval", async t => {
+  const config = loadConfig({ INCENTIV_PORTAL_URL: "https://preview.incentiv.io/agents" });
+  const f = await signedLinkFixture(t, true, {}, {}, { config });
+  const url = new URL((await f.service.signAgentLink(parent)).portal_url);
+  assert.equal(url.origin + url.pathname, "https://preview.incentiv.io/agents");
+  assert.equal(url.searchParams.get("parent"), parent); assert.ok(url.searchParams.get("agent_signature"));
+  // Same manifest, so a wallet approved under the default Portal keeps working under the override.
+  assert.equal(config.manifest.manifestId, MAINNET.manifest.manifestId);
+  const standard = await signedLinkFixture(t);
+  assert.equal(new URL((await standard.service.signAgentLink(parent)).portal_url).host, "portal.incentiv.io");
+});
 
 test("sign_agent_link signs this agent's consent for Portal to submit", async t => {
   const f = await signedLinkFixture(t);

@@ -258,7 +258,7 @@ export class WalletService {
     return this.store.session(s => this.chain.registryStatus(s.envelope, parent ? getAddress(parent) : undefined));
   }
   private agentLinkUrl(s: WalletSession) {
-    const cap = registryCapability(this.ctx.config), url = new URL(cap.portalUrl);
+    const cap = registryCapability(this.ctx.config), url = new URL(this.ctx.config.endpoints.portalUrl!);
     url.searchParams.set("agent", s.envelope.account);
     url.searchParams.set("chain_id", String(this.ctx.config.identity.chainId));
     url.searchParams.set("registry", cap.proxy.address);

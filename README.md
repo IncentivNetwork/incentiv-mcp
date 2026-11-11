@@ -78,6 +78,7 @@ Endpoint overrides keep that identity:
 | `INCENTIV_BUNDLER_URL` | `https://bundler.incentiv.io` | ERC-4337 bundler. |
 | `INCENTIV_EXPLORER_API_URL` | `https://explorer.incentiv.io/api/v2` | Blockscout v2 REST API. |
 | `INCENTIV_EXPLORER_URL` | `https://explorer.incentiv.io` | Explorer for links. |
+| `INCENTIV_PORTAL_URL` | `https://portal.incentiv.io/agents` | Portal page that agent connection links open. Must be an `https://` URL on `incentiv.io` or one of its subdomains. |
 | `INCENTIV_NETWORK_CONFIG` | Built-in mainnet configuration | Absolute path to one complete network JSON file. |
 
 Individual overrides such as `INCENTIV_CHAIN_ID`, `INCENTIV_ENTRY_POINT` or `INCENTIV_ACCOUNT_FACTORY` are rejected. Custom networks need a complete configuration with valid content-derived IDs; see [network configuration](https://github.com/IncentivNetwork/incentiv-mcp/blob/main/docs/network-configuration.md). Setting `manifest.bridge.enabled=false` removes the four bridge tools (20 public tools instead of 24).

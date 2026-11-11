@@ -77,6 +77,24 @@ test("complete custom configuration loads; endpoint changes preserve wallet iden
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("the Portal URL is an endpoint: overriding it keeps the manifest, and only Incentiv HTTPS hosts are accepted", () => {
+  assert.equal(MAINNET.endpoints.portalUrl, "https://portal.incentiv.io/agents");
+  assert.equal(loadConfig({}).endpoints.portalUrl, MAINNET.endpoints.portalUrl);
+  const other = loadConfig({ INCENTIV_PORTAL_URL: "https://preview.incentiv.io/agents" });
+  assert.equal(other.endpoints.portalUrl, "https://preview.incentiv.io/agents");
+  assert.equal(other.manifest.manifestId, MAINNET.manifest.manifestId);
+  assert.deepEqual(other.manifest, MAINNET.manifest);
+  for (const value of ["http://portal.incentiv.io/agents", "https://portal.incentiv.io.example.test/agents", "https://example.test/agents",
+    "https://incentiv.io.example.test/", "https://portal.incentiv.io:8443/agents", "https://user:pw@portal.incentiv.io/agents", "https://portal.incentiv.io/agents#x", "not a url"]) {
+    assert.throws(() => loadConfig({ INCENTIV_PORTAL_URL: value }), /endpoints\.portalUrl/, value);
+  }
+  // A configuration that enables the registry needs somewhere to send agent links; one without it does not.
+  const missing = structuredClone(MAINNET); delete missing.endpoints.portalUrl;
+  assert.throws(() => parseConfig(missing), /requires endpoints\.portalUrl/);
+  delete missing.manifest.agentRegistry; identify(missing);
+  assert.equal(parseConfig(missing).endpoints.portalUrl, undefined);
+});
+
 test("partial overrides, incomplete files, stale IDs and inconsistent capabilities are rejected", () => {
   for (const name of ["CHAIN_ID", "ACCOUNT_FACTORY", "ENTRY_POINT", "PAYMASTER", "QUOTER"]) {
     assert.throws(() => loadConfig({ [`INCENTIV_${name}`]: "24101" }), /Partial network/);

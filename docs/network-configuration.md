@@ -5,7 +5,7 @@ The built-in network configuration in `src/mainnet.json` has four parts:
 - `identity`: chain ID, genesis, EntryPoint, account factory, beacon and implementation pins, account version, derivation and signing schemes.
 - `manifest`: the approved token, paymaster, router and bridge capabilities, including their contract code hashes.
 - `accountCreationCode`: the unparameterized BeaconProxy creation bytecode, authenticated by the identity's `accountInitCodeHash`.
-- `endpoints`: RPC arrays, bundler and explorer URLs. Endpoint changes do not change either ID.
+- `endpoints`: RPC arrays, bundler and explorer URLs, and the Portal URL that agent links open (`portalUrl`, required when the manifest enables the Agent Registry; it must be an `https://` URL on `incentiv.io` or one of its subdomains). Endpoint changes do not change either ID.
 
 All objects are validated strictly. Unknown fields, missing pins, inconsistent bridge routes/endpoints, conflicting hashes for the same contract, unsupported algorithms, and stale IDs are rejected. All core capabilities are required in schema v1; bridge support can be disabled. Disabled bridge configuration is never used for remote reads or broadcasts.
 
