@@ -54,6 +54,24 @@ Notable behaviors:
 
 EOAs appear only where raw EVM data does (balances, and the plain-transaction history behind `get_transactions`). `get_account_activity` covers user-operation history and is empty for EOAs.
 
+## Optional text screening with Agent Wormhole
+
+Token names, revert reasons and decoded call data come from third parties, so an agent can be handed hostile text through them. You can screen that text with [Agent Wormhole](https://www.agentwormhole.com)'s `wormhole-x402`. It is off by default. The scanner is Wormhole's code, not Incentiv's, and it is not a dependency of this package: you install it, choose its version and upgrade it.
+
+To enable it, run the server with the scanner installed and set `INCENTIV_WORMHOLE_SCREENING=on` in the MCP client's environment:
+
+```bash
+npx -y -p incentiv-mcp -p wormhole-x402@0.11.0 incentiv-mcp
+```
+
+Incentiv tests against `0.11.x`. Wormhole's rules change between versions, so read its release notes before upgrading.
+
+Screening runs offline inside the local process and sends nothing to Wormhole. It covers token symbols and names (including their use in summaries), explorer method names, revert reasons, decoded call data and error text. Text with a critical or high finding, or too long to scan, is replaced with a marker such as `[withheld: Wormhole X402-202]` or `[withheld: Wormhole abstain]`. Addresses, amounts, balances, hashes and raw calldata are never touched.
+
+Results report `wormhole: { decision, codes, severity, withheld, version }`. Tool errors keep their plain-text format and carry the verdict in `_meta.wormhole`; wallet errors include it next to the error code. `allow` only means no critical or high finding: medium findings stay visible in `codes`. The rules are English-only and miss reworded instructions, so treat third-party text as untrusted either way.
+
+If the scanner is missing, throws, or fails its startup self-test (`wormhole canary failed` on stderr), the affected text is withheld and marked `unchecked`. The server keeps serving structured data.
+
 ## Configuration
 
 The server registers five wallet tools without touching storage until one is called. `wallet doctor` checks the network and bundler without opening a wallet. `wallet init` creates a disabled wallet, and `wallet policy configure` sets the administration password through a no-echo terminal prompt. `wallet backup --out <file>` writes an encrypted backup, and `wallet restore --in <file>` restores into an empty namespace. `wallet capabilities approve --previous <config.json>` approves new capabilities and keeps the account. See [wallet storage and CLI](https://github.com/IncentivNetwork/incentiv-mcp/blob/main/docs/wallet-storage.md).

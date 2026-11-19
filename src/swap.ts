@@ -18,7 +18,13 @@ export interface SwapRoute {
   hops: { tokenIn: Address; tokenOut: Address; fee: number }[];
 }
 
-export function planRoute(ctx: Ctx, tokenIn: TokenInfo, tokenOut: TokenInfo, feeTier = DEFAULT_FEE_TIER): SwapRoute {
+export function planRoute(
+  ctx: Ctx,
+  tokenIn: TokenInfo,
+  tokenOut: TokenInfo,
+  feeTier = DEFAULT_FEE_TIER,
+  displaySymbol: (token: TokenInfo) => string = token => token.symbol,
+): SwapRoute {
   const wcent = ctx.config.manifest.contracts.wcent.address.toLowerCase();
   const inLeg = legToken(ctx, tokenIn);
   const outLeg = legToken(ctx, tokenOut);
@@ -37,14 +43,14 @@ export function planRoute(ctx: Ctx, tokenIn: TokenInfo, tokenOut: TokenInfo, fee
   if (inLeg.toLowerCase() === wcent || outLeg.toLowerCase() === wcent) {
     return {
       kind: "single",
-      description: `${tokenIn.symbol} -${pct}%-> ${tokenOut.symbol}`,
+      description: `${displaySymbol(tokenIn)} -${pct}%-> ${displaySymbol(tokenOut)}`,
       hops: [{ tokenIn: inLeg, tokenOut: outLeg, fee: feeTier }],
     };
   }
   // All pools pair against WCENT.
   return {
     kind: "multihop",
-    description: `${tokenIn.symbol} -${pct}%-> WCENT -${pct}%-> ${tokenOut.symbol}`,
+    description: `${displaySymbol(tokenIn)} -${pct}%-> WCENT -${pct}%-> ${displaySymbol(tokenOut)}`,
     hops: [
       { tokenIn: inLeg, tokenOut: ctx.config.manifest.contracts.wcent.address, fee: feeTier },
       { tokenIn: ctx.config.manifest.contracts.wcent.address, tokenOut: outLeg, fee: feeTier },
