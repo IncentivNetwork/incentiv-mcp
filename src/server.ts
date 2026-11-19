@@ -4,7 +4,7 @@ import { renderMarkdown } from "./docs.js";
 import { registerPublicTools, type ToolDoc } from "./tools.js";
 import { WormholeScreening } from "./wormhole-screening.js";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.3.1";
 
 export interface ServerCapabilities {
   readonly publicTools: true;
