@@ -794,12 +794,45 @@ test("registry reverts expose actionable error and fresh-consent guidance throug
   assert.match(result.next_action, /fresh approval in Portal/);
 });
 
-// Builds an unlink record the way an earlier build did: the stubbed check lets it through, and the user approved it in the terminal.
-async function legacyUnlink(f, id) {
-  assert.equal((await f.service.send("unlink_agent", { request_id: id, parent })).status, "approval_required");
-  await f.service.approve(id, password, digest((await f.service.review(id)).records[0]));
-  return f.service.send("unlink_agent", { request_id: id, parent });
+// Builds an unlink record the way an earlier build did: the stubbed check lets it through, the user approved it in the
+// terminal, and reconcile did not yet cancel unlinks awaiting approval.
+async function legacyUnlink(f, id, { approve = true } = {}) {
+  const reconcile = f.service.reconcile;
+  f.service.reconcile = async () => {};
+  try {
+    assert.equal((await f.service.send("unlink_agent", { request_id: id, parent })).status, "approval_required");
+    if (!approve) return;
+    await f.service.approve(id, password, digest((await f.service.review(id)).records[0]));
+    return await f.service.send("unlink_agent", { request_id: id, parent });
+  } finally { f.service.reconcile = reconcile; }
 }
+
+test("an unlink an earlier build left awaiting approval is cancelled and never warned about", async t => {
+  const f = await signedLinkFixture(t), id = randomUUID();
+  await legacyUnlink(f, id, { approve: false });
+  const signed = await f.service.signAgentLink(parent);
+  assert.equal(signed.agent_signed, true); assert.equal(signed.warning, undefined);
+  const record = await f.service.operation(id);
+  assert.equal(record.status, "cancelled"); assert.equal(record.last_error, "registry_unlink_unsupported");
+  assert.equal(f.submissions.length, 0);
+});
+
+test("sign_agent_link points a signed or unconfirmed legacy unlink to a replacement, not to a removed tool", async t => {
+  for (const lost of [false, true]) {
+    const f = await signedLinkFixture(t), id = randomUUID(), relay = f.chain.relay, revalidate = f.service.revalidate;
+    // Lost in flight it is submission_unknown; refused before sending it stays signed.
+    if (lost) f.chain.relay = async () => { throw new Error("lost response"); };
+    else f.service.revalidate = async () => { throw new WalletError("rpc_unavailable", "down"); };
+    await legacyUnlink(f, id).catch(() => {});
+    f.chain.relay = relay; f.service.revalidate = revalidate;
+    assert.equal((await f.service.operation(id)).status, lost ? "submission_unknown" : "signed");
+    const refused = await f.service.signAgentLink(parent);
+    assert.equal(refused.link_blocked, "operation_pending");
+    assert.match(refused.next_action, new RegExp(`wallet operation resolve ${id} --replace`));
+    assert.doesNotMatch(refused.next_action, /Retry unlink_agent/);
+    assert.deepEqual(f.calls, []);
+  }
+});
 
 test("an unlink recorded by an earlier build still reconciles, and is never retried or sent to Portal", async t => {
   const f = await registryFixture(t), id = randomUUID();

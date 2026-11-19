@@ -62,14 +62,14 @@ export function setupTargets(config: Config, tokens: TokenInfo[], swaps: boolean
 
 /** Asks which Portal accounts this agent may connect to and returns the policy additions; nothing when declined. */
 export async function promptAgentRegistry(config: Config, ask: Ask, tell: Tell): Promise<{ agentRegistry?: Limits["agentRegistry"]; targets?: Limits["targets"] }> {
-  if (!config.manifest.agentRegistry || !await yesNo(ask, tell, "Allow this agent to connect to Portal accounts?")) return {};
+  if (!config.manifest.agentRegistry || !await yesNo(ask, tell, "Allow this agent to connect to Portal accounts? Connections are permanent: Portal and this wallet offer no way to disconnect them.")) return {};
   const parents = await answer(ask, tell, "Allowed Portal smart-account addresses, comma-separated: ", value => {
     const values = [...new Set(value.split(",").map(v => v.trim()))];
     if (!values.length || !values.every(v => isAddress(v) && !/^0x0{40}$/i.test(v))) throw new WalletError("validation_failed", "Enter Portal smart-account addresses");
     return [...new Set(values.map(value => getAddress(value)))];
   });
   const registry = config.manifest.agentRegistry.proxy.address.toLowerCase();
-  tell(`Connections are permanent: once a Portal account connects this agent, neither side can disconnect it. Registry link permission will be added for ${registry}. Gas budgets still apply.`);
+  tell(`Registry link permission will be added for ${registry}. Gas budgets still apply.`);
   return { agentRegistry: { parents, allowUnlink: false }, targets: { [registry]: [toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)")] } };
 }
 

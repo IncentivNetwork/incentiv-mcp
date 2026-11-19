@@ -60,7 +60,7 @@ If the agent account is already deployed, call `sign_agent_link` with `parent` s
 
 Otherwise, call `prepare_agent_link` and open its Portal URL. Check the agent and parent smart-account addresses, approve the connection in Portal, and pass the returned approval JSON to `link_agent` with a fresh `request_id` UUID. Reuse that UUID for identical retries and check `get_agent_operation` for confirmation. The agent pays gas and can deploy in its first linking operation.
 
-Existing wallets must approve the new capability manifest and review their policy before using the registry. Connections are permanent: neither the agent nor the Portal user can disconnect them. See [agent connection and migration](docs/agent-registry.md) for permissions, gas and stale approvals. `get_agent_registry_status` shows the current relationship. A connection does not authorize spending from the parent.
+Existing wallets must approve the new capability manifest and review their policy before using the registry. Connections are permanent: neither this wallet nor Portal offers a way to disconnect them. See [agent connection and migration](docs/agent-registry.md) for permissions, gas and stale approvals. `get_agent_registry_status` shows the current relationship. A connection does not authorize spending from the parent.
 
 ## Optional text screening with Agent Wormhole
 

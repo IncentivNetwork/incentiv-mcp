@@ -2,7 +2,7 @@
 
 The mainnet proxy is `0x1Be49e07439A4c3B1B95E1A9ba1031f477306012`, chain ID 24101. This integration supports two flows. In the Portal-submitted flow, the agent signs its own `AgentLink` consent for one parent and Portal sends `link` from the parent's account. In the agent-submitted flow, Portal signs parent consent and the local agent smart account sends `link` in an ERC-4337 v0.7 operation. No parent key enters MCP in either flow.
 
-**Connections are permanent.** Once an agent is linked, neither the agent nor the Portal user can disconnect it: MCP has no unlink tool and refuses unlink requests (`registry_unlink_unsupported`), and Portal has no disconnect action. The registry contract itself still has `unlink()` and `unlinkAgent()`, so this is a product rule, not an on-chain guarantee. Because a link uses up one of the parent's agent slots for good, confirm the parent address before signing.
+**Connections are permanent.** Once an agent is linked, neither MCP nor Portal offers a way to disconnect it: MCP has no unlink tool and refuses unlink requests (`registry_unlink_unsupported`), and Portal has no disconnect action. The registry contract itself still has `unlink()` and `unlinkAgent()`, so this is a product rule, not an on-chain guarantee. Because a link uses up one of the parent's agent slots for good, confirm the parent address before signing.
 
 ## Connect from Portal
 

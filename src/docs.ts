@@ -95,7 +95,7 @@ export function renderMarkdown(cfg: Config, tools: ToolDoc[]): string {
     ``,
     `## Agent connections`,
     ``,
-    `For a deployed agent, call \`sign_agent_link\` with \`parent\` set to a Portal account allowed by local wallet policy. The agent signs its consent to that parent, and the user submits the connection in Portal after trusting the agent; do not call \`link_agent\`. Otherwise call \`prepare_agent_link\`, open the first-party Portal URL, and approve the displayed smart-account addresses. Pass Portal's approval JSON to \`link_agent\` with a new request UUID. Parent approvals expire after minutes and become invalid if the parent links or unlinks another agent. Gas and local wallet policy still apply. Connections are permanent: neither the agent nor the Portal user can disconnect them. Use \`get_agent_registry_status\` for current state.`,
+    `For a deployed agent, call \`sign_agent_link\` with \`parent\` set to a Portal account allowed by local wallet policy. The agent signs its consent to that parent, and the user submits the connection in Portal after trusting the agent; do not call \`link_agent\`. Otherwise call \`prepare_agent_link\`, open the first-party Portal URL, and approve the displayed smart-account addresses. Pass Portal's approval JSON to \`link_agent\` with a new request UUID. Parent approvals expire after minutes and become invalid if the parent links another agent or cancels its outstanding approvals. Gas and local wallet policy still apply. Connections are permanent: neither this wallet nor Portal offers a way to disconnect them. Use \`get_agent_registry_status\` for current state.`,
     ``,
     `## How writing works`,
     ``,

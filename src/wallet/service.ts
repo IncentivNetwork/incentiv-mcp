@@ -20,7 +20,7 @@ import { validateOperation } from "./validate.js";
 // There is no environment-variable or MCP-argument override.
 export const WALLET_CANDIDATE_SIGNING_ENABLED = true;
 
-const APPROVAL_FLOW = "Open Portal, review and sign the connection (it is permanent: neither side can disconnect it), then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest.";
+const APPROVAL_FLOW = "Open Portal, review and sign the connection (it is permanent: Portal and this wallet offer no way to disconnect it), then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest.";
 /** Local conditions that sign_agent_link reports as link_blocked. Any other error, such as a damaged journal, stays an error. */
 const LINK_CONSENT_REFUSALS = ["policy_not_configured", "wallet_locked", "policy_expired", "registry_parent_not_allowed", "wallet_release_unreviewed", "capability_manifest_unapproved", "operation_pending"];
 const linkRefusal = (status: object, [code, message]: [string, string]) => ({ ...status, link_blocked: code, next_action: `${message}. Do not ask the user to sign in Portal.` });
@@ -83,6 +83,10 @@ export class WalletService {
     if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", "Operation deadline is too close; reconcile or review a same-nonce replacement");
   }
   private async reconcile(journal: Journal): Promise<void> {
+    // Connections are permanent: an unlink an earlier build left awaiting approval can never be approved, so it is cancelled.
+    for (const r of journal.data.records) if (r.intent.kind === "unlink_agent" && (r.status === "preparing" || r.status === "approval_required")) {
+      delete r.approval; r.lastError = "registry_unlink_unsupported"; await journal.transition(r, "cancelled");
+    }
     for (const r of journal.data.records.filter(r => ownsNonce(r.status))) {
       if (r.status === "signed") continue; // No network submission was started; exact bytes remain retryable.
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
@@ -290,10 +294,14 @@ export class WalletService {
     // A signed request, or one the network may have dropped, settles only when it is sent again or replaced.
     const resendable = pending?.status === "signed" || pending?.status === "submission_unknown";
     if (resendable && pending.deadline && pending.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", `Registry request ${pending.requestId} was ${pending.status === "signed" ? "signed but never submitted" : "never confirmed"}, and its deadline has passed. Resolve it with wallet operation resolve ${pending.requestId} --replace in your local terminal, then call sign_agent_link again`);
-    if (pending?.status === "signed") throw new WalletError("operation_pending", `Registry request ${pending.requestId} is signed but was never submitted. Retry ${pending.intent.kind} with that request_id to submit it, then call sign_agent_link again`);
-    if (pending?.status === "submission_unknown") throw new WalletError("operation_pending", `Registry request ${pending.requestId} was submitted but has not been confirmed and may have been dropped. Retry ${pending.intent.kind} with that request_id to send it again, check it with get_agent_operation, then call sign_agent_link again`);
+    // An unlink recorded by an earlier build is never sent again, so only a same-nonce replacement clears it.
+    if (pending?.intent.kind === "unlink_agent" && pending.status === "signed") throw new WalletError("operation_pending", `Registry request ${pending.requestId} is an unlink signed by an earlier build, which this wallet no longer sends. Clear it with wallet operation resolve ${pending.requestId} --replace in your local terminal, then call sign_agent_link again`);
+    if (pending?.intent.kind === "unlink_agent" && pending.status === "submission_unknown") throw new WalletError("operation_pending", `Registry request ${pending.requestId} is an unlink from an earlier build that was submitted but never confirmed. Check it with get_agent_operation; if it does not confirm, clear it with wallet operation resolve ${pending.requestId} --replace in your local terminal, then call sign_agent_link again`);
+    if (pending?.status === "signed") throw new WalletError("operation_pending", `Registry request ${pending.requestId} is signed but was never submitted. Retry link_agent with that request_id to submit it, then call sign_agent_link again`);
+    if (pending?.status === "submission_unknown") throw new WalletError("operation_pending", `Registry request ${pending.requestId} was submitted but has not been confirmed and may have been dropped. Retry link_agent with that request_id to send it again, check it with get_agent_operation, then call sign_agent_link again`);
     if (pending) throw new WalletError("operation_pending", `Registry request ${pending.requestId} is still unresolved. Check it with get_agent_operation until it settles, then call sign_agent_link again`);
-    return { limits, queued: registry.map(r => r.requestId) };
+    // An unlink from an earlier build that awaits approval can never be approved now, so it cannot land.
+    return { limits, queued: registry.filter(r => r.intent.kind !== "unlink_agent").map(r => r.requestId) };
   }
   /**
    * This agent's own AgentLink consent to `parent`, in a Portal URL, so Portal can submit the link from the
@@ -328,7 +336,7 @@ export class WalletService {
       url.searchParams.set("agent_signature", signature);
       return { ...status, portal_url: url.href, agent_signed: true, agent_link: { parent: requested, agent_nonce: consent.nonce.toString(), agent_deadline: consent.deadline.toString() },
         ...(queued.length ? { warning: `Registry request ${queued.join(", ")} has not been sent yet. If it is later approved or retried and lands, it changes this agent's registry nonce and this consent stops working.` } : {}),
-        next_action: "Give this URL to the user and tell them the connection is permanent: once made, neither they nor this agent can disconnect it. In Portal they trust this agent, then submit the connection from their account and pay its fee. Do not call link_agent. Check get_agent_registry_status afterwards. The request expires at agent_deadline, which is never later than local policy expiry, or earlier if this agent's registry nonce changes. Changing local policy does not withdraw it." };
+        next_action: "Give this URL to the user and tell them the connection is permanent: once made, neither Portal nor this wallet offers a way to disconnect it. In Portal they trust this agent, then submit the connection from their account and pay its fee. Do not call link_agent. Check get_agent_registry_status afterwards. The request expires at agent_deadline, which is never later than local policy expiry, or earlier if this agent's registry nonce changes. Changing local policy does not withdraw it." };
     });
   }
   private balanceTokens(limits: Limits): string[] {
