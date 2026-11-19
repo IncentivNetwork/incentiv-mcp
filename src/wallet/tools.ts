@@ -4,8 +4,10 @@ import type { ToolDoc } from "../tools.js";
 import { WalletError } from "./keystore.js";
 import { NetworkError } from "../network.js";
 import type { WalletService } from "./service.js";
+import { publicErrorMessage } from "../public-output.js";
+import type { WormholeScreening } from "../wormhole-screening.js";
 
-export function registerWalletTools(server: McpServer, wallet: WalletService): ToolDoc[] {
+export function registerWalletTools(server: McpServer, wallet: WalletService, screening?: WormholeScreening): ToolDoc[] {
   const catalog: ToolDoc[] = [];
   const add = (name: string, description: string, shape: Record<string, z.ZodType>, readOnly: boolean, handler: (args: Record<string, unknown>) => Promise<unknown>) => {
     catalog.push({ name, description, readOnly, params: Object.entries(shape).map(([name, schema]) => ({ name, required: !schema.isOptional() })) });
@@ -13,7 +15,8 @@ export function registerWalletTools(server: McpServer, wallet: WalletService): T
       try { return { content: [{ type: "text" as const, text: JSON.stringify(await handler(args)) }] }; }
       catch (error) {
         const known = error instanceof WalletError || error instanceof NetworkError;
-        return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ code: known ? error.code : "validation_failed", message: known ? error.message : "Local wallet operation failed" }) }] };
+        const result = { code: known ? error.code : "validation_failed", message: known ? publicErrorMessage(error) : "Local wallet operation failed" };
+        return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(known ? screening?.fields(result, ["message"]) ?? result : result) }] };
       }
     });
   };
