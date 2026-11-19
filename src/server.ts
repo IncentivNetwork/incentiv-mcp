@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Ctx } from "./context.js";
 import { renderMarkdown } from "./docs.js";
 import { registerPublicTools, type ToolDoc } from "./tools.js";
+import { WormholeScreening } from "./wormhole-screening.js";
 
 export const VERSION = "0.4.0-rc.1";
 
@@ -21,11 +22,15 @@ const CAPABILITIES: ServerCapabilities = Object.freeze({
   walletTools: true,
 });
 
-export function makeServer(ctx: Ctx, registerWallet: (server: McpServer) => ToolDoc[]): ServerBundle {
+export function makeServer(
+  ctx: Ctx,
+  registerWallet: (server: McpServer, screening: WormholeScreening) => ToolDoc[],
+  screening = WormholeScreening.load(),
+): ServerBundle {
   if (typeof registerWallet !== "function") throw new Error("The local server requires explicit wallet dependencies");
 
   const server = new McpServer({ name: "incentiv-mcp", version: VERSION });
-  const catalog = [...registerPublicTools(server, ctx), ...registerWallet(server)];
+  const catalog = [...registerPublicTools(server, ctx, screening), ...registerWallet(server, screening)];
 
   server.registerResource(
     "docs",
@@ -54,5 +59,5 @@ export async function createLocalStdioMcpServer(ctx: Ctx, profile = "default"): 
   const { localWalletStore } = await import("./wallet/store.js");
   const { registerWalletTools } = await import("./wallet/tools.js");
   const wallet = new WalletService(ctx, localWalletStore(ctx.config, profile));
-  return makeServer(ctx, server => registerWalletTools(server, wallet));
+  return makeServer(ctx, (server, screening) => registerWalletTools(server, wallet, screening));
 }

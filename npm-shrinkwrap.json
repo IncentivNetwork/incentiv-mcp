@@ -20,7 +20,16 @@
       "devDependencies": {
         "@types/node": "^26.1.1",
         "tsx": "^4.23.1",
-        "typescript": "^7.0.2"
+        "typescript": "^7.0.2",
+        "wormhole-x402": "0.11.0"
+      },
+      "peerDependencies": {
+        "wormhole-x402": "~0.11.0"
+      },
+      "peerDependenciesMeta": {
+        "wormhole-x402": {
+          "optional": true
+        }
       },
       "engines": {
         "node": ">=22.18.0"
@@ -2475,6 +2484,35 @@
       },
       "engines": {
         "node": ">= 8"
+      }
+    },
+    "node_modules/wormhole-x402": {
+      "version": "0.11.0",
+      "resolved": "https://registry.npmjs.org/wormhole-x402/-/wormhole-x402-0.11.0.tgz",
+      "integrity": "sha512-s+ZKJPtEwbKs4bc/xk9dstxhqUibw/rRkP47q2vpmlbVQQoUmoVafO0AhbNykc56N9riidQ2r9/Y33vHT6/7Hw==",
+      "dev": true,
+      "license": "Apache-2.0",
+      "bin": {
+        "wormhole-x402-mcp": "dist/mcp-run.js"
+      },
+      "engines": {
+        "node": ">=18"
+      },
+      "peerDependencies": {
+        "@solana/spl-token": "^0.4.0",
+        "@solana/web3.js": "^1.95.0",
+        "viem": "^2"
+      },
+      "peerDependenciesMeta": {
+        "@solana/spl-token": {
+          "optional": true
+        },
+        "@solana/web3.js": {
+          "optional": true
+        },
+        "viem": {
+          "optional": true
+        }
       }
     },
     "node_modules/wrappy": {

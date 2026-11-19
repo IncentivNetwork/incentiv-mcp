@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { publicErrorMessage, publicServiceUrl } from "./public-output.js";
+import { WormholeScreening, type WormholeReport } from "./wormhole-screening.js";
 import { networkStatusFields, verifyNetwork } from "./network.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
@@ -44,7 +45,13 @@ import {
   warpAbi,
 } from "./bridge.js";
 
-type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
+type ToolResult = {
+  content: { type: "text"; text: string }[];
+  isError?: boolean;
+  _meta?: { wormhole: NonNullable<ReturnType<WormholeReport["metadata"]>> };
+};
+
+const EXPLORER_STATUSES = new Set<unknown>(["ok", "error", "success", "failed", "pending", "reverted"]);
 
 function ok(data: unknown): ToolResult {
   return {
@@ -57,22 +64,12 @@ function ok(data: unknown): ToolResult {
   };
 }
 
-function err(message: string): ToolResult {
-  return { content: [{ type: "text", text: message }], isError: true };
+function displaySymbol(token: TokenInfo, report: WormholeReport, path: string): string {
+  return token.address === NATIVE ? token.symbol : report.text(token.symbol, path);
 }
 
-function wrap(fn: (args: never) => Promise<ToolResult>): (args: unknown) => Promise<ToolResult> {
-  return async (args: unknown) => {
-    try {
-      return await fn(args as never);
-    } catch (e) {
-      return err(publicErrorMessage(e));
-    }
-  };
-}
-
-function tokenLabel(t: TokenInfo): string {
-  return t.address === NATIVE ? `${t.symbol} (native)` : `${t.symbol} (${t.address})`;
+function tokenLabel(t: TokenInfo, symbol: string): string {
+  return t.address === NATIVE ? `${symbol} (native)` : `${symbol} (${t.address})`;
 }
 
 function parseAmount(amount: string, decimals: number, allowZero = false): bigint {
@@ -97,8 +94,8 @@ async function tokenBalance(ctx: Ctx, token: TokenInfo, account: Address): Promi
 }
 
 /** Check each call against TransferGate, as the account will. */
-async function gateCheck(ctx: Ctx, calls: Call[]): Promise<{ target: string; result: string; ok: boolean }[]> {
-  const out: { target: string; result: string; ok: boolean }[] = [];
+async function gateCheck(ctx: Ctx, calls: Call[], screening: WormholeScreening) {
+  const out = [];
   for (const call of calls) {
     try {
       const r = await ctx.client.readContract({
@@ -110,7 +107,9 @@ async function gateCheck(ctx: Ctx, calls: Call[]): Promise<{ target: string; res
       const reason = TRANSFER_GATE_REASONS[Number(r.reject)] ?? `UNKNOWN(${r.reject})`;
       out.push({ target: call.to, result: reason, ok: reason === "APPROVED" });
     } catch (e) {
-      out.push({ target: call.to, result: `check failed: ${publicErrorMessage(e)}`, ok: false });
+      const report = screening.report();
+      const message = report.text(publicErrorMessage(e), "result");
+      out.push(report.output({ target: call.to, result: `check failed: ${message}`, ok: false }));
     }
   }
   return out;
@@ -165,19 +164,17 @@ function deployArgs(ctx: Ctx, args: { owner?: string; salt?: string }): { owner?
   };
 }
 
-async function buildSwapPlan(ctx: Ctx, args: SwapArgs) {
+async function buildSwapPlan(ctx: Ctx, args: SwapArgs, routeSymbol: (token: TokenInfo) => string) {
   const account = ctx.resolveAccount(args.account);
   const { token: tokenIn, raw: amountIn } = await parseTokenAmount(ctx, args.token_in, args.amount_in);
   const tokenOut = await ctx.resolveToken(args.token_out);
   const feeTier = args.fee_tier ?? DEFAULT_FEE_TIER;
   const slippageBps = BigInt(args.slippage_bps ?? 100);
   if (slippageBps < 0n || slippageBps > 5000n) throw new Error("slippage_bps must be between 0 and 5000");
-  const route = planRoute(ctx, tokenIn, tokenOut, feeTier);
+  const route = planRoute(ctx, tokenIn, tokenOut, feeTier, routeSymbol);
   const { amountOut } = await quoteRoute(ctx, route, amountIn);
   if (amountOut === 0n) {
-    throw new Error(
-      `No liquidity for ${route.description} at the ${feeTier / 10_000}% fee tier. The quote is zero, so this swap cannot execute. Try another route, fee tier, or amount.`,
-    );
+    return { error: `No liquidity for ${route.description} at the ${feeTier / 10_000}% fee tier. The quote is zero, so this swap cannot execute. Try another route, fee tier, or amount.` };
   }
   const minOut = route.kind === "wrap" || route.kind === "unwrap" ? amountOut : (amountOut * (10_000n - slippageBps)) / 10_000n;
   const gasToken = args.gas_token ? await ctx.resolveToken(args.gas_token) : undefined;
@@ -207,10 +204,44 @@ export interface ToolDoc {
 }
 
 /** Register the keyless public tool surface and return its documentation catalog. */
-export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
+export function registerPublicTools(server: McpServer, ctx: Ctx, screening = WormholeScreening.load()): ToolDoc[] {
   const cfg = ctx.config;
   const { routes: ROUTES, remoteChains: REMOTE_CHAINS, domain: INCENTIV_DOMAIN, note: NON_EVM_NOTE } = getBridgeConfig(cfg);
   const catalog: ToolDoc[] = [];
+
+  function err(message: string, report = screening.report()): ToolResult {
+    let text = report.text(message, "message");
+    const wormhole = report.metadata();
+    if (wormhole?.withheld.includes("message")) {
+      const reason = wormhole.decision === "abstain" ? "abstain" : wormhole.codes.join(", ");
+      text = wormhole.decision === "unchecked" ? "The error text was withheld because Wormhole screening was unavailable."
+        : `The error text was withheld by Wormhole screening (${reason}).`;
+    }
+    if (wormhole?.withheld.length) wormhole.withheld = ["message"];
+    return { content: [{ type: "text", text }], isError: true, ...(wormhole ? { _meta: { wormhole } } : {}) };
+  }
+
+  function wrap(fn: (args: never) => Promise<ToolResult>): (args: unknown) => Promise<ToolResult> {
+    return async (args: unknown) => {
+      try {
+        return await fn(args as never);
+      } catch (error) {
+        return err(publicErrorMessage(error));
+      }
+    };
+  }
+
+  const screenToken = <T extends { symbol?: unknown; name?: unknown }>(item: T) =>
+    screening.fields(item, ["symbol", "name"]);
+  const screenTransfer = <T extends { symbol?: unknown; method?: unknown; type?: unknown }>(item: T) =>
+    screening.fields(item, typeof item.type === "string" && /^ERC[0-9]{1,5}$/.test(item.type)
+      ? ["symbol", "method"] : ["symbol", "method", "type"]);
+  const screenTx = <T extends { method?: unknown; status?: unknown }>(item: T) =>
+    screening.fields(item, EXPLORER_STATUSES.has(item.status) ? ["method"] : ["method", "status"]);
+  const screenOpSummary = <T extends { status?: unknown }>(item: T) =>
+    EXPLORER_STATUSES.has(item.status) ? item : screening.fields(item, ["status"]);
+  const screenOp = <T extends { revertReason?: unknown; status?: unknown; decodedCallData?: unknown }>(item: T) =>
+    screening.fields(item, EXPLORER_STATUSES.has(item.status) ? ["revertReason"] : ["revertReason", "status"], "decodedCallData");
 
   // Record each registration, then delegate.
   const passthrough = server.registerTool.bind(server);
@@ -372,7 +403,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
           totalUsd += usd;
           pricedCount++;
         }
-        positions.push({
+        positions.push(screening.fields({
           token: info.symbol,
           name: info.name,
           address: info.address,
@@ -380,7 +411,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
           raw: bal.toString(),
           price_usd: info.price,
           value_usd: usd !== undefined ? Number(usd.toFixed(2)) : undefined,
-        });
+        }, ["token", "name"]));
       }
       return ok({
         account: address,
@@ -417,7 +448,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
           note: "No user operations for this account. If this is an EOA, that is expected — EOAs send plain transactions, not user operations; use get_transactions for its history.",
         });
       }
-      return ok({ account: address, activity: items });
+      return ok({ account: address, activity: items.map(screenOpSummary) });
     }),
   );
 
@@ -436,7 +467,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
     wrap(async (args: { address?: string; limit?: number }) => {
       const address = await ctx.resolveAccount(args.address);
       const { items } = await ctx.indexer.accountTransactions(address, undefined, args.limit ?? 10);
-      return ok({ account: address, transactions: items, explorer: ctx.explorerAddress(address) });
+      return ok({ account: address, transactions: items.map(screenTx), explorer: ctx.explorerAddress(address) });
     }),
   );
 
@@ -454,7 +485,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
     wrap(async (args: { address?: string; limit?: number }) => {
       const address = await ctx.resolveAccount(args.address);
       const { items } = await ctx.indexer.accountTransfers(address, args.limit ?? 25);
-      return ok({ account: address, transfers: items });
+      return ok({ account: address, transfers: items.map(screenTransfer) });
     }),
   );
 
@@ -486,7 +517,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
           (a) => String(a.symbol ?? "").toLowerCase().includes(q) || String(a.name ?? "").toLowerCase().includes(q),
         );
       }
-      const slim = out.slice(0, wanted).map((a) => ({
+      const slim = out.slice(0, wanted).map((a) => screenToken({
         symbol: a.symbol,
         name: a.name,
         address: a.contract ?? a.assetId,
@@ -511,14 +542,14 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
       // Addresses work for NFTs too, which have no ERC-20 metadata.
       if (isAddress(args.asset)) {
         const details = await ctx.indexer.getAsset(args.asset).catch(() => undefined);
-        if (details && Object.keys(details as object).length > 0) return ok(details);
+        if (details && Object.keys(details as object).length > 0) return ok(screenToken(details));
       }
       const token = await ctx.resolveToken(args.asset);
       if (token.address === NATIVE) {
         return ok({ symbol: token.symbol, type: "native", decimals: 18, note: "Native gas token of Incentiv. Wrapped form: WCENT " + cfg.manifest.contracts.wcent.address });
       }
       const details = await ctx.indexer.getAsset(String(token.address)).catch(() => undefined);
-      return ok(details ?? token);
+      return ok(screenToken(details ?? token));
     }),
   );
 
@@ -539,17 +570,18 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
     wrap(async (args: { token_in: string; token_out: string; amount_in: string; fee_tier?: number }) => {
       const { token: tokenIn, raw: amountIn } = await parseTokenAmount(ctx, args.token_in, args.amount_in);
       const tokenOut = await ctx.resolveToken(args.token_out);
-      const route = planRoute(ctx, tokenIn, tokenOut, args.fee_tier ?? DEFAULT_FEE_TIER);
+      const report = screening.report();
+      const route = planRoute(ctx, tokenIn, tokenOut, args.fee_tier ?? DEFAULT_FEE_TIER, token => displaySymbol(token, report, "route"));
       const { amountOut, gasEstimate } = await quoteRoute(ctx, route, amountIn);
       const price = Number(formatUnits(amountOut, tokenOut.decimals)) / Number(formatUnits(amountIn, tokenIn.decimals));
-      return ok({
-        sell: `${formatUnits(amountIn, tokenIn.decimals)} ${tokenLabel(tokenIn)}`,
-        receive_estimate: `${formatUnits(amountOut, tokenOut.decimals)} ${tokenLabel(tokenOut)}`,
+      return ok(report.output({
+        sell: `${formatUnits(amountIn, tokenIn.decimals)} ${tokenLabel(tokenIn, displaySymbol(tokenIn, report, "sell"))}`,
+        receive_estimate: `${formatUnits(amountOut, tokenOut.decimals)} ${tokenLabel(tokenOut, displaySymbol(tokenOut, report, "receive_estimate"))}`,
         route: route.description,
-        effective_price: `1 ${tokenIn.symbol} = ${price.toPrecision(6)} ${tokenOut.symbol}`,
+        effective_price: `1 ${displaySymbol(tokenIn, report, "effective_price")} = ${price.toPrecision(6)} ${displaySymbol(tokenOut, report, "effective_price")}`,
         swap_gas_estimate: gasEstimate.toString(),
         note: "Use build_swap to construct the signable operation.",
-      });
+      }));
     }),
   );
 
@@ -584,14 +616,15 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
           const t = await ctx.resolveToken(listed.address);
           const amount = await computeGasTokenAmount(ctx, pmCfg, t, requiredUsdc);
           const balance = account ? await tokenBalance(ctx, t, account) : undefined;
-          options.push({
-            token: t.symbol,
+          const report = screening.report();
+          options.push(report.output({
+            token: displaySymbol(t, report, "token"),
             address: t.address,
             method: "Unified Token Paymaster",
-            estimated_cost: `${formatUnits(amount, t.decimals)} ${t.symbol}`,
+            estimated_cost: `${formatUnits(amount, t.decimals)} ${displaySymbol(t, report, "estimated_cost")}`,
             balance: balance !== undefined ? formatUnits(balance, t.decimals) : undefined,
             sufficient: balance !== undefined ? balance >= amount : undefined,
-          });
+          }));
         } catch {
           // Not on the paymaster's allowlist, or no WCENT pool, so this token cannot pay gas.
         }
@@ -666,13 +699,13 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
     wrap(async (args: { hash: string }) => {
       const [tx, userops, transfers] = await Promise.all([
         ctx.indexer.getTransaction(args.hash),
-        ctx.indexer.transactionUserOperations(args.hash).catch(() => ({ items: [] as unknown[] })),
-        ctx.indexer.transactionTransfers(args.hash).catch(() => ({ items: [] as unknown[] })),
+        ctx.indexer.transactionUserOperations(args.hash).catch(() => ({ items: [] })),
+        ctx.indexer.transactionTransfers(args.hash).catch(() => ({ items: [] })),
       ]);
       return ok({
-        transaction: tx,
-        user_operations: userops.items,
-        transfers: transfers.items,
+        transaction: screenTx(tx),
+        user_operations: userops.items.map(screenOpSummary),
+        transfers: transfers.items.map(screenTransfer),
         explorer: ctx.explorerTx(args.hash),
       });
     }),
@@ -691,7 +724,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
         ctx.indexer.getUserOperation(args.hash),
         ctx.indexer.userOperationTransfers(args.hash).catch(() => ({ items: [] })),
       ]);
-      return ok({ user_operation: op, transfers: (transfers as { items: unknown[] }).items, explorer: ctx.explorerOp(args.hash) });
+      return ok({ user_operation: screenOp(op), transfers: transfers.items.map(screenTransfer), explorer: ctx.explorerOp(args.hash) });
     }),
   );
 
@@ -713,7 +746,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
         id = String((items[0] as Record<string, unknown>)?.number ?? "");
       }
       const block = await ctx.indexer.getBlock(id);
-      const txs = args.include_transactions ? (await ctx.indexer.blockTransactions(id)).items : undefined;
+      const txs = args.include_transactions ? (await ctx.indexer.blockTransactions(id)).items.map(screenTx) : undefined;
       return ok({ block, transactions: txs });
     }),
   );
@@ -742,7 +775,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
         return ok({
           kind: code && code !== "0x" ? "contract" : "account",
           address: getAddress(q),
-          token: token && token.symbol !== "?" ? token : undefined,
+          token: token && token.symbol !== "?" ? screenToken(token) : undefined,
           explorer: ctx.explorerAddress(q),
         });
       }
@@ -751,11 +784,11 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
       if (/^0x[0-9a-fA-F]{64}$/.test(q)) {
         if (want("userOperation")) {
           const op = await ctx.indexer.getUserOperation(q).catch(() => undefined);
-          if (op?.hash) return ok({ kind: "userOperation", user_operation: op, explorer: ctx.explorerOp(q) });
+          if (op?.hash) return ok({ kind: "userOperation", user_operation: screenOp(op), explorer: ctx.explorerOp(q) });
         }
         if (want("transaction")) {
           const tx = await ctx.indexer.getTransaction(q).catch(() => undefined);
-          if (tx?.hash) return ok({ kind: "transaction", transaction: tx, explorer: ctx.explorerTx(q) });
+          if (tx?.hash) return ok({ kind: "transaction", transaction: screenTx(tx), explorer: ctx.explorerTx(q) });
         }
         if (want("block")) {
           const block = await ctx.indexer.getBlock(q).catch(() => undefined);
@@ -773,7 +806,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
 
       // Otherwise a token symbol.
       const token = await ctx.resolveToken(q).catch(() => undefined);
-      if (token) return ok({ kind: "token", token });
+      if (token) return ok({ kind: "token", token: token.address === NATIVE ? token : screenToken(token) });
       return ok({ kind: "none", results: [], note: "Nothing on Incentiv matches this query (checked user operations, transactions, blocks, tokens)." });
     }),
   );
@@ -826,9 +859,10 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
     calls: Call[],
     gasToken: TokenInfo | undefined,
     extra: Record<string, unknown>,
+    report: WormholeReport,
     deploy?: { owner?: Address; salt?: bigint },
   ): Promise<ToolResult> => {
-    const gate = await gateCheck(ctx, calls);
+    const gate = await gateCheck(ctx, calls, screening);
     let prepared;
     try {
       prepared = await buildUserOpUnsigned(ctx, { account, calls, gasToken, ...deploy });
@@ -836,7 +870,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
       return err(`Could not build the operation: ${describeEstimationError(e)}`);
     }
     const deploysAccount = !!prepared.op.factory;
-    return ok({
+    return ok(report.output({
       ...extra,
       account,
       execution: "Incentiv smart account (ERC-4337 v0.7 user operation)",
@@ -846,14 +880,14 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
         : undefined,
       transfer_gate: gate,
       gas_payment: prepared.gasToken
-        ? `${formatUnits(prepared.gasToken.tokenAmount, prepared.gasToken.token.decimals)} ${prepared.gasToken.token.symbol} (via Unified Token Paymaster)`
+        ? `${formatUnits(prepared.gasToken.tokenAmount, prepared.gasToken.token.decimals)} ${displaySymbol(prepared.gasToken.token, report, "gas_payment")} (via Unified Token Paymaster)`
         : `native ${cfg.identity.nativeSymbol}`,
       max_gas_cost: `${formatUnits(prepared.maxGasCostWei, 18)} ${cfg.identity.nativeSymbol}`,
       user_operation: userOpToJson(prepared.op),
       sign_hash: prepared.userOpHash,
       signing_scheme: "EIP-191 personal_sign over sign_hash by the account owner key",
       next_step: SIGNING_NOTE,
-    });
+    }));
   };
 
   server.registerTool(
@@ -876,10 +910,11 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
     wrap(async (args: TransferArgs) => {
       const t = await buildTransferCalls(ctx, args);
       const balance = await tokenBalance(ctx, t.token, t.account);
+      const report = screening.report();
       const warnings: string[] = [];
       if (balance < t.raw)
         warnings.push(
-          `Account ${t.token.symbol} balance is ${formatUnits(balance, t.token.decimals)}, below the ${formatUnits(t.raw, t.token.decimals)} being sent — fund it before broadcasting.`,
+          `Account ${displaySymbol(t.token, report, "warnings[0]")} balance is ${formatUnits(balance, t.token.decimals)}, below the ${formatUnits(t.raw, t.token.decimals)} being sent — fund it before broadcasting.`,
         );
       return buildOpResponse(
         t.account,
@@ -888,9 +923,10 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
         {
           action: "TRANSFER",
           to: t.to,
-          amount: `${formatUnits(t.raw, t.token.decimals)} ${tokenLabel(t.token)}`,
+          amount: `${formatUnits(t.raw, t.token.decimals)} ${tokenLabel(t.token, displaySymbol(t.token, report, "amount"))}`,
           warnings: warnings.length ? warnings : undefined,
         },
+        report,
         deployArgs(ctx, args),
       );
     }),
@@ -916,12 +952,14 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
       annotations: { readOnlyHint: true },
     },
     wrap(async (args: SwapArgs) => {
-      const s = await buildSwapPlan(ctx, args);
+      const report = screening.report();
+      const s = await buildSwapPlan(ctx, args, token => displaySymbol(token, report, "route"));
+      if (s.error !== undefined) return err(publicErrorMessage(s.error), report);
       const balance = await tokenBalance(ctx, s.tokenIn, s.account);
       const warnings: string[] = [];
       if (balance < s.amountIn)
         warnings.push(
-          `Account ${s.tokenIn.symbol} balance is ${formatUnits(balance, s.tokenIn.decimals)}, below the ${formatUnits(s.amountIn, s.tokenIn.decimals)} being swapped — fund it before broadcasting.`,
+          `Account ${displaySymbol(s.tokenIn, report, "warnings[0]")} balance is ${formatUnits(balance, s.tokenIn.decimals)}, below the ${formatUnits(s.amountIn, s.tokenIn.decimals)} being swapped — fund it before broadcasting.`,
         );
       return buildOpResponse(
         s.account,
@@ -929,12 +967,13 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
         s.gasToken,
         {
           action: "SWAP",
-          sell: `${formatUnits(s.amountIn, s.tokenIn.decimals)} ${tokenLabel(s.tokenIn)}`,
-          receive_estimate: `${formatUnits(s.amountOut, s.tokenOut.decimals)} ${tokenLabel(s.tokenOut)}`,
-          minimum_received: `${formatUnits(s.minOut, s.tokenOut.decimals)} ${s.tokenOut.symbol} (slippage ${Number(s.slippageBps) / 100}%)`,
+          sell: `${formatUnits(s.amountIn, s.tokenIn.decimals)} ${tokenLabel(s.tokenIn, displaySymbol(s.tokenIn, report, "sell"))}`,
+          receive_estimate: `${formatUnits(s.amountOut, s.tokenOut.decimals)} ${tokenLabel(s.tokenOut, displaySymbol(s.tokenOut, report, "receive_estimate"))}`,
+          minimum_received: `${formatUnits(s.minOut, s.tokenOut.decimals)} ${displaySymbol(s.tokenOut, report, "minimum_received")} (slippage ${Number(s.slippageBps) / 100}%)`,
           route: s.route.description,
           warnings: warnings.length ? warnings : undefined,
         },
+        report,
         deployArgs(ctx, args),
       );
     }),
@@ -964,17 +1003,18 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
         return err(`Bundler rejected the operation: ${describeEstimationError(e)}`);
       }
       const receipt = args.wait === false ? undefined : await waitForUserOp(ctx, userOpHash);
-      return ok({
+      const report = screening.report();
+      return ok(report.output({
         action: "USER OPERATION BROADCAST",
         user_op_hash: userOpHash,
         status: receipt
           ? receipt.success
             ? "confirmed"
-            : `failed${receipt.reason ? `: ${receipt.reason}` : ""}`
+            : `failed${receipt.reason ? `: ${report.text(publicErrorMessage(receipt.reason), "status")}` : ""}`
           : "submitted (confirmation pending — check the explorer)",
         transaction_hash: receipt?.transactionHash,
         explorer: ctx.explorerOp(userOpHash),
-      });
+      }));
     }),
   );
 
@@ -1187,6 +1227,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx): ToolDoc[] {
           interchain_gas: `${formatUnits(gasPayment, 18)} ${cfg.identity.nativeSymbol}`,
           warnings: warnings.length ? warnings : undefined,
         },
+        screening.report(),
         deployArgs(ctx, args),
       );
     }),
