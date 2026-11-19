@@ -25,7 +25,7 @@ const CAPABILITIES: ServerCapabilities = Object.freeze({
 export function makeServer(
   ctx: Ctx,
   registerWallet: (server: McpServer, screening: WormholeScreening) => ToolDoc[],
-  screening = new WormholeScreening(),
+  screening = WormholeScreening.load(),
 ): ServerBundle {
   if (typeof registerWallet !== "function") throw new Error("The local server requires explicit wallet dependencies");
 
@@ -59,6 +59,5 @@ export async function createLocalStdioMcpServer(ctx: Ctx, profile = "default"): 
   const { localWalletStore } = await import("./wallet/store.js");
   const { registerWalletTools } = await import("./wallet/tools.js");
   const wallet = new WalletService(ctx, localWalletStore(ctx.config, profile));
-  const screening = await WormholeScreening.load();
-  return makeServer(ctx, (server, screening) => registerWalletTools(server, wallet, screening), screening);
+  return makeServer(ctx, (server, screening) => registerWalletTools(server, wallet, screening));
 }

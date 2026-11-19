@@ -174,9 +174,7 @@ async function buildSwapPlan(ctx: Ctx, args: SwapArgs, routeSymbol: (token: Toke
   const route = planRoute(ctx, tokenIn, tokenOut, feeTier, routeSymbol);
   const { amountOut } = await quoteRoute(ctx, route, amountIn);
   if (amountOut === 0n) {
-    throw new Error(
-      `No liquidity for ${route.description} at the ${feeTier / 10_000}% fee tier. The quote is zero, so this swap cannot execute. Try another route, fee tier, or amount.`,
-    );
+    return { error: `No liquidity for ${route.description} at the ${feeTier / 10_000}% fee tier. The quote is zero, so this swap cannot execute. Try another route, fee tier, or amount.` };
   }
   const minOut = route.kind === "wrap" || route.kind === "unwrap" ? amountOut : (amountOut * (10_000n - slippageBps)) / 10_000n;
   const gasToken = args.gas_token ? await ctx.resolveToken(args.gas_token) : undefined;
@@ -204,23 +202,20 @@ export interface ToolDoc {
 }
 
 /** Register the keyless public tool surface and return its documentation catalog. */
-export function registerPublicTools(server: McpServer, ctx: Ctx, screening = new WormholeScreening()): ToolDoc[] {
+export function registerPublicTools(server: McpServer, ctx: Ctx, screening = WormholeScreening.load()): ToolDoc[] {
   const cfg = ctx.config;
   const { routes: ROUTES, remoteChains: REMOTE_CHAINS, domain: INCENTIV_DOMAIN, note: NON_EVM_NOTE } = getBridgeConfig(cfg);
   const catalog: ToolDoc[] = [];
 
-  function err(message: string): ToolResult {
-    const report = screening.report();
+  function err(message: string, report = screening.report()): ToolResult {
     let text = report.text(message, "message");
     const wormhole = report.metadata();
-    if (wormhole?.decision === "refuse") {
-      const codes = wormhole.codes.join(", ");
-      text = `The error text was withheld by Wormhole screening (${codes}).`;
-    } else if (wormhole?.decision === "abstain") {
-      text = "The error text was withheld by Wormhole screening (abstain).";
-    } else if (wormhole?.decision === "unchecked") {
-      text = "The error text was withheld because Wormhole screening was unavailable.";
+    if (wormhole?.withheld.includes("message")) {
+      const reason = wormhole.decision === "abstain" ? "abstain" : wormhole.codes.join(", ");
+      text = wormhole.decision === "unchecked" ? "The error text was withheld because Wormhole screening was unavailable."
+        : `The error text was withheld by Wormhole screening (${reason}).`;
     }
+    if (wormhole?.withheld.length) wormhole.withheld = ["message"];
     return { content: [{ type: "text", text }], isError: true, ...(wormhole ? { _meta: { wormhole } } : {}) };
   }
 
@@ -957,6 +952,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx, screening = new
     wrap(async (args: SwapArgs) => {
       const report = screening.report();
       const s = await buildSwapPlan(ctx, args, token => displaySymbol(token, report, "route"));
+      if (s.error !== undefined) return err(publicErrorMessage(s.error), report);
       const balance = await tokenBalance(ctx, s.tokenIn, s.account);
       const warnings: string[] = [];
       if (balance < s.amountIn)

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { decodeFunctionData } from "viem";
+import { decodeFunctionData, encodeFunctionData } from "viem";
 import { inspectQuoteText } from "wormhole-x402/quotetext";
 import { accountAbi, erc20Abi } from "../src/abi.ts";
 import { MAINNET } from "../src/config.ts";
@@ -24,16 +24,19 @@ const oversized = "a".repeat(1025);
 const findingCode = "X402-202";
 const withheld = `[withheld: Wormhole ${findingCode}]`;
 
-function context(t, { setting = "on", decodedCallData = { parameters: [canaryText, oversized, recipient, 7, true, null] } } = {}) {
+function context(t, {
+  setting = "on", assetMetadata = {}, decodedCallData = { parameters: [canaryText, oversized, recipient, 7, true, null] },
+} = {}) {
   const previous = process.env.INCENTIV_WORMHOLE_SCREENING;
-  process.env.INCENTIV_WORMHOLE_SCREENING = setting;
+  if (setting === null) delete process.env.INCENTIV_WORMHOLE_SCREENING;
+  else process.env.INCENTIV_WORMHOLE_SCREENING = setting;
   t.after(() => {
     if (previous === undefined) delete process.env.INCENTIV_WORMHOLE_SCREENING;
     else process.env.INCENTIV_WORMHOLE_SCREENING = previous;
   });
   const ctx = new Ctx(MAINNET);
   const flagged = { address_hash: token, symbol: canaryText, name: canaryText, type: "ERC-20", decimals: "6" };
-  const benign = { address_hash: usdc, symbol: "USDC", name: benignName, type: "ERC-20", decimals: "6" };
+  const benign = { address_hash: usdc, symbol: "USDC", name: benignName, type: "ERC-20", decimals: "6", ...assetMetadata };
   t.mock.method(globalThis, "fetch", async (input, options) => {
     if (input === MAINNET.endpoints.bundlerUrl) {
       assert.equal(JSON.parse(options.body).method, "eth_estimateUserOperationGas");
@@ -88,7 +91,6 @@ function context(t, { setting = "on", decodedCallData = { parameters: [canaryTex
 const screen = (options = {}) => new WormholeScreening({ mode: "on", inspect: inspectQuoteText, version: "0.11.0", ...options });
 
 async function connect(t, ctx, screening, registerWallet = () => []) {
-  screening ??= screen({ mode: process.env.INCENTIV_WORMHOLE_SCREENING });
   const { server } = makeServer(ctx, registerWallet, screening);
   const client = new Client({ name: "wormhole-test", version: "1" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -103,6 +105,85 @@ async function call(client, name, args = {}) {
   assert.ok(!response.isError, JSON.stringify(response));
   return JSON.parse(response.content[0].text);
 }
+
+test("makeServer loads the installed scanner when enabled without an injected instance", async t => {
+  const warnings = t.mock.method(console, "error", () => {});
+  const client = await connect(t, context(t));
+  const asset = await call(client, "get_asset", { asset: usdc });
+  assert.equal(asset.symbol, "USDC");
+  assert.equal(asset.wormhole.decision, "allow");
+  assert.equal(asset.wormhole.version, "0.11.0");
+  assert.equal(warnings.mock.callCount(), 0);
+});
+
+test("MCP withholds malformed explorer text fields and preserves off-mode output", async t => {
+  const assetMetadata = { name: { display: "Sample name" }, symbol: ["Sample symbol"] };
+  const ctx = context(t, { assetMetadata });
+  for (const [scanner, decision] of [
+    [screen(), "abstain"],
+    [new WormholeScreening({ mode: "on", warn: () => {} }), "unchecked"],
+    [new WormholeScreening({ mode: "off" }), undefined],
+  ]) {
+    const client = await connect(t, ctx, scanner);
+    const asset = await call(client, "get_asset", { asset: usdc });
+    assert.equal(asset.contract, usdc);
+    assert.equal(asset.decimals, 6);
+    if (decision) {
+      assert.equal(asset.name, `[withheld: Wormhole ${decision}]`);
+      assert.equal(asset.symbol, asset.name);
+      assert.equal(asset.wormhole.decision, decision);
+      assert.deepEqual(asset.wormhole.withheld, ["symbol", "name"]);
+    } else {
+      assert.deepEqual(asset.name, assetMetadata.name);
+      assert.deepEqual(asset.symbol, assetMetadata.symbol);
+      assert.equal(asset.wormhole, undefined);
+    }
+  }
+});
+
+test("build_swap retains the route finding in a zero-liquidity error", async t => {
+  const ctx = context(t);
+  ctx.resolveToken = async ref => ref === "native" ? ctx.nativeToken() : { address: token, symbol: oversized, name: "Sample", decimals: 6 };
+  ctx.client.readContract = async ({ functionName }) => {
+    assert.equal(functionName, "quoteExactInputSingle");
+    return [0n, 0n, 0, 1n];
+  };
+  const client = await connect(t, ctx, screen());
+  const result = await client.callTool({ name: "build_swap", arguments: { account, token_in: token, token_out: "native", amount_in: "1" } });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /No liquidity for \[withheld: Wormhole abstain\]/);
+  assert.deepEqual(result._meta.wormhole, {
+    decision: "abstain", codes: ["X402-210"], severity: "medium", withheld: ["message"], version: "0.11.0",
+  });
+});
+
+test("MCP preserves decoded selectors and typed ABI bytes while screening text", async t => {
+  const transfer = encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [recipient, 1n] });
+  const longBytes = `0x${"00".repeat(512)}`;
+  const decodedCallData = { method_id: "23b872dd", parameters: [
+    { type: "bytes", value: longBytes },
+    { type: "bytes[][1]", value: [[transfer, "0x"]] },
+    { type: "bytes2", value: "0xa1b2" },
+    { type: "string", value: longBytes },
+    { type: "bytes", value: oversized },
+    { type: "bytes2", value: longBytes },
+    { type: "bytes[2]", value: [longBytes] },
+    { type: "(bytes,(bytes2,string))[]", value: [[longBytes, ["0xa1b2", longBytes]]] },
+    { type: "(bytes,string)", value: [longBytes] },
+  ] };
+  const ctx = context(t, { decodedCallData });
+  for (const [scanner, decision] of [[screen(), "abstain"], [new WormholeScreening({ mode: "on", warn: () => {} }), "unchecked"]]) {
+    const client = await connect(t, ctx, scanner);
+    const { user_operation: op } = await call(client, "get_user_operation", { hash });
+    assert.equal(op.decodedCallData.method_id, decodedCallData.method_id);
+    const marker = `[withheld: Wormhole ${decision}]`;
+    assert.deepEqual(op.decodedCallData.parameters.map(p => p.value), [
+      longBytes, [[transfer, "0x"]], "0xa1b2", marker, marker, marker, [marker],
+      [[longBytes, ["0xa1b2", marker]]], [marker],
+    ]);
+    assert.equal(op.callData, "0x1234");
+  }
+});
 
 test("MCP screens token labels while preserving balances, benign text, and internal lookup", async t => {
   const ctx = context(t);
@@ -208,8 +289,10 @@ test("MCP screens wallet error messages alongside the original error code", asyn
 
 test("screening is off unless enabled: text, structure and keys are returned untouched", async t => {
   const decodedCallData = Array.from({ length: 40 }).reduce(child => [child], canaryText);
+  const ctx = context(t, { setting: "off", decodedCallData });
   for (const setting of ["off", ""]) {
-    const client = await connect(t, context(t, { setting, decodedCallData }));
+    process.env.INCENTIV_WORMHOLE_SCREENING = setting;
+    const client = await connect(t, ctx);
     const asset = await call(client, "get_asset", { asset: token });
     assert.equal(asset.name, canaryText);
     assert.equal(asset.symbol, canaryText);
@@ -222,8 +305,7 @@ test("screening is off unless enabled: text, structure and keys are returned unt
 });
 
 test("a default server never imports or requires wormhole-x402", async t => {
-  const screening = new WormholeScreening({ mode: undefined, warn: message => assert.fail(message) });
-  const client = await connect(t, context(t, { setting: "off" }), screening);
+  const client = await connect(t, context(t, { setting: null }));
   const asset = await call(client, "get_asset", { asset: token });
   assert.equal(asset.name, canaryText);
   assert.equal(asset.wormhole, undefined);
@@ -249,7 +331,7 @@ test("load imports the user's installed wormhole-x402 only when enabled and repo
   assert.equal(flagged.name, withheld);
   assert.match(flagged.wormhole.version, /^0\.11\./);
   assert.deepEqual(warnings, []);
-  const off = await WormholeScreening.load({ mode: undefined });
+  const off = await WormholeScreening.load({ mode: "off" });
   assert.deepEqual(off.fields({ name: canaryText }, ["name"]), { name: canaryText });
 });
 
