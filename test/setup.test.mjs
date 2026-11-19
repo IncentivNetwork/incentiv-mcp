@@ -174,12 +174,12 @@ test("keeping current permissions still offers the registry once approved, and o
   assert.equal((await f.service.review()).wallet.manifest_id, base.manifest.manifestId);
 
   await approveCapabilities(f.store, base, MAINNET, password, digest(await reviewCapabilities(f.store, base, MAINNET)));
-  const approved = interaction(["", "y", "y", portal, "n", "y", "y", "ENABLE"], join(old.parent, "approved.json"));
+  const approved = interaction(["", "y", "y", portal, "y", "y", "ENABLE"], join(old.parent, "approved.json"));
   await setupWallet(f.service, f.root, approved.io);
   const { limits: saved, enabled } = (await f.service.review()).wallet.policy;
   assert.equal(enabled, true);
   assert.deepEqual(saved.agentRegistry, { parents: [portal], allowUnlink: false });
-  assert.equal(saved.targets[MAINNET.manifest.agentRegistry.proxy.address.toLowerCase()].length, 1, "link only, because unlink was declined");
+  assert.equal(saved.targets[MAINNET.manifest.agentRegistry.proxy.address.toLowerCase()].length, 1, "link only: connections are permanent");
   assert.deepEqual(saved.tokens, limits.tokens);
 });
 

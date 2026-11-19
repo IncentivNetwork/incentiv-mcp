@@ -631,7 +631,7 @@ export function registerPublicTools(server: McpServer, ctx: Ctx, screening = Wor
       }
       return ok({
         account,
-        note: "Estimates assume a typical single-transfer user operation. Pass gas_token to send_transfer, send_swap, link_agent or unlink_agent to use one.",
+        note: "Estimates assume a typical single-transfer user operation. Pass gas_token to send_transfer, send_swap or link_agent to use one.",
         options,
       });
     }),

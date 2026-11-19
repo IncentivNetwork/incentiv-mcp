@@ -76,7 +76,8 @@ export function policyViolations(limits: Limits, input: {
 }, now = Date.now()): string[] {
   const reasons: string[] = [];
   if (input.registryKind === "link_agent" && !registryParentAllowed(limits, input.registryParent)) reasons.push("registry_parent_not_allowed");
-  if (input.registryKind === "unlink_agent" && !limits.agentRegistry?.allowUnlink) reasons.push("registry_unlink_not_allowed");
+  // Connections are permanent: an older policy's allowUnlink no longer permits anything.
+  if (input.registryKind === "unlink_agent") reasons.push("registry_unlink_not_allowed");
   const token = tokenLimits(limits, input.token);
   if (!token || BigInt(input.amount) > BigInt(token.perTransaction)) reasons.push("per_transaction_limit");
   if (input.to && limits.recipients.mode === "allowlist" && !limits.recipients.addresses.some(a => a.toLowerCase() === input.to!.toLowerCase())) reasons.push("recipient_not_allowed");

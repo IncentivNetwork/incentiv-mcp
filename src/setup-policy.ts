@@ -68,10 +68,9 @@ export async function promptAgentRegistry(config: Config, ask: Ask, tell: Tell):
     if (!values.length || !values.every(v => isAddress(v) && !/^0x0{40}$/i.test(v))) throw new WalletError("validation_failed", "Enter Portal smart-account addresses");
     return [...new Set(values.map(value => getAddress(value)))];
   });
-  const allowUnlink = await yesNo(ask, tell, "Allow the agent to unlink itself?");
   const registry = config.manifest.agentRegistry.proxy.address.toLowerCase();
-  tell(`Registry contract permissions will be added for ${registry}. Gas budgets still apply.`);
-  return { agentRegistry: { parents, allowUnlink }, targets: { [registry]: [toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)"), ...(allowUnlink ? [toFunctionSelector("unlink()")] : [])] } };
+  tell(`Connections are permanent: once a Portal account connects this agent, neither side can disconnect it. Registry link permission will be added for ${registry}. Gas budgets still apply.`);
+  return { agentRegistry: { parents, allowUnlink: false }, targets: { [registry]: [toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)")] } };
 }
 
 export async function promptPolicy(config: Config, resolveToken: (ref: string) => Promise<TokenInfo>, ask: Ask, tell: Tell) {
@@ -144,7 +143,7 @@ export function policySummary(limits: Limits, tokens: TokenInfo[], nativeSymbol 
     const fmt = (value: string) => `${formatUnits(BigInt(value), token.decimals)} ${token.symbol}`;
     lines.push(`  ${token.symbol}: input per operation ${fmt(caps.perTransaction)}; daily INCLUDING gas ${fmt(caps.daily)}; maximum holdings ${fmt(caps.exposure)}; gas per operation ${fmt(caps.gasPayment)}`);
   }
-  if (limits.agentRegistry) lines.push(`  Agent Registry parents: ${limits.agentRegistry.parents.join(", ") || "none"}; unlink: ${limits.agentRegistry.allowUnlink ? "allowed" : "blocked"}`);
+  if (limits.agentRegistry) lines.push(`  Agent Registry parents: ${limits.agentRegistry.parents.join(", ") || "none"}; connections are permanent`);
   lines.push(`  Recipients: ${limits.recipients.mode === "any" ? "ANY ADDRESS" : limits.recipients.addresses.join(", ") || "none (transfers blocked)"}`,
     `  Swaps: ${limits.swaps ? `enabled; ${limits.maxSlippageBps / 100}% maximum slippage, ${limits.maxQuoteDeviationBps / 100}% quote deviation` : "disabled"}`,
     `  Trusted RPCs: ${limits.trustedRpcOrigins?.join(", ") || "none"}; independent RPCs: ${limits.independentRpcOrigins.join(", ") || "none"}`,

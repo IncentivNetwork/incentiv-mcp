@@ -20,7 +20,7 @@ import { validateOperation } from "./validate.js";
 // There is no environment-variable or MCP-argument override.
 export const WALLET_CANDIDATE_SIGNING_ENABLED = true;
 
-const APPROVAL_FLOW = "Open Portal, review and sign the connection, then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest.";
+const APPROVAL_FLOW = "Open Portal, review and sign the connection (it is permanent: neither side can disconnect it), then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest.";
 /** Local conditions that sign_agent_link reports as link_blocked. Any other error, such as a damaged journal, stays an error. */
 const LINK_CONSENT_REFUSALS = ["policy_not_configured", "wallet_locked", "policy_expired", "registry_parent_not_allowed", "wallet_release_unreviewed", "capability_manifest_unapproved", "operation_pending"];
 const linkRefusal = (status: object, [code, message]: [string, string]) => ({ ...status, link_blocked: code, next_action: `${message}. Do not ask the user to sign in Portal.` });
@@ -328,7 +328,7 @@ export class WalletService {
       url.searchParams.set("agent_signature", signature);
       return { ...status, portal_url: url.href, agent_signed: true, agent_link: { parent: requested, agent_nonce: consent.nonce.toString(), agent_deadline: consent.deadline.toString() },
         ...(queued.length ? { warning: `Registry request ${queued.join(", ")} has not been sent yet. If it is later approved or retried and lands, it changes this agent's registry nonce and this consent stops working.` } : {}),
-        next_action: "Give this URL to the user. In Portal they trust this agent, then submit the connection from their account and pay its fee. Do not call link_agent. Check get_agent_registry_status afterwards. The request expires at agent_deadline, which is never later than local policy expiry, or earlier if this agent's registry nonce changes. Changing local policy does not withdraw it." };
+        next_action: "Give this URL to the user and tell them the connection is permanent: once made, neither they nor this agent can disconnect it. In Portal they trust this agent, then submit the connection from their account and pay its fee. Do not call link_agent. Check get_agent_registry_status afterwards. The request expires at agent_deadline, which is never later than local policy expiry, or earlier if this agent's registry nonce changes. Changing local policy does not withdraw it." };
     });
   }
   private balanceTokens(limits: Limits): string[] {
@@ -491,13 +491,14 @@ export class WalletService {
 const MAX_LINK_ATTEMPTS = 8;
 const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable"];
 /** Registry refusals that the same signed bytes can never get past. */
-const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed"];
+const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed", "registry_unlink_unsupported"];
 const PORTAL_APPROVAL_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid"];
 /** What an agent should do after the registry reverted its request; only a link's parent consent comes from a Portal approval. */
 function registryNextAction(kind: Intent["kind"], code: string) {
+  // Only an unlink recorded by an earlier build reaches this: connections are permanent, so it is never retried.
   if (kind === "unlink_agent") return code === "registry_link_changed"
     ? "This agent is no longer linked to that parent, so there was nothing to unlink. Check get_agent_registry_status; no Portal approval is needed."
-    : `The registry refused this unlink (${code}). Check get_agent_registry_status before retrying with a new request UUID; no Portal approval is needed.`;
+    : `The registry refused this unlink (${code}). Connections are permanent and this wallet no longer sends unlinks; check get_agent_registry_status.`;
   return PORTAL_APPROVAL_ERRORS.includes(code)
     ? "Refresh registry status. Invalid or expired parent consent requires a fresh approval in Portal and a new request UUID."
     : `The registry refused this link (${code}). Check get_agent_registry_status before asking the user for a fresh Portal approval with a new request UUID.`;

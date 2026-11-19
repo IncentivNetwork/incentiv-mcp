@@ -101,7 +101,7 @@ export async function registryStatus(client: PublicClient, cfg: Config, agent: A
 }
 /** Why this agent cannot link to any parent; the contract checks a deployed agent itself and the factory only for a new one. */
 export function linkBlocker(status: { parent: string; agent_is_parent: boolean; agent_eligible: boolean; factory_allowed: boolean }, deployed: boolean): [code: string, message: string] | undefined {
-  if (!/^0x0{40}$/i.test(status.parent)) return ["registry_already_linked", "Agent is already linked; refresh status or unlink first"];
+  if (!/^0x0{40}$/i.test(status.parent)) return ["registry_already_linked", "Agent is already permanently connected to a Portal account"];
   if (status.agent_is_parent || (deployed ? !status.agent_eligible : !status.factory_allowed)) return ["registry_ineligible", "Account roles or allowed factories do not permit this link"];
 }
 export function registryCall(cfg: Config, agent: Address, intent: Intent) {
@@ -113,15 +113,15 @@ export function registryCall(cfg: Config, agent: Address, intent: Intent) {
     || intent.amount !== "0" || intent.token !== intent.gasToken) throw new WalletError("validation_failed", "Registry approval does not match this wallet, network and parent");
   return { to: cap.proxy.address, value: 0n, data: encodeFunctionData({ abi: agentRegistryAbi, functionName: "link", args: [getAddress(a.parent), agent, BigInt(a.parent_deadline), a.parent_signature as Hex, 0n, "0x"] }) };
 }
+/** Agent connections are permanent. Unlink records from earlier builds still parse and reconcile, but are never prepared, approved, signed or sent. */
+export function assertNotUnlink(intent: Intent): asserts intent is Intent & { kind: Exclude<Intent["kind"], "unlink_agent"> } {
+  if (intent.kind === "unlink_agent") throw new WalletError("registry_unlink_unsupported", "Agent connections are permanent; this wallet does not unlink agents");
+}
 export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wallet: { account: string }, intent: Intent, state: { block: bigint; timestamp: number; deployed: boolean }) {
+  assertNotUnlink(intent);
   await verifyRegistryDeployment(client, cfg, state.block);
   registryCall(cfg, wallet.account as Address, intent);
-  const status = await registryStatus(client, cfg, wallet.account as Address, intent.kind === "unlink_agent" ? undefined : intent.registryParent as Address, state.block);
-  if (intent.kind === "unlink_agent") {
-    if (/^0x0{40}$/i.test(status.parent)) throw new WalletError("registry_link_changed", "The agent is not linked; refresh status");
-    if (!intent.registryParent || !sameAddress(status.parent, intent.registryParent)) throw new WalletError("registry_link_changed", "The agent's parent changed; refresh status before unlinking");
-    return;
-  }
+  const status = await registryStatus(client, cfg, wallet.account as Address, intent.registryParent as Address, state.block);
   const a = intent.registryApproval!;
   const now = freshBlockTime(state.timestamp);
   if (Number(a.parent_deadline) <= now + 10) throw new WalletError("registry_approval_expired", "Portal approval expired or is too close to expiry; obtain a fresh approval");
@@ -169,7 +169,7 @@ export function agentLinkDigest(cfg: Config, agent: Address, parent: Address, no
 /** Why `parent` cannot take this agent right now, read from a registryStatus that named it. */
 export function parentBlocker(status: { agent: string; parent_eligible?: boolean; parent_is_agent?: boolean; parent_agent_count?: string; max_agents: string }, parent: string): [code: string, message: string] | undefined {
   if (sameAddress(parent, status.agent) || status.parent_is_agent || !status.parent_eligible) return ["registry_ineligible", "Account roles or allowed factories do not permit this link"];
-  if (BigInt(status.parent_agent_count ?? "0") >= BigInt(status.max_agents)) return ["registry_limit_reached", "Parent has reached its agent limit; unlink an agent in Portal first"];
+  if (BigInt(status.parent_agent_count ?? "0") >= BigInt(status.max_agents)) return ["registry_limit_reached", "This Portal account has reached its agent limit"];
 }
 /**
  * The digest this agent signs to consent to `parent`, at one pinned block whose registry deployment the

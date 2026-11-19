@@ -101,12 +101,14 @@ test("semantic validation binds registry, parent, agent, zero value, deadline an
   assert.throws(() => intentSchema.parse({ ...i, kind: "transfer" }));
 });
 
-test("registry policy defaults deny connection and unlink while gas budgets still apply", () => {
+test("registry policy defaults deny connection, never allow unlink, and gas budgets still apply", () => {
   const base = { token: "native", amount: "0", swap: false, slippage: 0, spend: { native: "300" }, used: {}, balances: { native: "1000000" }, gasCost: 300n, fee: 1n, gasUnits: 300n, gasToken: "native", gasCharge: 300n, calls: [], registryKind: "link_agent", registryParent: parent };
   assert.ok(policyViolations(limits, base).includes("registry_parent_not_allowed"));
   const configured = limitsSchema.parse({ ...limits, agentRegistry: { parents: [parent], allowUnlink: true } });
   assert.deepEqual(policyViolations(configured, base), []);
   assert.ok(policyViolations(limits, { ...base, registryKind: "unlink_agent" }).includes("registry_unlink_not_allowed"));
+  // An older stored policy that allowed unlinking no longer permits it.
+  assert.ok(policyViolations(configured, { ...base, registryKind: "unlink_agent" }).includes("registry_unlink_not_allowed"));
   assert.ok(policyViolations(configured, { ...base, gasCharge: 10001n }).includes("gas_payment_limit"));
 });
 
@@ -114,7 +116,7 @@ async function registryFixture(t, allowed = true, options = {}) {
   const f = await fixture(t, options);
   const wallet = await f.store.createOrLoad(), a = await approval({ agent: wallet.smart_account_address ?? wallet.account });
   // publicWallet uses account; obtain the exact address from the authenticated envelope.
-  await f.store.session(async s => { a.agent = s.envelope.account; if (allowed) await s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: true }, targets: { [cap.proxy.address.toLowerCase()]: ["0x" + registryCall(MAINNET, a.agent, intent(a)).data.slice(2, 10), encodeFunctionData({ abi: agentRegistryAbi, functionName: "unlink" }).slice(0, 10)] } } }); });
+  await f.store.session(async s => { a.agent = s.envelope.account; if (allowed) await s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: false }, targets: { [cap.proxy.address.toLowerCase()]: ["0x" + registryCall(MAINNET, a.agent, intent(a)).data.slice(2, 10)] } } }); });
   f.chain.verifyRegistry = async () => {};
   f.chain.build = async (w, i, s) => {
     const built = unsigned(w, { to: parent, amount: "0" }, s);
@@ -149,13 +151,15 @@ test("unconfigured registry permission needs existing exact-operation local appr
   assert.equal((await f.service.send("link_agent", args)).status, "submitted");
 });
 
-test("unlink validates the expected parent and uses the same pipeline", async t => {
+test("connections are permanent: an unlink request is refused before any read, record or submission", async t => {
   const f = await registryFixture(t), id = randomUUID();
-  const result = await f.service.send("unlink_agent", { request_id: id, parent });
-  assert.equal(result.status, "submitted");
-  assert.equal(decodeFunctionData({ abi: agentRegistryAbi, data: decodeFunctionData({ abi: (await import('../src/abi.ts')).accountAbi, data: f.submissions[0].callData }).args[2][0] }).functionName, "unlink");
-  const c = client();
-  await assert.rejects(verifyRegistryIntent(c, MAINNET, { account: agent }, { ...intent(await approval()), kind: "unlink_agent", registryApproval: undefined }, state()), { code: "registry_link_changed" });
+  f.chain.verifyRegistry = WalletChain.prototype.verifyRegistry; // the real check
+  await assert.rejects(f.service.send("unlink_agent", { request_id: id, parent }), { code: "registry_unlink_unsupported" });
+  assert.equal(f.submissions.length, 0);
+  await assert.rejects(f.service.operation(id), { code: "operation_not_found" });
+  const reads = [], c = client({ readContract: async opts => { reads.push(opts.functionName); throw new Error("unexpected read"); } });
+  await assert.rejects(verifyRegistryIntent(c, MAINNET, { account: agent }, { ...intent(await approval()), kind: "unlink_agent", registryApproval: undefined }, state()), { code: "registry_unlink_unsupported" });
+  assert.deepEqual(reads, []);
 });
 
 const registryLog = (eventName, by = agent) => ({ address: cap.proxy.address, topics: encodeEventTopics({ abi: agentRegistryAbi, eventName, args: { parent, agent, ...(eventName === "AgentUnlinked" ? { by } : {}) } }), data: "0x" });
@@ -315,7 +319,8 @@ test("registry use stays blocked until approval and nothing but approval grants 
   await assert.rejects(f.service.registryStatus(), { code });
   await assert.rejects(f.service.prepareAgentLink(), { code });
   await assert.rejects(f.service.send("link_agent", { request_id: id, approval: a }), { code });
-  await assert.rejects(f.service.send("unlink_agent", { request_id: id, parent }), { code });
+  // Unlink is refused for every wallet, before the approval check.
+  await assert.rejects(f.service.send("unlink_agent", { request_id: id, parent }), { code: "registry_unlink_unsupported" });
   await f.store.session(async s => {
     assert.equal((await Journal.open(s)).data.records.length, 0);
     assert.throws(() => validateOperation(MAINNET, s.envelope, intent(a), {}, { nonce: 0n, deployed: false, hash: digestToSign }), { code });
@@ -528,12 +533,8 @@ test("an RPC outage elsewhere in preparation keeps a request retryable; other er
   assert.equal((await g.service.operation(other)).status, "failed");
 });
 
-test("unlink refuses an unlinked agent up front and skips parent reads, and agent role uses the count", async () => {
-  const a = await approval(), unlink = { ...intent(a), kind: "unlink_agent", registryApproval: undefined }, good = client();
-  await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, { ...unlink, registryParent: zero }, state()), { code: "registry_link_changed" });
-  const reads = [], linked = client({ readContract: async opts => { reads.push(opts.functionName); return opts.functionName === "parentOf" ? parent : good.readContract(opts); } });
-  await verifyRegistryIntent(linked, MAINNET, { account: agent }, unlink, state());
-  assert.ok(!reads.includes("nonces"));
+test("an agent that is itself a parent is ineligible, judged by its agent count", async () => {
+  const a = await approval(), good = client();
   const isParent = client({ readContract: async opts => opts.functionName === "agentCount" && opts.args[0].toLowerCase() === agent.toLowerCase() ? 1n : good.readContract(opts) });
   await assert.rejects(verifyRegistryIntent(isParent, MAINNET, { account: agent }, intent(a), state()), { code: "registry_ineligible" });
 });
@@ -793,19 +794,38 @@ test("registry reverts expose actionable error and fresh-consent guidance throug
   assert.match(result.next_action, /fresh approval in Portal/);
 });
 
-test("a reverted unlink or a link refused for another reason is not sent to Portal for a fresh approval", async t => {
+// Builds an unlink record the way an earlier build did: the stubbed check lets it through, and the user approved it in the terminal.
+async function legacyUnlink(f, id) {
+  assert.equal((await f.service.send("unlink_agent", { request_id: id, parent })).status, "approval_required");
+  await f.service.approve(id, password, digest((await f.service.review(id)).records[0]));
+  return f.service.send("unlink_agent", { request_id: id, parent });
+}
+
+test("an unlink recorded by an earlier build still reconciles, and is never retried or sent to Portal", async t => {
   const f = await registryFixture(t), id = randomUUID();
-  assert.equal((await f.service.send("unlink_agent", { request_id: id, parent })).status, "submitted");
+  await legacyUnlink(f, id);
+  assert.equal(f.submissions.length, 1);
   f.setReceipt({ success: false, actualGasCost: 200n, transactionHash: `0x${"11".repeat(32)}`, registryError: "registry_link_changed" });
   const unlinked = await f.service.operation(id);
   assert.equal(unlinked.status, "reverted"); assert.equal(unlinked.registry_error, "registry_link_changed");
-  assert.match(unlinked.next_action, /no longer linked.*no Portal approval is needed/); assert.doesNotMatch(unlinked.next_action, /fresh approval/);
+  assert.match(unlinked.next_action, /no longer linked.*no Portal approval is needed/); assert.doesNotMatch(unlinked.next_action, /fresh approval|retry/i);
 
   const g = await registryFixture(t), linkId = randomUUID();
   await g.service.send("link_agent", { request_id: linkId, approval: g.approval });
   g.setReceipt({ success: false, actualGasCost: 200n, transactionHash: `0x${"22".repeat(32)}`, registryError: "registry_limit_reached" });
   const limited = await g.service.operation(linkId);
   assert.equal(limited.registry_error, "registry_limit_reached"); assert.match(limited.next_action, /refused this link \(registry_limit_reached\).*get_agent_registry_status/);
+});
+
+test("a signed unlink from an earlier build is never resent and points to a same-nonce replacement", async t => {
+  const f = await registryFixture(t), id = randomUUID(), relay = f.chain.relay;
+  f.chain.relay = async () => { throw new Error("lost response"); };
+  await legacyUnlink(f, id).catch(() => {});
+  assert.equal((await f.service.operation(id)).status, "submission_unknown");
+  f.chain.relay = relay;
+  f.chain.verifyRegistry = WalletChain.prototype.verifyRegistry; // the real check
+  await assert.rejects(f.service.send("unlink_agent", { request_id: id, parent }), e => e.code === "registry_unlink_unsupported" && e.message.includes(`wallet operation resolve ${id} --replace`));
+  assert.equal(f.submissions.length, 0);
 });
 
 test("the agent-link digest matches the mainnet registry", () => {
