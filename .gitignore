@@ -4,3 +4,4 @@ coverage/
 *.log
 .cache/
 *.tgz
+.DS_Store

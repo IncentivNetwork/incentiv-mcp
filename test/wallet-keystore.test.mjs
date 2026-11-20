@@ -60,7 +60,11 @@ test("authenticated metadata, nonce, ciphertext, tag and wrapping key cannot be 
   const network = structuredClone(original); network.networkIdentity.networkId = `0x${"12".repeat(32)}`;
   assert.throws(() => authenticateWallet(MAINNET, network, wrappingKey), { code: "wallet_network_mismatch" });
   const manifest = structuredClone(original); manifest.approvedCapabilityManifestId = `0x${"12".repeat(32)}`;
+  assert.throws(() => authenticateWallet(MAINNET, manifest, wrappingKey), { code: "keystore_authentication_failed" }, "changing the approval breaks authentication");
+  delete manifest.registryFreeManifestId;
   assert.throws(() => authenticateWallet(MAINNET, manifest, wrappingKey), { code: "capability_manifest_unapproved" });
+  const registryFree = structuredClone(original); registryFree.registryFreeManifestId = `0x${"12".repeat(32)}`;
+  assert.throws(() => authenticateWallet(MAINNET, registryFree, wrappingKey), { code: "keystore_authentication_failed" });
 });
 
 test("unsupported format, algorithms, lengths, policy and extra fields fail closed", () => {

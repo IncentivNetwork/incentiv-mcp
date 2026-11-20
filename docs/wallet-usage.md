@@ -32,7 +32,8 @@ history and pending signed operations are preserved. The command sends no funds
 and leaves sending disabled; check pending operations and review policy using
 `setup` or `wallet policy configure` before enabling it again. Do not delete the
 wallet or create a replacement to work around a mismatch. New wallets use the
-current implementation directly.
+current implementation directly. To use the Agent Registry afterward, run
+`wallet capabilities approve`; see [Agent Registry](agent-registry.md).
 
 For an old encrypted backup, restore into an empty profile with:
 
@@ -134,6 +135,7 @@ The separate profile gets its own app connection. Default setup retains the orig
 | `wallet_permissions_invalid` | Use your own terminal and inspect directory permissions. Setup does not silently weaken or repair wallet ACLs. |
 | Policy or gas limit blocks an operation | Review the quote and balances; authenticate a deliberate policy change through setup. |
 | `operation_pending` | Check the existing request ID; do not start a second intent as a retry. |
+| `rpc_unavailable` | A temporary RPC failure interrupted the request. Retry with the same request ID. |
 | `wallet_recovery_required` | Preserve files and follow [authenticated recovery](wallet-storage.md); never delete the wallet to restart. |
 
 Client references: [Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), [Claude Desktop](https://modelcontextprotocol.io/docs/2026-07-28/develop/connect-local-servers), [Cursor](https://cursor.com/docs/mcp). Historical local-test commands and machine-specific workarounds are in [development notes](wallet-development.md).

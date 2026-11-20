@@ -1,3 +1,4 @@
+import { assertRegistryApproved, isRegistryIntent, registryCall } from "../agent-registry.js";
 import { decodeFunctionData, encodeFunctionData, type Address, type Hex } from "viem";
 import { z } from "zod";
 import type { Config } from "../config.js";
@@ -29,6 +30,7 @@ function decode(abi: any, data: Hex): any {
   return parsed;
 }
 export function validateOperation(cfg: Config, wallet: WalletEnvelope, intent: Intent, wire: Record<string, string>, expected: { nonce: bigint; deployed: boolean; hash: string; deadline?: number }) {
+  if (isRegistryIntent(intent)) assertRegistryApproved(cfg, wallet);
   try {
     const parsed = operationSchema.parse(wire), op = userOpFromJson(parsed);
     requireValue(equal(op.sender, wallet.account) && op.nonce === expected.nonce && op.signature === "0x");
@@ -59,7 +61,12 @@ export function validateOperation(cfg: Config, wallet: WalletEnvelope, intent: I
       gasCharge = gasCost;
     }
     const amount = BigInt(intent.amount);
-    if (intent.kind === "transfer") {
+    if (isRegistryIntent(intent)) {
+      requireValue(business.length === 1 && intent.registryParent && intent.amount === "0" && intent.token === intent.gasToken);
+      const call = business[0], expectedCall = registryCall(cfg, wallet.account as Address, intent);
+      requireValue(equal(call.to, expectedCall.to) && call.value === 0n && equal(call.data, expectedCall.data));
+      if (intent.kind === "link_agent") requireValue(expected.deadline === Number(intent.registryApproval!.parent_deadline));
+    } else if (intent.kind === "transfer") {
       requireValue(business.length === 1 && intent.to);
       const call = business[0];
       if (intent.token === "native") requireValue(equal(call.to, intent.to) && call.value === amount && call.data === "0x");

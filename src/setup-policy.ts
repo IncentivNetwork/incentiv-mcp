@@ -6,7 +6,12 @@ import { limitsSchema, type Limits } from "./wallet/policy.js";
 
 export type Ask = (question: string) => Promise<string>;
 export type Tell = (message: string) => void;
-export const technicalLimits = { maxSlippageBps: 50, maxQuoteDeviationBps: 50, maxFeePerGas: "100000000000000", maxGasUnits: "1000000", maxBatchCalls: 4 };
+/**
+ * Defaults for the advanced limits. Gas units count every limit of an operation, including the paymaster's own
+ * verification and post-operation limits when gas is paid in a token: a USDC-paid first operation that deploys
+ * and links an agent declared 1,114,937 units on mainnet, so the default leaves room above that.
+ */
+export const technicalLimits = { maxSlippageBps: 50, maxQuoteDeviationBps: 50, maxFeePerGas: "100000000000000", maxGasUnits: "1500000", maxBatchCalls: 4 };
 
 /** Policy allowances may be zero. Never round or parse amounts through floating point. */
 export function allowance(text: string, decimals: number): string {
@@ -55,6 +60,33 @@ export function setupTargets(config: Config, tokens: TokenInfo[], swaps: boolean
   return targets;
 }
 
+/** Asks which Portal accounts this agent may connect to and returns the policy additions; nothing when declined. */
+export async function promptAgentRegistry(config: Config, ask: Ask, tell: Tell): Promise<{ agentRegistry?: Limits["agentRegistry"]; targets?: Limits["targets"] }> {
+  if (!config.manifest.agentRegistry || !await yesNo(ask, tell, "Allow this agent to connect to Portal accounts? Connections are permanent: Portal and this wallet offer no way to disconnect them.")) return {};
+  const parents = await answer(ask, tell, "Allowed Portal smart-account addresses, comma-separated: ", value => {
+    const values = [...new Set(value.split(",").map(v => v.trim()))];
+    if (!values.length || !values.every(v => isAddress(v) && !/^0x0{40}$/i.test(v))) throw new WalletError("validation_failed", "Enter Portal smart-account addresses");
+    return [...new Set(values.map(value => getAddress(value)))];
+  });
+  const registry = config.manifest.agentRegistry.proxy.address.toLowerCase();
+  tell(`Registry link permission will be added for ${registry}. Gas budgets still apply.`);
+  return { agentRegistry: { parents, allowUnlink: false }, targets: { [registry]: [toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)")] } };
+}
+
+/**
+ * Connections are permanent: removes the unlink permission an earlier build's policy may hold (allowUnlink and the
+ * registry's unlink() selector), so setup reviews and saves a policy without it. Returns `limits` itself when there is none.
+ */
+export function withoutUnlink(config: Config, limits: Limits): Limits {
+  const registry = config.manifest.agentRegistry?.proxy.address.toLowerCase(), unlink = toFunctionSelector("unlink()");
+  const key = registry && Object.keys(limits.targets).find(target => target.toLowerCase() === registry);
+  const selectors = key ? limits.targets[key] : undefined;
+  if (!limits.agentRegistry?.allowUnlink && !selectors?.some(selector => selector.toLowerCase() === unlink)) return limits;
+  const targets = { ...limits.targets };
+  if (key) targets[key] = selectors!.filter(selector => selector.toLowerCase() !== unlink);
+  return limitsSchema.parse({ ...limits, ...(limits.agentRegistry ? { agentRegistry: { ...limits.agentRegistry, allowUnlink: false } } : {}), targets });
+}
+
 export async function promptPolicy(config: Config, resolveToken: (ref: string) => Promise<TokenInfo>, ask: Ask, tell: Tell) {
   const available = [config.identity.nativeSymbol, ...Object.keys(config.manifest.canonicalTokens)];
   tell(`Choose assets: ${available.join(", ")}. Limits use normal token amounts; 0 blocks that use. Type cancel to stop.`);
@@ -98,7 +130,7 @@ export async function promptPolicy(config: Config, resolveToken: (ref: string) =
     return amount;
   });
   const technical = { ...technicalLimits };
-  tell("Advanced defaults: 0.5% swap slippage, 0.5% quote deviation, 1,000,000 gas units, 100,000 gwei fee ceiling, 4 calls. Your total gas budget still applies.");
+  tell(`Advanced defaults: ${technicalLimits.maxSlippageBps / 100}% swap slippage, ${technicalLimits.maxQuoteDeviationBps / 100}% quote deviation, ${Number(technicalLimits.maxGasUnits).toLocaleString("en-US")} gas units, ${Number(formatUnits(BigInt(technicalLimits.maxFeePerGas), 9)).toLocaleString("en-US")} gwei fee ceiling, ${technicalLimits.maxBatchCalls} calls. Your total gas budget still applies.`);
   if (await yesNo(ask, tell, "Edit these advanced limits?")) {
     const integer = (label: string, min: number, max: number, current: number) => answer(ask, tell, `${label} [${current}]: `, text => {
       const value = Number(text || current);
@@ -111,7 +143,9 @@ export async function promptPolicy(config: Config, resolveToken: (ref: string) =
     technical.maxBatchCalls = await integer("Maximum batch calls", 1, 16, technical.maxBatchCalls);
     technical.maxFeePerGas = await answer(ask, tell, "Maximum fee per gas in gwei [100000]: ", value => allowance(value || "100000", 9));
   }
-  const limits = limitsSchema.parse({ tokens: amounts, recipients: { mode: "allowlist", addresses: recipients }, targets: setupTargets(config, tokens, swaps), swaps, ...technical, independentRpcOrigins: [], ...(swaps ? { trustedRpcOrigins: origins } : {}), maxGasCostWei });
+  const { agentRegistry, targets: registryTargets } = await promptAgentRegistry(config, ask, tell);
+  const targets = { ...setupTargets(config, tokens, swaps), ...registryTargets };
+  const limits = limitsSchema.parse({ ...(agentRegistry ? { agentRegistry } : {}), tokens: amounts, recipients: { mode: "allowlist", addresses: recipients }, targets, swaps, ...technical, independentRpcOrigins: [], ...(swaps ? { trustedRpcOrigins: origins } : {}), maxGasCostWei });
   return { limits, tokens };
 }
 
@@ -123,6 +157,7 @@ export function policySummary(limits: Limits, tokens: TokenInfo[], nativeSymbol 
     const fmt = (value: string) => `${formatUnits(BigInt(value), token.decimals)} ${token.symbol}`;
     lines.push(`  ${token.symbol}: input per operation ${fmt(caps.perTransaction)}; daily INCLUDING gas ${fmt(caps.daily)}; maximum holdings ${fmt(caps.exposure)}; gas per operation ${fmt(caps.gasPayment)}`);
   }
+  if (limits.agentRegistry) lines.push(`  Agent Registry parents: ${limits.agentRegistry.parents.join(", ") || "none"}; connections are permanent`);
   lines.push(`  Recipients: ${limits.recipients.mode === "any" ? "ANY ADDRESS" : limits.recipients.addresses.join(", ") || "none (transfers blocked)"}`,
     `  Swaps: ${limits.swaps ? `enabled; ${limits.maxSlippageBps / 100}% maximum slippage, ${limits.maxQuoteDeviationBps / 100}% quote deviation` : "disabled"}`,
     `  Trusted RPCs: ${limits.trustedRpcOrigins?.join(", ") || "none"}; independent RPCs: ${limits.independentRpcOrigins.join(", ") || "none"}`,
