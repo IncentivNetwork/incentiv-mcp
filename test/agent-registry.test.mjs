@@ -795,16 +795,17 @@ test("registry reverts expose actionable error and fresh-consent guidance throug
 });
 
 // Builds an unlink record the way an earlier build did: the stubbed check lets it through, the user approved it in the
-// terminal, and reconcile did not yet cancel unlinks awaiting approval.
+// terminal, reconcile did not yet cancel unlinks awaiting approval, and submission did not yet refuse them.
 async function legacyUnlink(f, id, { approve = true } = {}) {
-  const reconcile = f.service.reconcile;
+  const { reconcile, refuseUnlink } = f.service;
   f.service.reconcile = async () => {};
+  f.service.refuseUnlink = () => {};
   try {
     assert.equal((await f.service.send("unlink_agent", { request_id: id, parent })).status, "approval_required");
     if (!approve) return;
     await f.service.approve(id, password, digest((await f.service.review(id)).records[0]));
     return await f.service.send("unlink_agent", { request_id: id, parent });
-  } finally { f.service.reconcile = reconcile; }
+  } finally { f.service.reconcile = reconcile; f.service.refuseUnlink = refuseUnlink; }
 }
 
 test("an unlink an earlier build left awaiting approval is cancelled and never warned about", async t => {
@@ -858,6 +859,10 @@ test("a signed unlink from an earlier build is never resent and points to a same
   f.chain.relay = relay;
   f.chain.verifyRegistry = WalletChain.prototype.verifyRegistry; // the real check
   await assert.rejects(f.service.send("unlink_agent", { request_id: id, parent }), e => e.code === "registry_unlink_unsupported" && e.message.includes(`wallet operation resolve ${id} --replace`));
+  // wallet operation resolve <id> without --replace, once the terminal approval has expired: refused before policy,
+  // with the same guidance rather than a bare policy denial.
+  await f.store.session(async s => { const journal = await Journal.open(s), r = journal.data.records.find(r => r.requestId === id); r.approval.expiresAt = 1; await journal.save(); });
+  await assert.rejects(f.service.resolve(id, password), e => e.code === "registry_unlink_unsupported" && e.message.includes(`wallet operation resolve ${id} --replace`));
   assert.equal(f.submissions.length, 0);
 });
 

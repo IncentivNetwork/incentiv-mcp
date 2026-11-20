@@ -63,7 +63,7 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
   let limits, tokens;
   if (review?.wallet.policy.configured && await yesNo(ask, tell, "Keep the current permissions?", true)) {
     limits = withoutUnlink(config, review.wallet.policy.limits!);
-    if (limits !== review.wallet.policy.limits) tell("Connections are now permanent, so the unlink permission an earlier version saved is removed from this policy.");
+    if (limits !== review.wallet.policy.limits) tell("Connections are now permanent, so the unlink permission an earlier version saved is left out below. It stays stored, and is never used, until you type ENABLE at the end of setup to save these permissions.");
     if (config.manifest.agentRegistry && !limits.agentRegistry) {
       if (review.wallet.manifest_id === config.manifest.manifestId) {
         const registry = await promptAgentRegistry(config, ask, tell);

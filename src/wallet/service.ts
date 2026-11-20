@@ -122,10 +122,18 @@ export class WalletService {
       }
     }
   }
+  /**
+   * Connections are permanent: an unlink an earlier build signed is never sent, whatever the current policy says.
+   * Checked before policy, so the refusal names the only way to free the nonce it holds.
+   */
+  private refuseUnlink(r: OperationRecord): void {
+    if (r.intent.kind === "unlink_agent") throw new WalletError("registry_unlink_unsupported", `Agent connections are permanent; this wallet does not unlink agents. Signed request ${r.requestId} cannot be sent but still holds the account nonce, so first clear it with wallet operation resolve ${r.requestId} --replace in your local terminal`);
+  }
   private async submit(s: WalletSession, journal: Journal, r: OperationRecord): Promise<void> {
     await this.canSubmit(s, r);
     if (!r.operation || !r.userOpHash) throw new WalletError("wallet_recovery_required", "Signed operation is missing");
     if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", "Signed operation deadline expired; review a same-nonce replacement with wallet operation resolve --replace");
+    this.refuseUnlink(r);
     // A registry request signed under pins this release no longer approves, or before a release without the registry,
     // cannot be sent; approving new pins waits for its nonce, so only a same-nonce replacement clears it.
     if (isRegistryIntent(r.intent)) try { assertRegistryApproved(this.ctx.config, s.envelope); } catch (error) {

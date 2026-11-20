@@ -189,7 +189,7 @@ test("keeping a policy from an earlier build drops its unlink permission before 
   await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [portal], allowUnlink: true }, targets: { ...s.envelope.policy.limits.targets, [registry]: [link, unlink] } } }));
   const kept = interaction(["", "y", "y", "y", "ENABLE"], join(old.parent, "kept.json"));
   await setupWallet(f.service, f.root, kept.io);
-  assert.ok(kept.output.some(line => line.includes("unlink permission an earlier version saved is removed")));
+  assert.ok(kept.output.some(line => line.includes("unlink permission an earlier version saved is left out below")));
   const summary = kept.output.find(line => line.includes("Contract permissions"));
   assert.ok(summary && !summary.includes(unlink), "the reviewed summary no longer lists unlink()");
   const { limits: saved } = (await f.service.review()).wallet.policy;
