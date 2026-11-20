@@ -73,6 +73,20 @@ export async function promptAgentRegistry(config: Config, ask: Ask, tell: Tell):
   return { agentRegistry: { parents, allowUnlink: false }, targets: { [registry]: [toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)")] } };
 }
 
+/**
+ * Connections are permanent: removes the unlink permission an earlier build's policy may hold (allowUnlink and the
+ * registry's unlink() selector), so setup reviews and saves a policy without it. Returns `limits` itself when there is none.
+ */
+export function withoutUnlink(config: Config, limits: Limits): Limits {
+  const registry = config.manifest.agentRegistry?.proxy.address.toLowerCase(), unlink = toFunctionSelector("unlink()");
+  const key = registry && Object.keys(limits.targets).find(target => target.toLowerCase() === registry);
+  const selectors = key ? limits.targets[key] : undefined;
+  if (!limits.agentRegistry?.allowUnlink && !selectors?.some(selector => selector.toLowerCase() === unlink)) return limits;
+  const targets = { ...limits.targets };
+  if (key) targets[key] = selectors!.filter(selector => selector.toLowerCase() !== unlink);
+  return limitsSchema.parse({ ...limits, ...(limits.agentRegistry ? { agentRegistry: { ...limits.agentRegistry, allowUnlink: false } } : {}), targets });
+}
+
 export async function promptPolicy(config: Config, resolveToken: (ref: string) => Promise<TokenInfo>, ask: Ask, tell: Tell) {
   const available = [config.identity.nativeSymbol, ...Object.keys(config.manifest.canonicalTokens)];
   tell(`Choose assets: ${available.join(", ")}. Limits use normal token amounts; 0 blocks that use. Type cancel to stop.`);

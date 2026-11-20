@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtemp, readFile, realpath, rm, writeFile, mkdir, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { encodeFunctionData } from "viem";
+import { encodeFunctionData, toFunctionSelector } from "viem";
 import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
@@ -181,6 +181,20 @@ test("keeping current permissions still offers the registry once approved, and o
   assert.deepEqual(saved.agentRegistry, { parents: [portal], allowUnlink: false });
   assert.equal(saved.targets[MAINNET.manifest.agentRegistry.proxy.address.toLowerCase()].length, 1, "link only: connections are permanent");
   assert.deepEqual(saved.tokens, limits.tokens);
+});
+
+test("keeping a policy from an earlier build drops its unlink permission before the review", async t => {
+  const old = await fixture(t), f = await fixture(t, { root: old.root, existing: true }), portal = "0x0000000000000000000000000000000000000002";
+  const registry = MAINNET.manifest.agentRegistry.proxy.address.toLowerCase(), link = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)"), unlink = toFunctionSelector("unlink()");
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [portal], allowUnlink: true }, targets: { ...s.envelope.policy.limits.targets, [registry]: [link, unlink] } } }));
+  const kept = interaction(["", "y", "y", "y", "ENABLE"], join(old.parent, "kept.json"));
+  await setupWallet(f.service, f.root, kept.io);
+  assert.ok(kept.output.some(line => line.includes("unlink permission an earlier version saved is removed")));
+  const summary = kept.output.find(line => line.includes("Contract permissions"));
+  assert.ok(summary && !summary.includes(unlink), "the reviewed summary no longer lists unlink()");
+  const { limits: saved } = (await f.service.review()).wallet.policy;
+  assert.deepEqual(saved.agentRegistry, { parents: [portal], allowUnlink: false });
+  assert.deepEqual(saved.targets[registry], [link]);
 });
 
 test("MCP-created wallet can establish disabled administration before backup, and cancellation never enables it", async t => {

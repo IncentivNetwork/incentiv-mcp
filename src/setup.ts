@@ -14,7 +14,7 @@ import { authorize, limitsSchema } from "./wallet/policy.js";
 import { digest } from "./wallet/journal.js";
 import { backupWallet } from "./wallet/backup.js";
 import { confirmedSecret, requireTerminal, secretPrompt, textPrompt } from "./wallet/cli.js";
-import { answer, policySummary, promptAgentRegistry, promptPolicy, yesNo, type Ask, type Tell } from "./setup-policy.js";
+import { answer, policySummary, promptAgentRegistry, promptPolicy, withoutUnlink, yesNo, type Ask, type Tell } from "./setup-policy.js";
 import { connectClient, connectionFor, type SetupClient } from "./setup-client.js";
 
 export interface SetupIO {
@@ -62,7 +62,8 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
   }
   let limits, tokens;
   if (review?.wallet.policy.configured && await yesNo(ask, tell, "Keep the current permissions?", true)) {
-    limits = review.wallet.policy.limits!;
+    limits = withoutUnlink(config, review.wallet.policy.limits!);
+    if (limits !== review.wallet.policy.limits) tell("Connections are now permanent, so the unlink permission an earlier version saved is removed from this policy.");
     if (config.manifest.agentRegistry && !limits.agentRegistry) {
       if (review.wallet.manifest_id === config.manifest.manifestId) {
         const registry = await promptAgentRegistry(config, ask, tell);
