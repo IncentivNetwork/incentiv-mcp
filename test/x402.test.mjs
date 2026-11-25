@@ -294,6 +294,57 @@ test("a signed payment that never left this computer is rechecked against full w
   assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submitted");
 });
 
+test("the wallet can be disabled, or policy expire, while the pre-send journal write completes; the payment then never leaves", async t => {
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const atSend = (f, act) => { let done = false; f.deps.checkpoint = async point => { if (!done && /^journal_\d+_submitting$/.test(point)) { done = true; await act(); } }; };
+  // Disabled during the write: the first send is refused and the payment stays signed, unsent.
+  const disabled = await x402Fixture(t), id = randomUUID();
+  atSend(disabled, () => disabled.store.disable());
+  await assert.rejects(disabled.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), { code: "wallet_locked" });
+  assert.equal(disabled.seen.payments.length, 0);
+  // Policy expires during the write.
+  const expiring = await x402Fixture(t), other = randomUUID();
+  await expiring.store.session(async s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt: Date.now() + 1500 } }));
+  atSend(expiring, () => sleep(1600));
+  await assert.rejects(expiring.service.payX402({ url: URL_, max_amount: "0.05", request_id: other }), e => e.code === "policy_denied" && /expired.*never sent/.test(e.message));
+  assert.equal(expiring.seen.payments.length, 0);
+  // A resend the seller may already hold is also stopped by disable, and stays unknown rather than unsent.
+  const resend = await x402Fixture(t), third = randomUUID();
+  resend.seen.fail = 1;
+  await resend.service.payX402({ url: URL_, max_amount: "0.05", request_id: third });
+  atSend(resend, () => resend.store.disable());
+  await assert.rejects(resend.service.payX402({ url: URL_, max_amount: "0.05", request_id: third }), { code: "wallet_locked" });
+  assert.equal(resend.seen.payments.length, 1);
+  for (const [f, request, status] of [[disabled, id, "signed"], [expiring, other, "signed"], [resend, third, "submission_unknown"]]) {
+    const r = await f.store.session(async s => (await Journal.open(s)).data.records.find(r => r.requestId === request));
+    assert.equal(r.status, status);
+    assert.equal(r.attempts, status === "signed" ? 0 : 1);
+  }
+});
+
+test("receipt search progress is kept in the journal between reconciliations", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  let seen;
+  f.chain.receipt = async r => { seen = r.searchedBlock; r.searchedBlock = String(BigInt(r.searchedBlock ?? "0") + 10n); };
+  await f.service.operation(id);
+  await f.service.operation(id);
+  assert.equal(seen, "10");
+  assert.equal(await f.store.session(async s => (await Journal.open(s)).data.records[0].searchedBlock), "20");
+});
+
+test("a paid POST is never repeated to recover its answer", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), post = { url: URL_, method: "POST", body: '{"city":"Kyiv"}', max_amount: "0.05", request_id: id };
+  const paid = await f.service.payX402(post);
+  assert.equal(paid.status, "submitted");
+  f.setReceipt({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  const retry = await f.service.payX402(post);
+  assert.equal(retry.status, "confirmed");
+  assert.equal(retry.content_delivered, false);
+  assert.match(retry.next_action, /cannot tell whether it reached you.*does not resend a paid POST/);
+  assert.equal(f.seen.payments.length, 1);
+});
+
 test("a settled payment whose answer was lost is offered to the seller again, never paid twice", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   f.seen.fail = 1;
@@ -331,14 +382,14 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   const tx = `0x${"aa".repeat(32)}`, wrong = `0x${"bb".repeat(32)}`, blockHash = `0x${"cc".repeat(32)}`;
   const log = { address: entryPoint, topics: encodeEventTopics({ abi: [event], eventName: "UserOperationEvent", args: { userOpHash, sender, paymaster } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [nonce, true, 1234n, 1n]) };
   const record = { requestId: randomUUID(), intent: { kind: "x402_payment" }, userOpHash, nonce: nonce.toString(), fromBlock: "500", operation: { sender, paymaster } };
-  const make = laneUsed => {
+  const make = (laneUsed, head = 1000n, at = 990n) => {
     const calls = { logs: [] };
     const client = {
-      getBlockNumber: async () => 1000n,
+      getBlockNumber: async () => head,
       getBlock: async () => ({ hash: blockHash }),
       readContract: async ({ functionName, args }) => { assert.equal(functionName, "getNonce"); assert.equal(args[1], 5n); return laneUsed ? nonce + 1n : nonce; },
-      getLogs: async ({ args, fromBlock, toBlock }) => { calls.logs.push([fromBlock, toBlock]); return args.userOpHash === userOpHash && fromBlock <= 990n && 990n <= toBlock ? [{ transactionHash: tx }] : []; },
-      getTransactionReceipt: async ({ hash }) => ({ status: "success", blockHash, blockNumber: 990n, transactionHash: hash, logs: hash === tx ? [log] : [] }),
+      getLogs: async ({ args, fromBlock, toBlock }) => { calls.logs.push([fromBlock, toBlock]); return args.userOpHash === userOpHash && fromBlock <= at && at <= toBlock ? [{ transactionHash: tx }] : []; },
+      getTransactionReceipt: async ({ hash }) => ({ status: "success", blockHash, blockNumber: at, transactionHash: hash, logs: hash === tx ? [log] : [] }),
     };
     const chain = new WalletChain(new Ctx(MAINNET));
     chain.clients = [client, client];
@@ -367,6 +418,21 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   ({ chain, calls } = make(false));
   assert.equal(await chain.receipt(record), undefined);
   assert.equal(calls.logs.length, 0);
+  // A payment settled more than one search window after it was signed is reached over several attempts: each
+  // covers a bounded range forward from the signing block and records its progress, short of the head.
+  ({ chain, calls } = make(true, 3_000_000n, 1_500_000n));
+  const old = { ...record, fromBlock: "100" };
+  assert.equal(await chain.receipt(old), undefined);
+  assert.equal(old.searchedBlock, "1000099");
+  assert.deepEqual(calls.logs[0], [100n, 5099n]);
+  assert.deepEqual(await chain.receipt(old), expected);
+  assert.ok(calls.logs.at(-1)[0] <= 1_500_000n && 1_500_000n <= calls.logs.at(-1)[1]);
+  ({ chain, calls } = make(true, 1000n, 2000n));
+  const fresh = { ...record };
+  assert.equal(await chain.receipt(fresh), undefined);
+  assert.equal(fresh.searchedBlock, "872"); // Never closer to the head than the reorg margin.
+  assert.equal(await chain.receipt(fresh), undefined);
+  assert.deepEqual(calls.logs.at(-1), [873n, 1000n]);
   // Other operations keep using only the wallet's bundler.
   ({ chain, calls } = make(true));
   assert.equal(await chain.receipt({ ...record, intent: { kind: "transfer" }, transactionHash: tx }), undefined);

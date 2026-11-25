@@ -19,7 +19,7 @@ export { isTransportFailure };
 const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() === String(values[0]).toLowerCase());
 export const SWAP_DEADLINE_SECONDS = 60;
 /** How far back, and in what steps, an operation is looked for in EntryPoint events. */
-const SEARCH_CHUNK = 5_000n, SEARCH_BLOCKS = 1_000_000n;
+const SEARCH_CHUNK = 5_000n, SEARCH_BLOCKS = 1_000_000n, REORG_MARGIN = 128n;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
 export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
 export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string }
@@ -268,8 +268,9 @@ export class WalletChain {
       ?? this.searchOperation(record);
   }
   /**
-   * Finds an operation's bundle in the EntryPoint's events, searching back from the head to the block it was
-   * signed at. Only runs once the operation's nonce is used, so an unspent payment costs one read.
+   * Finds an operation's bundle in the EntryPoint's events, searching forward from the block it was signed at.
+   * Only runs once the operation's nonce is used, so an unspent payment costs one read. Each call covers at most
+   * SEARCH_BLOCKS and records how far it got in `searchedBlock`, so an old payment is still reached.
    */
   async searchOperation(record: OperationRecord): Promise<ChainReceipt | undefined> {
     const nonce = BigInt(record.nonce!), sender = record.operation!.sender as Address, entryPoint = this.ctx.config.identity.entryPoint.address;
@@ -278,12 +279,16 @@ export class WalletChain {
     const lanes = await Promise.all(this.clients.map(c => c.readContract({ address: entryPoint, abi: entryPointAbi, functionName: "getNonce", args: [sender, nonce >> 64n], blockNumber: head })));
     if (!same(lanes)) throw new Error("RPC nonces disagree");
     if (lanes[0] <= nonce) return;
-    const floor = record.fromBlock !== undefined ? BigInt(record.fromBlock) : head > SEARCH_BLOCKS ? head - SEARCH_BLOCKS : 0n;
-    for (let to = head; to >= floor && head - to < SEARCH_BLOCKS; to -= SEARCH_CHUNK) {
-      const from = to - SEARCH_CHUNK + 1n > floor ? to - SEARCH_CHUNK + 1n : floor;
+    const start = record.searchedBlock !== undefined ? BigInt(record.searchedBlock) + 1n : record.fromBlock !== undefined ? BigInt(record.fromBlock) : head > SEARCH_BLOCKS ? head - SEARCH_BLOCKS : 0n;
+    const end = start + SEARCH_BLOCKS - 1n < head ? start + SEARCH_BLOCKS - 1n : head;
+    // Progress stops short of the head, so a reorg cannot hide an event in blocks already searched.
+    const settled = head > REORG_MARGIN ? head - REORG_MARGIN : 0n;
+    for (let from = start; from <= end; from += SEARCH_CHUNK) {
+      const to = from + SEARCH_CHUNK - 1n < end ? from + SEARCH_CHUNK - 1n : end;
       const logs = await this.clients[0].getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, fromBlock: from, toBlock: to });
       if (logs[0]?.transactionHash) return this.verifiedReceipt(record, logs[0].transactionHash);
-      if (from === 0n) break;
+      const covered = to < settled ? to : settled;
+      if (covered >= start) record.searchedBlock = covered.toString();
     }
   }
   /** The operation's outcome in one bundle transaction, agreed by every configured RPC; undefined until 2 blocks deep. */

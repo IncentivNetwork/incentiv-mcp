@@ -57,9 +57,9 @@ const recordSchema = z.strictObject({
     liveTest: z.strictObject({ requestId: z.string().uuid(), policyDigest: hash }).optional(),
   }).optional(),
   transactionHash: hash.optional(),
-  // x402 only: the block the payment was signed at, which bounds an on-chain search for it, and whether the
-  // seller's answer for it reached the caller.
-  fromBlock: uint.optional(), delivered: z.boolean().optional(),
+  // x402 only: the block the payment was signed at, which bounds an on-chain search for it, the last block that
+  // search has covered without finding it, and whether the seller's answer for it was handed back.
+  fromBlock: uint.optional(), searchedBlock: uint.optional(), delivered: z.boolean().optional(),
   replacement: z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int() }).superRefine((replacement, ctx) => {
     if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
   }).optional(),
@@ -83,7 +83,8 @@ const transitions: Record<OperationRecord["status"], string[]> = {
   approval_required: ["preparing", "expired", "cancelled"],
   // Only an x402 payment that never left this computer expires from signed: nobody else holds its signature.
   signed: ["submitting", "superseding", "expired"],
-  submitting: ["submitted", "submission_unknown"],
+  // Back to its earlier status only when the last check before the outbound request refused it, so it never left.
+  submitting: ["submitted", "submission_unknown", "signed"],
   submitted: ["confirmed", "reverted", "submission_unknown", "superseding"],
   submission_unknown: ["submitting", "submitted", "confirmed", "reverted", "superseding"],
   superseding: ["confirmed", "reverted", "superseded"],

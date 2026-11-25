@@ -102,9 +102,13 @@ export class WalletService {
       }
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
       try {
+        const searched = r.searchedBlock;
         const receipt = await this.chain.receipt(r);
+        // Search progress is kept, so a payment settled long ago is reached over several reconciliations.
+        if (!receipt && r.searchedBlock !== searched) { r.sequence = ++journal.data.sequence; await journal.save(); }
         if (!receipt && r.replacement?.signed) {
-          const replaced = await this.chain.receipt({ ...r, operation: r.replacement.operation, userOpHash: r.replacement.userOpHash });
+          // The replacement's own search starts from the signing block: the payment's progress says nothing about it.
+          const replaced = await this.chain.receipt({ ...r, operation: r.replacement.operation, userOpHash: r.replacement.userOpHash, searchedBlock: undefined });
           if (replaced) {
             const gasToken = r.replacement!.gasToken ?? "native";
             r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: r.replacement!.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
@@ -405,7 +409,7 @@ export class WalletService {
         // A payment that never left this computer is sent only if current wallet policy still allows it (checked in
         // deliverX402); one that did is resent unchanged while the seller can still accept it, since it may hold it.
         if (["signed", "submission_unknown"].includes(existing.status)) return this.deliverX402(s, journal, existing, req, limits);
-        // Whether an answer handed back earlier reached the caller is unknown here, so a retry asks the seller again.
+        // Whether an answer handed back earlier reached the caller is unknown here, so a retry may ask the seller again.
         if (existing.status === "submitted" || existing.status === "confirmed") return this.redeliverX402(journal, existing, req);
         // Either the payment or its cancellation will take the nonce lane; a new request ID uses another lane, so both could pay.
         if (existing.status === "superseding") return { ...x402Result(existing), next_action: "A cancellation of this payment is pending, and the payment itself may still settle instead. Check get_agent_operation and wait until it shows superseded (cancelled, nothing paid) or confirmed (paid; retry this request ID for the answer). Buying again with a new request ID before then may pay twice." };
@@ -487,38 +491,51 @@ export class WalletService {
 
   /**
    * The seller reported or the chain shows this payment settled, but its answer may not have reached the caller:
-   * the process can stop after the answer is recorded and before the tool returns. The same signed payment is
-   * offered to the seller once more; it owns one nonce, so it cannot be charged again, and the seller may serve it.
+   * the process can stop after the answer is recorded and before the tool returns. For a GET, the same signed
+   * payment is offered to the seller once more; it owns one nonce, so it cannot be charged again, and the seller
+   * may serve it. A POST is never repeated automatically: a seller that accepts the payment again would run its
+   * handler a second time.
    */
   private async redeliverX402(journal: Journal, r: OperationRecord, req: X402Request) {
     const x = r.intent.x402!;
-    const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
-    const response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES }).catch(() => undefined);
-    if (response && response.status >= 200 && response.status < 300) {
-      r.delivered = true; r.sequence = ++journal.data.sequence; await journal.save();
-      return { ...x402Result(r), content_delivered: true, content: responseContent(response), next_action: "This payment had settled without its answer; the seller has now served it. Nothing more was paid." };
+    let response: Awaited<ReturnType<typeof this.http>> | undefined;
+    if (req.method === "GET") {
+      const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
+      response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES }).catch(() => undefined);
+      if (response && response.status >= 200 && response.status < 300) {
+        r.delivered = true; r.sequence = ++journal.data.sequence; await journal.save();
+        return { ...x402Result(r), content_delivered: true, content: responseContent(response), next_action: "This payment had settled without its answer; the seller has now served it. Nothing more was paid." };
+      }
     }
     const where = r.transactionHash ? ` in ${r.transactionHash}` : "";
-    return { ...x402Result(r), content_delivered: false, ...(response ? { http_status: response.status } : {}), next_action: r.delivered
-      ? `This payment settled${where} and its answer was handed back when it was paid, but this wallet cannot tell whether it reached you, and the seller did not serve it again. Nothing more was paid. Buying again with a new request ID pays again; if the answer was lost, ask the seller to honour this payment instead.`
-      : `This payment settled${where}, but its answer was lost and the seller did not serve it again. Nothing more was paid. Buying again with a new request ID pays again; ask the seller to honour this payment instead.` };
+    const answer = r.delivered ? "its answer was handed back when it was paid, but this wallet cannot tell whether it reached you" : "its answer was lost";
+    const again = req.method === "GET" ? "the seller did not serve it again" : "this wallet does not resend a paid POST, because the seller could run it a second time";
+    return { ...x402Result(r), content_delivered: false, ...(response ? { http_status: response.status } : {}), next_action: `This payment settled${where} and ${answer}; ${again}. Nothing more was paid. Buying again with a new request ID pays again; if the answer was lost, ask the seller to honour this payment instead.` };
   }
 
+  /** The seller's deadline passed: an unsent payment expires; one the seller may hold stays reserved until resolved. */
+  private async pastDeadlineX402(journal: Journal, r: OperationRecord) {
+    if (r.status === "signed") { r.lastError = "x402_payment_expired"; await journal.transition(r, "expired"); return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." }; }
+    return { ...x402Result(r), next_action: X402_UNKNOWN_ACTION(r.requestId) };
+  }
   /** Sends the signed payment with the request, and records what the seller answered. */
   private async deliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request, limits: Limits) {
     const x = r.intent.x402!;
-    if (x.validUntil <= Math.floor(Date.now() / 1000)) {
-      if (r.status === "signed") { r.lastError = "x402_payment_expired"; await journal.transition(r, "expired"); return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." }; }
-      return { ...x402Result(r), next_action: X402_UNKNOWN_ACTION(r.requestId) };
-    }
+    if (x.validUntil <= Math.floor(Date.now() / 1000)) return this.pastDeadlineX402(journal, r);
     // First delivery is a fresh spend on either path: policy may have expired or changed while the payment was
     // simulated or waited unsent. A payment the seller may already hold is resent unchanged.
-    const first = r.status === "signed";
+    const before = r.status, first = before === "signed";
     if (first) await this.recheckX402(s, journal, r, limits);
     await this.canSubmit(s, r);
     if (first) assertPolicyLive(limits, "it was never sent and expires unpaid");
     r.attempts++;
     await journal.transition(r, "submitting"); // From here the seller may hold the signed payment.
+    // While that write completes, the wallet can be disabled, policy can expire or the deadline can pass. They are
+    // checked again at the request itself, with nothing awaited in between; a refusal records that it never left.
+    const unsent = async () => { r.attempts--; await journal.transition(r, before); };
+    try { await this.canSubmit(s, r); if (first) assertPolicyLive(limits, "it was never sent and expires unpaid"); }
+    catch (error) { await unsent(); throw error; }
+    if (x.validUntil <= Math.floor(Date.now() / 1000)) { await unsent(); return this.pastDeadlineX402(journal, r); }
     const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
     let response;
     try { response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES }); }
