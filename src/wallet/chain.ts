@@ -24,7 +24,7 @@ const SEARCH_CHUNK = 5_000n, SEARCH_BLOCKS = 1_000_000n, SEARCH_PER_PASS = 100_0
 export const REORG_MARGIN_BLOCKS = 128n;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
 export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
-export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string; blockNumber?: bigint }
+export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string; blockNumber?: bigint; blockHash?: Hex }
 
 export class WalletChain {
   readonly clients: PublicClient[];
@@ -49,6 +49,13 @@ export class WalletChain {
     if (base === null || base === undefined) throw new WalletError("validation_failed", "Missing base fee");
     return { nonce: nonces[0], deployed, block, timestamp: Number(blocks[0].timestamp), fees: { baseFeePerGas: base, maxFeePerGas: base * 2n + 1_000_000_000n, maxPriorityFeePerGas: 1_000_000_000n } };
   }
+  async canonicalBlockHash(blockNumber: bigint): Promise<Hex> {
+    const hashes = await Promise.all(this.clients.map(c => c.getBlock({ blockNumber }).then(block => block.hash)));
+    const [hash] = hashes;
+    if (!hash || !same(hashes)) throw new WalletError("validation_failed", "RPC block hashes disagree");
+    return hash;
+  }
+
   /** The account's next nonce on one EntryPoint key, agreed by every configured RPC at `block`. */
   async laneNonce(wallet: WalletEnvelope, key: bigint, block: bigint): Promise<bigint> {
     const nonces = await Promise.all(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "getNonce", args: [wallet.account as Address, key], blockNumber: block })));
@@ -309,8 +316,8 @@ export class WalletChain {
         const orphaned = await Promise.all(found.map(async ({ blockNumber, blockHash, transactionHash }) => {
           if (!transactionHash) return true;
           if (!blockHash || blockNumber == null) return false;
-          const hashes = await Promise.all(this.clients.map(c => c.getBlock({ blockNumber }).then(b => b.hash))).catch(() => []);
-          return hashes.length > 0 && hashes.every(Boolean) && same(hashes) && hashes[0]!.toLowerCase() !== blockHash.toLowerCase();
+          const canonical = await this.canonicalBlockHash(blockNumber).catch(() => undefined);
+          return canonical !== undefined && canonical.toLowerCase() !== blockHash.toLowerCase();
         }));
         progressBlocked = !orphaned.every(Boolean);
       }
@@ -370,7 +377,7 @@ export class WalletChain {
       if (!same(errors)) throw new Error("Registry revert reason disagrees across RPCs");
       registryError = errors[0];
     }
-    return { ...matches[0][0], ...(record.intent.kind === "x402_payment" ? { blockNumber: receipts[0].blockNumber } : {}), ...(registryError ? { registryError } : {}) };
+    return { ...matches[0][0], ...(record.intent.kind === "x402_payment" ? { blockNumber: receipts[0].blockNumber, blockHash: receipts[0].blockHash } : {}), ...(registryError ? { registryError } : {}) };
   }
 }
 /** The registry a signed registry operation called: its last call, after any gas-token payment. Undefined if it cannot be decoded. */

@@ -616,6 +616,30 @@ test("a rolled-back x402 cancellation restores the original and replacement rese
   assert.equal(f.seen.payments.length, 1);
 });
 
+test("reconciliation detects a different operation winning the same x402 lane after a reorg", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true, block: 100n });
+  const payment = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const review = await f.service.reviewReplacement(id, true);
+  await f.service.replace(id, password, digest(review.records[0]));
+  const cancelHash = review.records[0].replacement.userOpHash;
+  const cancelled = { success: true, actualGasCost: 5n, transactionHash: `0x${"aa".repeat(32)}`, blockNumber: 98n, blockHash: `0x${"bb".repeat(32)}` };
+  const paid = { success: true, actualGasCost: 10n, transactionHash: `0x${"cc".repeat(32)}`, blockNumber: 98n, blockHash: `0x${"dd".repeat(32)}` };
+  const laneNonce = f.chain.laneNonce;
+  f.chain.laneNonce = async (...args) => (await laneNonce(...args)) + 1n;
+  f.chain.receipt = async record => record.userOpHash === cancelHash ? cancelled : undefined;
+  f.chain.canonicalBlockHash = async () => cancelled.blockHash;
+  assert.equal((await f.service.operation(id)).status, "superseded");
+
+  f.chain.receipt = async record => record.userOpHash === payment.user_op_hash ? paid : undefined;
+  f.chain.canonicalBlockHash = async () => paid.blockHash;
+  const reconciled = await f.service.operation(id);
+  assert.equal(reconciled.status, "confirmed");
+  assert.equal(reconciled.transaction_hash, paid.transactionHash);
+  assert.equal((await f.used())[usdc], "80000");
+  assert.equal(f.seen.payments.length, 1);
+});
+
 test("ended x402 payments are archived after two days with their hashes, and stay bound until the user clears them", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
@@ -756,7 +780,7 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
     chain.bundlerHint = async () => undefined;
     return { chain, calls };
   };
-  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: 990n };
+  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: 990n, blockHash };
   let { chain, calls } = make(true);
   assert.deepEqual(await chain.receipt({ ...record, transactionHash: tx }), expected);
   assert.equal(calls.logs.length, 0);
@@ -1091,7 +1115,7 @@ test("the receipt search reads every RPC, tries each distinct transaction, and n
     getTransactionReceipt: async ({ hash }) => { if (hash !== tx) throw new Error("transaction not found"); return { status: "success", blockHash, blockNumber: block, transactionHash: hash, logs: [log] }; },
   });
   const chain = (...clients) => { const c = new WalletChain(new Ctx(MAINNET)); c.clients = clients; c.bundlerHint = async () => undefined; return c; };
-  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: 990n };
+  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: 990n, blockHash };
   // Only the second RPC has the log: the first one's incomplete index does not hide it.
   const [missing, indexed] = [client([]), client([{ transactionHash: tx }])];
   assert.deepEqual(await chain(missing, indexed).searchOperation({ ...record }), expected);

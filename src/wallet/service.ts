@@ -106,11 +106,19 @@ export class WalletService {
     if (!settled.length) return;
     const wallet = journal.session.envelope;
     const { block } = await this.chain.state(wallet).catch(rethrowX402RecheckError);
+    const blockHashes = new Map<bigint, Hex>();
     for (const r of settled) {
-      if (r.settledBlock !== undefined && block >= BigInt(r.settledBlock) + REORG_MARGIN_BLOCKS) continue;
+      const settledBlock = r.settledBlock === undefined ? undefined : BigInt(r.settledBlock);
+      if (settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS) continue;
       const nonce = BigInt(r.nonce!);
       const current = await this.chain.laneNonce(wallet, nonce >> 64n, block).catch(rethrowX402RecheckError);
-      if (current === nonce) await this.reopenX402Settlement(journal, r);
+      let orphaned = settledBlock !== undefined && block < settledBlock;
+      if (!orphaned && settledBlock !== undefined && r.settledBlockHash) {
+        const hash = blockHashes.get(settledBlock) ?? await this.chain.canonicalBlockHash(settledBlock).catch(rethrowX402RecheckError);
+        blockHashes.set(settledBlock, hash);
+        orphaned = hash.toLowerCase() !== r.settledBlockHash;
+      }
+      if (current === nonce || orphaned) await this.reopenX402Settlement(journal, r);
     }
   }
 
@@ -119,6 +127,7 @@ export class WalletService {
     delete r.consumedAt;
     delete r.transactionHash;
     delete r.settledBlock;
+    delete r.settledBlockHash;
     delete r.searchedBlock;
     if (r.replacement) delete r.replacement.searchedBlock;
     const confirmed = r.status === "confirmed";
@@ -160,6 +169,7 @@ export class WalletService {
             const gasToken = r.replacement!.gasToken ?? "native";
             r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: r.replacement!.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
             if (replaced.blockNumber !== undefined) r.settledBlock = replaced.blockNumber.toString();
+            if (replaced.blockHash) r.settledBlockHash = replaced.blockHash.toLowerCase() as Hex;
             // A mined replacement consumes the nonce even if its execution reverted.
             await journal.transition(r, "superseded"); continue;
           }
@@ -182,6 +192,7 @@ export class WalletService {
         if (receipt.registryError) r.lastError = receipt.registryError;
         r.consumed = spend; r.consumedAt = Date.now(); r.transactionHash = receipt.transactionHash;
         if (receipt.blockNumber !== undefined) r.settledBlock = receipt.blockNumber.toString();
+        if (receipt.blockHash) r.settledBlockHash = receipt.blockHash.toLowerCase() as Hex;
         await journal.transition(r, receipt.success ? "confirmed" : "reverted");
       } catch (error) {
         if (error instanceof WalletError) throw error;
