@@ -6,11 +6,25 @@ export const uint = z.string().regex(/^(0|[1-9][0-9]*)$/).refine(s => BigInt(s) 
 export const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
 export const tokenId = z.union([z.literal("native"), address]);
 const limits = z.strictObject({ perTransaction: uint, daily: uint, exposure: uint, gasPayment: uint });
+/** An exact https origin, as `new URL(value).origin` prints it. */
+export const httpsOrigin = z.string().max(256).refine(value => {
+  try { const url = new URL(value); return url.protocol === "https:" && url.origin === value; } catch { return false; }
+}, "Use an exact https origin without a path, credentials or trailing slash");
+/**
+ * Paying for x402 resources. Absent means off. Payments also count against the USDC token limits,
+ * which must exist; the global recipient allowlist does not apply, because sellers choose payTo.
+ */
+export const x402PolicySchema = z.strictObject({
+  origins: z.discriminatedUnion("mode", [z.strictObject({ mode: z.literal("any") }), z.strictObject({ mode: z.literal("allowlist"), origins: z.array(httpsOrigin).max(100) })]),
+  payTo: z.discriminatedUnion("mode", [z.strictObject({ mode: z.literal("any") }), z.strictObject({ mode: z.literal("allowlist"), addresses: z.array(address).max(100) })]),
+  maxPerPayment: uint,
+});
 export const limitsSchema = z.strictObject({
   tokens: z.record(tokenId, limits),
   recipients: z.discriminatedUnion("mode", [z.strictObject({ mode: z.literal("any") }), z.strictObject({ mode: z.literal("allowlist"), addresses: z.array(address) })]),
   targets: z.record(address, z.array(z.string().regex(/^0x(?:[0-9a-f]{8})?$/))),
   agentRegistry: z.strictObject({ parents: z.array(address).max(100), allowUnlink: z.boolean() }).optional(),
+  x402: x402PolicySchema.optional(),
   swaps: z.boolean(), maxSlippageBps: z.number().int().min(0).max(1000),
   maxQuoteDeviationBps: z.number().int().min(0).max(1000),
   // The administrator attests that these exact endpoint origins have independent operators.
@@ -73,8 +87,11 @@ export function policyViolations(limits: Limits, input: {
   spend: Spend; used: Spend; balances: Spend; gasCost: bigint; fee: bigint; gasUnits: bigint;
   registryKind?: "link_agent" | "unlink_agent"; registryParent?: string;
   gasToken: string; gasCharge: bigint; calls: { to: string; data: string }[];
+  /** Set for an x402 payment: where the 402 came from and who it pays. */
+  x402?: { origin: string; payTo: string };
 }, now = Date.now()): string[] {
   const reasons: string[] = [];
+  if (input.x402) reasons.push(...x402Violations(limits, input.x402.origin, input.x402.payTo, input.amount));
   if (input.registryKind === "link_agent" && !registryParentAllowed(limits, input.registryParent)) reasons.push("registry_parent_not_allowed");
   // Connections are permanent: an older policy's allowUnlink no longer permits anything.
   if (input.registryKind === "unlink_agent") reasons.push("registry_unlink_not_allowed");
@@ -102,4 +119,14 @@ export function policyViolations(limits: Limits, input: {
     if (!allowed?.includes(call.data.slice(0, 10).toLowerCase())) reasons.push("target_or_selector_not_allowed");
   }
   return [...new Set(reasons)];
+}
+/** Whether authenticated local policy lets this wallet pay `amount` to `payTo` for a resource at `origin`. */
+export function x402Violations(limits: Limits, origin: string, payTo: string, amount: string): string[] {
+  const x402 = limits.x402;
+  if (!x402) return ["x402_not_enabled"];
+  const reasons: string[] = [];
+  if (x402.origins.mode === "allowlist" && !x402.origins.origins.includes(origin)) reasons.push("x402_origin_not_allowed");
+  if (x402.payTo.mode === "allowlist" && !x402.payTo.addresses.some(a => sameAddress(a, payTo))) reasons.push("x402_pay_to_not_allowed");
+  if (BigInt(amount) > BigInt(x402.maxPerPayment)) reasons.push("x402_payment_limit");
+  return reasons;
 }

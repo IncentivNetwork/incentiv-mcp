@@ -6,7 +6,7 @@ import { MAINNET } from "../src/config.ts";
 import { Ctx } from "../src/context.ts";
 import { renderMarkdown } from "../src/docs.ts";
 import { createLocalStdioMcpServer, makeServer } from "../src/server.ts";
-import { WALLET_TOOL_NAMES } from "../src/wallet/tool-names.ts";
+import { WALLET_TOOL_NAMES, X402_TOOL_NAMES } from "../src/wallet/tool-names.ts";
 
 const CHAIN_TOOL_NAMES = [
   "get_account",
@@ -57,8 +57,8 @@ test("local stdio registers the local wallet tools without accessing wallet stor
   const bundle = await createLocalStdioMcpServer(context());
 
   assert.deepEqual(bundle.capabilities, { publicTools: true, walletTools: true });
-  assert.deepEqual(bundle.catalog.map((tool) => tool.name), [...CHAIN_TOOL_NAMES, ...WALLET_TOOL_NAMES]);
-  assert.deepEqual(await registeredToolNames(bundle), [...CHAIN_TOOL_NAMES, ...WALLET_TOOL_NAMES]);
+  assert.deepEqual(bundle.catalog.map((tool) => tool.name), [...CHAIN_TOOL_NAMES, ...WALLET_TOOL_NAMES, ...X402_TOOL_NAMES]);
+  assert.deepEqual(await registeredToolNames(bundle), [...CHAIN_TOOL_NAMES, ...WALLET_TOOL_NAMES, ...X402_TOOL_NAMES]);
 
   const docs = renderMarkdown(MAINNET, bundle.catalog);
   assert.match(docs, /local MCP server/);

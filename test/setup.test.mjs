@@ -7,7 +7,7 @@ import { encodeFunctionData, toFunctionSelector } from "viem";
 import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
-import { allowance, answer, promptPolicy, setupTargets, technicalLimits } from "../src/setup-policy.ts";
+import { allowance, answer, policySummary, promptPolicy, setupTargets, technicalLimits } from "../src/setup-policy.ts";
 import { connectionFor, clientConfigPath, mergeConnection, saveClientConfig, connectClient } from "../src/setup-client.ts";
 import { setupWallet, checkRuntime } from "../src/setup.ts";
 import { parseWalletProfileArgs } from "../src/wallet-profile.ts";
@@ -63,7 +63,7 @@ test("generated permissions match real transfer, paymaster, wrap and swap select
 });
 
 test("guided policy requires RPC trust, corrects invalid input and includes gas in user-entered daily budgets", async () => {
-  const replies = ["", "bad-address", recipient, "y", "y", "1", "0.5", "100", "1000", "20", "10.1234567", "10", "11", "100", "1", "20", "n", "n"];
+  const replies = ["", "bad-address", recipient, "y", "y", "1", "0.5", "100", "1000", "20", "10.1234567", "10", "11", "100", "1", "20", "n", "n", "n"];
   const messages = [];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, message => messages.push(message));
   assert.equal(policy.tokens[usdc.address].daily, "11000000");
@@ -226,9 +226,24 @@ test("saving disabled policy preserves restored-copy acknowledgement and existin
 
 test("registry setup deduplicates parent addresses after case normalization", async () => {
   const parent = "0x16e43840d8D79896A389a3De85aB0B0210C05685";
-  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "y", `${parent.toLowerCase()},${parent}`, "y"];
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "y", `${parent.toLowerCase()},${parent}`, "n"];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, () => {});
   assert.deepEqual(policy.agentRegistry.parents, [parent]);
+});
+
+test("guided policy offers x402 only with USDC, and records its cap, sites and sellers", async () => {
+  const seller = "0x16e43840d8D79896A389a3De85aB0B0210C05685";
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "n", "y", "0", "0.05", "http://api.example.com", "https://api.example.com/path", "https://api.example.com, https://data.example.org", seller.toLowerCase()];
+  const messages = [];
+  const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, message => messages.push(message));
+  assert.deepEqual(policy.x402, { origins: { mode: "allowlist", origins: ["https://api.example.com", "https://data.example.org"] }, payTo: { mode: "allowlist", addresses: [seller] }, maxPerPayment: "50000" });
+  assert.equal(replies.length, 0);
+  assert.match(policySummary(policy, [native, usdc]), /x402 payments: up to 0\.05 USDC each/);
+  // Without USDC in the policy the question is never asked.
+  const nativeOnly = ["CENT", recipient, "n", "1", "100", "1000", "20", "20", "n", "n"];
+  const { limits: plain } = await promptPolicy(MAINNET, async () => native, async () => { assert.ok(nativeOnly.length); return nativeOnly.shift(); }, () => {});
+  assert.equal(plain.x402, undefined);
+  assert.match(policySummary(plain, [native]), /x402 payments: disabled/);
 });
 
 test("setup's default gas-unit limit admits a token-paid first operation that deploys and links an agent", async () => {

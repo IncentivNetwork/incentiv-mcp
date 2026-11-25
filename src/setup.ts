@@ -14,7 +14,7 @@ import { authorize, limitsSchema } from "./wallet/policy.js";
 import { digest } from "./wallet/journal.js";
 import { backupWallet } from "./wallet/backup.js";
 import { confirmedSecret, requireTerminal, secretPrompt, textPrompt } from "./wallet/cli.js";
-import { answer, policySummary, promptAgentRegistry, promptPolicy, withoutUnlink, yesNo, type Ask, type Tell } from "./setup-policy.js";
+import { answer, policySummary, promptAgentRegistry, promptPolicy, promptX402, withoutUnlink, yesNo, type Ask, type Tell } from "./setup-policy.js";
 import { connectClient, connectionFor, type SetupClient } from "./setup-client.js";
 
 export interface SetupIO {
@@ -69,6 +69,10 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
         const registry = await promptAgentRegistry(config, ask, tell);
         if (registry.agentRegistry) limits = limitsSchema.parse({ ...limits, agentRegistry: registry.agentRegistry, targets: { ...limits.targets, ...registry.targets } });
       } else tell("To connect this agent to Portal accounts, run wallet capabilities approve, then rerun setup.");
+    }
+    if (!limits.x402) {
+      const x402 = await promptX402(config, limits, ask, tell);
+      if (x402) limits = limitsSchema.parse({ ...limits, x402 });
     }
     tokens = await Promise.all(Object.keys(limits.tokens).map(token => service.chain.token(token)));
   } else {

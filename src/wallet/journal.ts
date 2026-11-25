@@ -11,13 +11,26 @@ import { address, tokenId, uint, addSpend, type Spend } from "./policy.js";
 import type { WalletSession } from "./store.js";
 
 const hash = z.string().regex(/^0x[0-9a-f]{64}$/);
+/**
+ * What an x402 payment pays for and how it was signed. `accepted` and `resource` are the seller's JSON, kept
+ * exactly so the payment payload repeats them; `request` binds the request UUID to the caller's request.
+ */
+export const x402IntentSchema = z.strictObject({
+  url: z.string().max(2048), origin: z.string().max(256), method: z.enum(["GET", "POST"]), request: hash, maxAmount: uint,
+  accepted: z.string().max(8192), resource: z.string().max(8192).optional(),
+  paymentId: hash, validUntil: z.number().int().positive(),
+});
 export const intentSchema = z.strictObject({
-  intentSchemaVersion: z.literal(1), kind: z.enum(["transfer", "swap", "link_agent", "unlink_agent"]),
+  intentSchemaVersion: z.literal(1), kind: z.enum(["transfer", "swap", "link_agent", "unlink_agent", "x402_payment"]),
   token: tokenId, amount: uint, gasToken: tokenId, to: address.optional(),
   tokenOut: tokenId.optional(), minimumOut: uint.optional(), slippageBps: z.number().int().min(0).max(1000),
   feeTier: z.number().int().min(1).max(1_000_000),
   registryParent: address.optional(), registryApproval: registryApprovalSchema.optional(),
+  x402: x402IntentSchema.optional(),
 }).superRefine((intent, ctx) => {
+  if (intent.kind === "x402_payment" ? (!intent.x402 || !intent.to || intent.token === "native" || intent.tokenOut !== undefined || intent.minimumOut !== undefined || BigInt(intent.amount) > BigInt(intent.x402.maxAmount)) : intent.x402 !== undefined) {
+    ctx.addIssue({ code: "custom", message: "Invalid x402 intent" });
+  }
   const registry = intent.kind === "link_agent" || intent.kind === "unlink_agent";
   if (registry ? (!intent.registryParent || intent.amount !== "0" || intent.token !== intent.gasToken || intent.to !== undefined || intent.tokenOut !== undefined || intent.minimumOut !== undefined || (intent.kind === "link_agent" ? !intent.registryApproval : !!intent.registryApproval)) : (intent.registryParent !== undefined || intent.registryApproval !== undefined)) {
     ctx.addIssue({ code: "custom", message: "Invalid registry intent" });
@@ -26,6 +39,8 @@ export const intentSchema = z.strictObject({
 export type Intent = z.infer<typeof intentSchema>;
 export const statuses = ["preparing", "approval_required", "signed", "submitting", "submitted", "submission_unknown", "superseding", "superseded", "confirmed", "reverted", "failed", "cancelled", "expired"] as const;
 export const ownsNonce = (status: string) => ["signed", "submitting", "submitted", "submission_unknown", "superseding"].includes(status);
+/** x402 payments use their own nonce lane, so only other operations hold the account's main nonce. */
+export const holdsMainNonce = (r: { status: string; intent: { kind: string } }) => ownsNonce(r.status) && r.intent.kind !== "x402_payment";
 export const terminal = (status: string) => ["confirmed", "reverted", "failed", "cancelled", "expired", "superseded"].includes(status);
 const recordSchema = z.strictObject({
   requestId: z.string().uuid(), intent: intentSchema, intentHash: hash,
@@ -62,7 +77,9 @@ const signedSchema = z.strictObject({ data: journalSchema, mac: z.string().regex
 export const digest = (value: unknown) => keccak256(toHex(canonicalJson(value)));
 const transitions: Record<OperationRecord["status"], string[]> = {
   preparing: ["approval_required", "signed", "failed", "cancelled"],
-  approval_required: ["preparing", "expired", "cancelled"], signed: ["submitting", "superseding"],
+  approval_required: ["preparing", "expired", "cancelled"],
+  // Only an x402 payment that never left this computer expires from signed: nobody else holds its signature.
+  signed: ["submitting", "superseding", "expired"],
   submitting: ["submitted", "submission_unknown"],
   submitted: ["confirmed", "reverted", "submission_unknown", "superseding"],
   submission_unknown: ["submitting", "submitted", "confirmed", "reverted", "superseding"],

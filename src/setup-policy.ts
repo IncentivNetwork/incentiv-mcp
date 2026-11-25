@@ -87,6 +87,41 @@ export function withoutUnlink(config: Config, limits: Limits): Limits {
   return limitsSchema.parse({ ...limits, ...(limits.agentRegistry ? { agentRegistry: { ...limits.agentRegistry, allowUnlink: false } } : {}), targets });
 }
 
+/**
+ * Offers x402 payments when the policy covers Incentiv USDC. Payments still count against the USDC limits;
+ * this adds the per-payment cap and which sellers may be paid.
+ */
+export async function promptX402(config: Config, limits: Pick<Limits, "tokens">, ask: Ask, tell: Tell): Promise<Limits["x402"]> {
+  const usdc = config.manifest.canonicalTokens.USDC?.address;
+  if (config.identity.chainId !== 24101 || !usdc || !Object.keys(limits.tokens).some(token => token.toLowerCase() === usdc.toLowerCase())) return undefined;
+  tell("x402 lets this agent pay websites and APIs per request in USDC. Each payment also counts against the USDC limits above, and gas (about 0.03 USDC) is paid on top.");
+  if (!await yesNo(ask, tell, "Allow paying for x402 resources?")) return undefined;
+  const maxPerPayment = await answer(ask, tell, "USDC — maximum price per x402 payment [0.10]: ", value => {
+    const amount = allowance(value || "0.10", 6);
+    if (amount === "0") throw new WalletError("validation_failed", "Set a positive maximum, or answer no to x402");
+    return amount;
+  });
+  const origins = await answer(ask, tell, "Sites the agent may pay, as https origins separated by commas (blank allows any site): ", value => {
+    const list = value ? [...new Set(value.split(",").map(s => s.trim()))] : [];
+    return list.map(item => {
+      let url: URL;
+      try { url = new URL(item); } catch { throw new WalletError("validation_failed", "Enter origins such as https://api.example.com"); }
+      if (url.protocol !== "https:" || url.origin !== item.replace(/\/$/, "")) throw new WalletError("validation_failed", "Enter https origins without a path, such as https://api.example.com");
+      return url.origin;
+    });
+  });
+  const payTo = await answer(ask, tell, "Seller payment addresses the agent may pay, separated by commas (blank allows any): ", value => {
+    const addresses = value ? [...new Set(value.split(",").map(s => s.trim()))] : [];
+    if (!addresses.every(a => isAddress(a))) throw new WalletError("validation_failed", "Enter complete valid EVM addresses");
+    return addresses.map(a => getAddress(a));
+  });
+  return {
+    origins: origins.length ? { mode: "allowlist", origins } : { mode: "any" },
+    payTo: payTo.length ? { mode: "allowlist", addresses: payTo } : { mode: "any" },
+    maxPerPayment,
+  };
+}
+
 export async function promptPolicy(config: Config, resolveToken: (ref: string) => Promise<TokenInfo>, ask: Ask, tell: Tell) {
   const available = [config.identity.nativeSymbol, ...Object.keys(config.manifest.canonicalTokens)];
   tell(`Choose assets: ${available.join(", ")}. Limits use normal token amounts; 0 blocks that use. Type cancel to stop.`);
@@ -144,8 +179,9 @@ export async function promptPolicy(config: Config, resolveToken: (ref: string) =
     technical.maxFeePerGas = await answer(ask, tell, "Maximum fee per gas in gwei [100000]: ", value => allowance(value || "100000", 9));
   }
   const { agentRegistry, targets: registryTargets } = await promptAgentRegistry(config, ask, tell);
+  const x402 = await promptX402(config, { tokens: amounts }, ask, tell);
   const targets = { ...setupTargets(config, tokens, swaps), ...registryTargets };
-  const limits = limitsSchema.parse({ ...(agentRegistry ? { agentRegistry } : {}), tokens: amounts, recipients: { mode: "allowlist", addresses: recipients }, targets, swaps, ...technical, independentRpcOrigins: [], ...(swaps ? { trustedRpcOrigins: origins } : {}), maxGasCostWei });
+  const limits = limitsSchema.parse({ ...(agentRegistry ? { agentRegistry } : {}), ...(x402 ? { x402 } : {}), tokens: amounts, recipients: { mode: "allowlist", addresses: recipients }, targets, swaps, ...technical, independentRpcOrigins: [], ...(swaps ? { trustedRpcOrigins: origins } : {}), maxGasCostWei });
   return { limits, tokens };
 }
 
@@ -158,6 +194,8 @@ export function policySummary(limits: Limits, tokens: TokenInfo[], nativeSymbol 
     lines.push(`  ${token.symbol}: input per operation ${fmt(caps.perTransaction)}; daily INCLUDING gas ${fmt(caps.daily)}; maximum holdings ${fmt(caps.exposure)}; gas per operation ${fmt(caps.gasPayment)}`);
   }
   if (limits.agentRegistry) lines.push(`  Agent Registry parents: ${limits.agentRegistry.parents.join(", ") || "none"}; connections are permanent`);
+  const x402 = limits.x402;
+  lines.push(`  x402 payments: ${!x402 ? "disabled" : `up to ${formatUnits(BigInt(x402.maxPerPayment), 6)} USDC each, within the USDC limits; sites ${x402.origins.mode === "any" ? "ANY SITE" : x402.origins.origins.join(", ")}; sellers ${x402.payTo.mode === "any" ? "ANY ADDRESS" : x402.payTo.addresses.join(", ")}`}`);
   lines.push(`  Recipients: ${limits.recipients.mode === "any" ? "ANY ADDRESS" : limits.recipients.addresses.join(", ") || "none (transfers blocked)"}`,
     `  Swaps: ${limits.swaps ? `enabled; ${limits.maxSlippageBps / 100}% maximum slippage, ${limits.maxQuoteDeviationBps / 100}% quote deviation` : "disabled"}`,
     `  Trusted RPCs: ${limits.trustedRpcOrigins?.join(", ") || "none"}; independent RPCs: ${limits.independentRpcOrigins.join(", ") || "none"}`,

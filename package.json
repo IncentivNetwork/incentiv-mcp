@@ -20,7 +20,8 @@
     "account-abstraction",
     "ethereum",
     "erc-4337",
-    "hyperlane"
+    "hyperlane",
+    "x402"
   ],
   "author": "",
   "license": "MIT",
@@ -33,10 +34,12 @@
     "incentiv-mcp": "dist/index.js"
   },
   "dependencies": {
+    "@incentiv/x402": "0.1.1",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@napi-rs/keyring": "2.1.0",
-    "viem": "2.55.4",
-    "zod": "4.4.3"
+    "@x402/core": "2.32.0",
+    "viem": "2.58.4",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
@@ -63,7 +66,8 @@
     "docs/wallet-usage.md",
     "docs/wallet-policy.example.json",
     "docs/network-configuration.md",
-    "docs/agent-registry.md"
+    "docs/agent-registry.md",
+    "docs/x402.md"
   ],
   "publishConfig": {
     "access": "public",

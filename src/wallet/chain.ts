@@ -45,6 +45,20 @@ export class WalletChain {
     if (base === null || base === undefined) throw new WalletError("validation_failed", "Missing base fee");
     return { nonce: nonces[0], deployed, block, timestamp: Number(blocks[0].timestamp), fees: { baseFeePerGas: base, maxFeePerGas: base * 2n + 1_000_000_000n, maxPriorityFeePerGas: 1_000_000_000n } };
   }
+  /** The account's next nonce on one EntryPoint key, agreed by every configured RPC at `block`. */
+  async laneNonce(wallet: WalletEnvelope, key: bigint, block: bigint): Promise<bigint> {
+    const nonces = await Promise.all(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "getNonce", args: [wallet.account as Address, key], blockNumber: block })));
+    if (!same(nonces)) throw new WalletError("validation_failed", "RPC nonces disagree");
+    return nonces[0];
+  }
+  /**
+   * The chain state an operation's nonce is checked against: its own lane for an x402 payment (whose key is the
+   * nonce's upper 192 bits), the main lane otherwise.
+   */
+  async stateFor(wallet: WalletEnvelope, record: OperationRecord): Promise<ChainState> {
+    const state = await this.state(wallet);
+    return record.intent.kind === "x402_payment" ? { ...state, nonce: await this.laneNonce(wallet, BigInt(record.nonce!) >> 64n, state.block) } : state;
+  }
   async token(ref: string): Promise<TokenInfo> {
     const cfg = this.ctx.config, name = ref.trim();
     if (name.toLowerCase() === "native" || name.toUpperCase() === cfg.identity.nativeSymbol) return this.ctx.nativeToken();
