@@ -274,3 +274,12 @@ test("setup's default gas-unit limit admits a token-paid first operation that de
   await promptPolicy(MAINNET, async ref => ({ address: ref === "CENT" ? "native" : MAINNET.manifest.canonicalTokens.USDC.address, symbol: ref, name: ref, decimals: ref === "CENT" ? 18 : 6 }), async q => { asked.push(q); return answers.shift() ?? "n"; }, m => told.push(m)).catch(() => {});
   assert.ok(told.some(m => m.includes("1,500,000 gas units") && m.includes("100,000 gwei fee ceiling")), "setup states the defaults it applies");
 });
+
+test("setup does not ask for Portal accounts on a wallet that has not approved the registry yet", async () => {
+  // The same answers as the registry case above, without the registry prompt: nothing is left unanswered or saved.
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n"], asked = [], told = [];
+  const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async q => { asked.push(q); assert.ok(replies.length); return replies.shift(); }, m => told.push(m), false);
+  assert.equal(policy.agentRegistry, undefined); assert.equal(replies.length, 0);
+  assert.ok(!asked.some(q => /Portal accounts/.test(q)));
+  assert.ok(told.some(m => /run wallet capabilities approve, then rerun setup/.test(m)));
+});

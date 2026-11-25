@@ -69,7 +69,7 @@ Restart your app, or reconnect its MCP server. Ask:
 
 > Show the Incentiv network status, then show my Incentiv wallet balance.
 
-Expected: the network is Incentiv Mainnet, and the wallet address matches the address shown by setup. The local server exposes 29 tools with the default mainnet configuration. App configuration being saved does not establish that the app connected; this first prompt verifies it.
+Expected: the network is Incentiv Mainnet, and the wallet address matches the address shown by setup. The local server exposes 33 tools with the default mainnet configuration. App configuration being saved does not establish that the app connected; this first prompt verifies it.
 
 ### 4. Fund the wallet
 

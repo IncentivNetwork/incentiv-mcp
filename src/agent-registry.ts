@@ -102,9 +102,11 @@ export async function registryStatus(client: PublicClient, cfg: Config, agent: A
 /** Why this agent cannot link to any parent; the contract checks a deployed agent itself and the factory only for a new one. */
 export function linkBlocker(status: { parent: string; agent_is_parent: boolean; agent_eligible: boolean; factory_allowed: boolean }, deployed: boolean): [code: string, message: string] | undefined {
   if (!/^0x0{40}$/i.test(status.parent)) return ["registry_already_linked", "Agent is already permanently connected to a Portal account"];
-  if (status.agent_is_parent || (deployed && !status.agent_eligible)) return ["registry_ineligible", "Account roles or allowed factories do not permit this link"];
-  // The registry's factory allowlist can change, so this refusal is temporary: the same request can be retried once it allows the factory.
-  if (!deployed && !status.factory_allowed) return ["registry_factory_not_allowed", "The Agent Registry does not currently allow this account's factory, so this undeployed account cannot link yet; retry the same request once it does"];
+  if (status.agent_is_parent) return ["registry_ineligible", "Account roles or allowed factories do not permit this link"];
+  // The registry's factory allowlist can change, so this refusal is temporary. A deployed agent is eligible exactly when the
+  // factory that deployed it (the configured one, checked when reading state) is allowed, so the same refusal applies to it.
+  if (!status.factory_allowed && (!deployed || !status.agent_eligible)) return ["registry_factory_not_allowed", "The Agent Registry does not currently allow this account's factory, so this agent cannot link yet; retry once it does"];
+  if (deployed && !status.agent_eligible) return ["registry_ineligible", "Account roles or allowed factories do not permit this link"];
 }
 export function registryCall(cfg: Config, agent: Address, intent: Intent) {
   const cap = registryCapability(cfg);

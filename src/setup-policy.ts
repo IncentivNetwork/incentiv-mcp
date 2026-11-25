@@ -61,6 +61,7 @@ export function setupTargets(config: Config, tokens: TokenInfo[], swaps: boolean
   return targets;
 }
 
+export const REGISTRY_APPROVAL_HINT = "To connect this agent to Portal accounts, run wallet capabilities approve, then rerun setup.";
 /** Asks which Portal accounts this agent may connect to and returns the policy additions; nothing when declined. */
 export async function promptAgentRegistry(config: Config, ask: Ask, tell: Tell): Promise<{ agentRegistry?: Limits["agentRegistry"]; targets?: Limits["targets"] }> {
   if (!config.manifest.agentRegistry || !await yesNo(ask, tell, "Allow this agent to connect to Portal accounts? Connections are permanent: Portal and this wallet offer no way to disconnect them.")) return {};
@@ -102,7 +103,8 @@ export function withoutUnlink(_config: Config, limits: Limits): Limits {
   return limitsSchema.parse({ ...limits, ...(limits.agentRegistry ? { agentRegistry: { ...limits.agentRegistry, allowUnlink: false } } : {}), targets });
 }
 
-export async function promptPolicy(config: Config, resolveToken: (ref: string) => Promise<TokenInfo>, ask: Ask, tell: Tell) {
+/** `registryApproved` is false for an existing wallet that has not approved this release's capabilities: it cannot link until it does. */
+export async function promptPolicy(config: Config, resolveToken: (ref: string) => Promise<TokenInfo>, ask: Ask, tell: Tell, registryApproved = true) {
   const available = [config.identity.nativeSymbol, ...Object.keys(config.manifest.canonicalTokens)];
   tell(`Choose assets: ${available.join(", ")}. Limits use normal token amounts; 0 blocks that use. Type cancel to stop.`);
   const defaults = [config.identity.nativeSymbol, ...(config.manifest.canonicalTokens.USDC ? ["USDC"] : [])];
@@ -158,7 +160,8 @@ export async function promptPolicy(config: Config, resolveToken: (ref: string) =
     technical.maxBatchCalls = await integer("Maximum batch calls", 1, 16, technical.maxBatchCalls);
     technical.maxFeePerGas = await answer(ask, tell, "Maximum fee per gas in gwei [100000]: ", value => allowance(value || "100000", 9));
   }
-  const { agentRegistry, targets: registryTargets } = await promptAgentRegistry(config, ask, tell);
+  if (config.manifest.agentRegistry && !registryApproved) tell(REGISTRY_APPROVAL_HINT);
+  const { agentRegistry, targets: registryTargets } = registryApproved ? await promptAgentRegistry(config, ask, tell) : {};
   const targets = { ...setupTargets(config, tokens, swaps), ...registryTargets };
   const limits = limitsSchema.parse({ ...(agentRegistry ? { agentRegistry } : {}), tokens: amounts, recipients: { mode: "allowlist", addresses: recipients }, targets, swaps, ...technical, independentRpcOrigins: [], ...(swaps ? { trustedRpcOrigins: origins } : {}), maxGasCostWei });
   return { limits, tokens };
