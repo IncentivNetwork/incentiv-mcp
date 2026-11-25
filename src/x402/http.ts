@@ -1,5 +1,5 @@
 import { lookup as dnsLookup, type LookupAddress } from "node:dns";
-import { request as httpsRequest } from "node:https";
+import { Agent, request as httpsRequest } from "node:https";
 import { BlockList, isIP, type LookupFunction } from "node:net";
 import { WalletError } from "../wallet/errors.js";
 
@@ -89,6 +89,13 @@ export function checkHeaders(headers: Record<string, string> | undefined): Recor
   return out;
 }
 
+/**
+ * The transport's own agent. Node's global agent follows HTTPS_PROXY when NODE_USE_ENV_PROXY is set, and a proxy
+ * resolves the target itself, past publicLookup, and receives the payment header. An agent created without
+ * `proxyEnv` always connects directly, so the guarded lookup checks the address actually used.
+ */
+export const directAgent = new Agent({ keepAlive: false });
+
 /** The default transport: one HTTPS request, no redirects, public addresses only, bounded size and time. */
 export const httpsTransport: HttpTransport = (req) => new Promise((resolve, reject) => {
   const url = checkResourceUrl(req.url);
@@ -96,7 +103,7 @@ export const httpsTransport: HttpTransport = (req) => new Promise((resolve, reje
   const headers: Record<string, string> = { "user-agent": "incentiv-mcp", accept: "application/json, text/*;q=0.9, */*;q=0.5", ...req.headers };
   if (body) { headers["content-length"] = String(body.length); headers["content-type"] ??= "application/json"; }
   const timeout = req.timeoutMs ?? 60_000;
-  const call = httpsRequest(url, { method: req.method, headers, lookup: publicLookup, timeout }, res => {
+  const call = httpsRequest(url, { method: req.method, headers, agent: directAgent, lookup: publicLookup, timeout }, res => {
     const chunks: Buffer[] = [];
     let size = 0, truncated = false;
     res.on("data", (chunk: Buffer) => {

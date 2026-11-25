@@ -201,6 +201,8 @@ export interface ToolDoc {
   readOnly: boolean;
   /** Signs with the wallet key without changing chain state. */
   signs?: boolean;
+  /** Sends the caller's request to a third party, which may act on it, without signing or changing chain state. */
+  requests?: boolean;
 }
 
 /** Register the keyless public tool surface and return its documentation catalog. */

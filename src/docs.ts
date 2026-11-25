@@ -126,7 +126,7 @@ export function renderMarkdown(cfg: Config, tools: ToolDoc[]): string {
     if (g.blurb) lines.push(g.blurb, ``);
     for (const t of g.tools) {
       const params = t.params.map((p) => (p.required ? p.name : `${p.name}?`)).join(", ") || "—";
-      lines.push(`- **\`${t.name}\`** (${params})${t.readOnly ? "" : t.signs ? " — *signs, never submits*" : " — *changes chain state*"}`);
+      lines.push(`- **\`${t.name}\`** (${params})${t.readOnly ? "" : t.signs ? " — *signs, never submits*" : t.requests ? " — *sends your request to a third party*" : " — *changes chain state*"}`);
       if (t.description) lines.push(`  ${t.description}`);
     }
     lines.push(``);
@@ -162,7 +162,7 @@ export function renderHtml(cfg: Config, tools: ToolDoc[]): string {
           ${g.tools
             .map(
               (t) => `<details class="tool-entry">
-            <summary>${esc(t.name)}<span class="tool-kind">${t.readOnly ? "Read / prepare" : "Submit"}</span></summary>
+            <summary>${esc(t.name)}<span class="tool-kind">${t.readOnly ? "Read / prepare" : t.requests ? "Request" : "Submit"}</span></summary>
             <p>${esc(t.description ?? "")}</p>
             <div class="params">${
               t.params.length

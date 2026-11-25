@@ -1,4 +1,4 @@
-import { formatUnits } from "viem";
+import { formatUnits, getAddress, isAddress } from "viem";
 import type { Config } from "../config.js";
 import { WalletError } from "../wallet/errors.js";
 import { checkResourceUrl, type HttpTransport } from "./http.js";
@@ -41,15 +41,15 @@ export async function discoverResources(cfg: Config, http: HttpTransport, args: 
   const resources = [];
   for (const raw of Array.isArray(entries) ? entries : []) {
     const entry = raw as Record<string, unknown>;
-    if (typeof entry?.resource !== "string") continue;
+    if (typeof entry?.resource !== "string" || entry.resource.length > 2048) continue;
     try { checkResourceUrl(entry.resource); } catch { continue; }
     const accepts = (Array.isArray(entry.accepts) ? entry.accepts : []) as Record<string, unknown>[];
-    const option = accepts.find(a => a?.scheme === X402_SCHEME && a?.network === X402_NETWORK && typeof a?.asset === "string" && a.asset.toLowerCase() === usdc.toLowerCase() && typeof a?.amount === "string" && /^[0-9]{1,30}$/.test(a.amount));
+    const option = accepts.find(a => a?.scheme === X402_SCHEME && a?.network === X402_NETWORK && typeof a?.asset === "string" && a.asset.toLowerCase() === usdc.toLowerCase() && typeof a?.amount === "string" && /^[0-9]{1,30}$/.test(a.amount) && typeof a?.payTo === "string" && isAddress(a.payTo, { strict: false }));
     if (!option) continue;
     resources.push({
       url: entry.resource,
       listed_price: `${formatUnits(BigInt(option.amount as string), USDC_DECIMALS)} USDC`,
-      pay_to: option.payTo,
+      pay_to: getAddress(option.payTo as string),
       service_name: text(entry.serviceName, 100),
       description: text(entry.description, 500),
       mime_type: text(entry.mimeType, 100),

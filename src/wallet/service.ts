@@ -11,7 +11,7 @@ import { userOpToJson } from "../userop.js";
 import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
 import { Journal, digest, holdsMainNonce, intentSchema, ownsNonce, terminal, type Intent, type OperationRecord } from "./journal.js";
-import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, x402Violations, type Limits, type Spend } from "./policy.js";
+import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, x402QuoteViolations, x402Violations, type Limits, type Spend } from "./policy.js";
 import { MIN_SWAP_REMAINING_SECONDS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure } from "./chain.js";
 import { validateOperation } from "./validate.js";
 import { httpsTransport, type HttpTransport } from "../x402/http.js";
@@ -107,8 +107,10 @@ export class WalletService {
         // Search progress is kept, so a payment settled long ago is reached over several reconciliations.
         if (!receipt && r.searchedBlock !== searched) { r.sequence = ++journal.data.sequence; await journal.save(); }
         if (!receipt && r.replacement?.signed) {
-          // The replacement's own search starts from the signing block: the payment's progress says nothing about it.
-          const replaced = await this.chain.receipt({ ...r, operation: r.replacement.operation, userOpHash: r.replacement.userOpHash, searchedBlock: undefined });
+          // The replacement has its own search start and progress: the payment's say nothing about it.
+          const lookup = { ...r, operation: r.replacement.operation, userOpHash: r.replacement.userOpHash, transactionHash: undefined, fromBlock: r.replacement.fromBlock ?? r.fromBlock, searchedBlock: r.replacement.searchedBlock };
+          const replaced = await this.chain.receipt(lookup);
+          if (!replaced && lookup.searchedBlock !== r.replacement.searchedBlock) { r.replacement.searchedBlock = lookup.searchedBlock; r.sequence = ++journal.data.sequence; await journal.save(); }
           if (replaced) {
             const gasToken = r.replacement!.gasToken ?? "native";
             r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: r.replacement!.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
@@ -375,7 +377,12 @@ export class WalletService {
     try { accepted = selectRequirements(required, this.ctx.config); }
     catch (error) { if (!(error instanceof WalletError)) throw error; unsupported = error.detail; }
     // Whether local policy would allow it, read without unlocking the key. Balance and gas are checked when paying.
-    const reasons = accepted ? await this.store.session(async s => s.envelope.policy.configured ? x402Violations(s.envelope.policy.limits, req.origin, accepted.payTo, accepted.amount) : ["policy_not_configured"]).catch(() => ["wallet_unavailable"]) : undefined;
+    const reasons = accepted ? await this.store.session(async s => {
+      const policy = s.envelope.policy;
+      if (!policy.configured) return ["policy_not_configured"];
+      const reasons = x402QuoteViolations(policy.limits, x402Config(this.ctx.config).usdc, req.origin, accepted.payTo, accepted.amount);
+      return !policy.enabled || await s.disabled() ? ["wallet_disabled", ...reasons] : reasons;
+    }).catch(() => ["wallet_unavailable"]) : undefined;
     return {
       url: req.url, payment_required: true, payable: !!accepted, ...(unsupported ? { unsupported } : {}),
       ...(accepted ? { price: { amount: formatUnits(BigInt(accepted.amount), USDC_DECIMALS), amount_atomic: accepted.amount, asset: "USDC", pay_to: getAddress(accepted.payTo), scheme: accepted.scheme, network: accepted.network, max_timeout_seconds: accepted.maxTimeoutSeconds, settles_before_handler: accepted.extra?.paymentFlow === "upfront" } } : {}),
@@ -406,9 +413,14 @@ export class WalletService {
       const existing = journal.data.records.find(r => r.requestId === requestId);
       if (existing) {
         if (existing.intent.kind !== "x402_payment" || existing.intent.x402!.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
-        // A payment that never left this computer is sent only if current wallet policy still allows it (checked in
-        // deliverX402); one that did is resent unchanged while the seller can still accept it, since it may hold it.
-        if (["signed", "submission_unknown"].includes(existing.status)) return this.deliverX402(s, journal, existing, req, limits);
+        // Any send needs current wallet policy (checked in deliverX402): even after an uncertain attempt, the seller
+        // may never have received the signature. A payment the seller may hold is resent unchanged.
+        if (existing.status === "signed") return this.deliverX402(s, journal, existing, req, limits);
+        if (existing.status === "submission_unknown") {
+          // The seller may already have run a POST it received; sending it again could run it twice.
+          if (!replayable(req)) return { ...x402Result(existing), content_delivered: false, next_action: `The seller may already have received and acted on this POST, so this wallet does not send it again without an Idempotency-Key header. ${X402_UNKNOWN_ACTION(existing.requestId)}` };
+          return this.deliverX402(s, journal, existing, req, limits);
+        }
         // Whether an answer handed back earlier reached the caller is unknown here, so a retry may ask the seller again.
         if (existing.status === "submitted" || existing.status === "confirmed") return this.redeliverX402(journal, existing, req);
         // Either the payment or its cancellation will take the nonce lane; a new request ID uses another lane, so both could pay.
@@ -434,10 +446,13 @@ export class WalletService {
 
       const paymentId = `0x${randomBytes(32).toString("hex")}` as Hex;
       const validUntil = Math.floor(Date.now() / 1000) + accepted.maxTimeoutSeconds;
-      const intent = intentSchema.parse({
+      // The seller chooses the size of its terms; terms too large to journal are its error, not this wallet's.
+      const parsed = intentSchema.safeParse({
         intentSchemaVersion: 1, kind: "x402_payment", token: xcfg.usdc.toLowerCase(), amount: accepted.amount, gasToken, to: payTo, slippageBps: 0, feeTier: 3000,
         x402: { url: req.url, origin: req.origin, method: req.method, request, maxAmount: maxAmount.toString(), accepted: JSON.stringify(accepted), ...(required.resource ? { resource: JSON.stringify(required.resource) } : {}), paymentId, validUntil },
       });
+      if (!parsed.success) throw new WalletError("x402_invalid_response", "The resource's payment terms or URL are too large to record; nothing was paid");
+      const intent = parsed.data;
       const r = await journal.create(requestId, intent);
       try {
         const state = await this.chain.state(s.envelope);
@@ -473,11 +488,11 @@ export class WalletService {
   }
 
   /**
-   * A signed payment that has not left this computer is a fresh spend: before it is first sent, it must still
-   * pass current wallet policy, balance and its nonce lane, as it did when signed. Its own reservation is
-   * excluded from what is already used. A refusal leaves it unsent, and it expires at its deadline.
+   * Sending a signed payment may release it to the seller for the first time, even after an uncertain attempt, so
+   * every send must still pass current wallet policy, balance and its nonce lane, as it did when signed. Its own
+   * reservation is excluded from what is already used. A refusal sends nothing and keeps the record as it was.
    */
-  private async recheckX402(s: WalletSession, journal: Journal, r: OperationRecord, limits: Limits): Promise<void> {
+  private async recheckX402(s: WalletSession, journal: Journal, r: OperationRecord, limits: Limits, consequence: string): Promise<void> {
     const state = await this.chain.stateFor(s.envelope, r);
     if (state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "This payment's nonce lane has moved; check get_agent_operation");
     const validated = validateOperation(this.ctx.config, s.envelope, r.intent, { ...r.operation!, signature: "0x" }, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash! });
@@ -485,21 +500,21 @@ export class WalletService {
     const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
     for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
     const violations = policyViolations(limits, { token: r.intent.token, amount: r.intent.amount, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls, x402: { origin: r.intent.x402!.origin, payTo: r.intent.to! } });
-    if (violations.length) throw new WalletError("policy_denied", `Local wallet policy no longer allows this payment: ${violations.join(", ")}; it was never sent and expires unpaid`);
-    for (const [token, amount] of Object.entries(validated.spend)) if (BigInt(balances[token] ?? "0") < BigInt(amount)) throw new WalletError("policy_denied", "Balance no longer covers this payment; it was never sent and expires unpaid");
+    if (violations.length) throw new WalletError("policy_denied", `Local wallet policy no longer allows this payment: ${violations.join(", ")}; ${consequence}`);
+    for (const [token, amount] of Object.entries(validated.spend)) if (BigInt(balances[token] ?? "0") < BigInt(amount)) throw new WalletError("policy_denied", `Balance no longer covers this payment; ${consequence}`);
   }
 
   /**
    * The seller reported or the chain shows this payment settled, but its answer may not have reached the caller:
-   * the process can stop after the answer is recorded and before the tool returns. For a GET, the same signed
-   * payment is offered to the seller once more; it owns one nonce, so it cannot be charged again, and the seller
-   * may serve it. A POST is never repeated automatically: a seller that accepts the payment again would run its
-   * handler a second time.
+   * the process can stop after the answer is recorded and before the tool returns. For a GET, or a POST that
+   * carries an Idempotency-Key, the same signed payment is offered to the seller once more; it owns one nonce, so
+   * it cannot be charged again, and the seller may serve it. Any other POST is never repeated: a seller that
+   * accepts the payment again would run its handler a second time.
    */
   private async redeliverX402(journal: Journal, r: OperationRecord, req: X402Request) {
     const x = r.intent.x402!;
     let response: Awaited<ReturnType<typeof this.http>> | undefined;
-    if (req.method === "GET") {
+    if (replayable(req)) {
       const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
       response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES }).catch(() => undefined);
       if (response && response.status >= 200 && response.status < 300) {
@@ -509,7 +524,7 @@ export class WalletService {
     }
     const where = r.transactionHash ? ` in ${r.transactionHash}` : "";
     const answer = r.delivered ? "its answer was handed back when it was paid, but this wallet cannot tell whether it reached you" : "its answer was lost";
-    const again = req.method === "GET" ? "the seller did not serve it again" : "this wallet does not resend a paid POST, because the seller could run it a second time";
+    const again = replayable(req) ? "the seller did not serve it again" : "this wallet does not resend a paid POST without an Idempotency-Key header, because the seller could run it a second time";
     return { ...x402Result(r), content_delivered: false, ...(response ? { http_status: response.status } : {}), next_action: `This payment settled${where} and ${answer}; ${again}. Nothing more was paid. Buying again with a new request ID pays again; if the answer was lost, ask the seller to honour this payment instead.` };
   }
 
@@ -522,44 +537,59 @@ export class WalletService {
   private async deliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request, limits: Limits) {
     const x = r.intent.x402!;
     if (x.validUntil <= Math.floor(Date.now() / 1000)) return this.pastDeadlineX402(journal, r);
-    // First delivery is a fresh spend on either path: policy may have expired or changed while the payment was
-    // simulated or waited unsent. A payment the seller may already hold is resent unchanged.
+    // Every send is checked against current policy: a first send is a fresh spend, and after an uncertain attempt
+    // (say the process stopped before the request started) the seller may still never have received it.
     const before = r.status, first = before === "signed";
-    if (first) await this.recheckX402(s, journal, r, limits);
+    const consequence = first ? "it was never sent and expires unpaid" : `it was not sent again. The seller may already hold it, so it stays reserved; ${X402_UNKNOWN_ACTION(r.requestId)}`;
+    await this.recheckX402(s, journal, r, limits, consequence);
     await this.canSubmit(s, r);
-    if (first) assertPolicyLive(limits, "it was never sent and expires unpaid");
+    assertPolicyLive(limits, consequence);
     r.attempts++;
     await journal.transition(r, "submitting"); // From here the seller may hold the signed payment.
     // While that write completes, the wallet can be disabled, policy can expire or the deadline can pass. They are
     // checked again at the request itself, with nothing awaited in between; a refusal records that it never left.
     const unsent = async () => { r.attempts--; await journal.transition(r, before); };
-    try { await this.canSubmit(s, r); if (first) assertPolicyLive(limits, "it was never sent and expires unpaid"); }
+    try { await this.canSubmit(s, r); assertPolicyLive(limits, consequence); }
     catch (error) { await unsent(); throw error; }
     if (x.validUntil <= Math.floor(Date.now() / 1000)) { await unsent(); return this.pastDeadlineX402(journal, r); }
     const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
     let response;
     try { response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES }); }
-    catch {
+    catch (error) {
+      // Some failures prove no request was written: the name did not resolve (or resolved somewhere private), the
+      // connection was refused or unreachable, or TLS verification failed before any data was sent.
+      if (neverSent(error)) {
+        await unsent();
+        throw new WalletError("x402_request_failed", `The seller could not be reached, so this attempt sent nothing: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}. ${first ? "Retry with the same request ID while the deadline is open; an unsent payment expires unpaid." : X402_UNKNOWN_ACTION(r.requestId)}`);
+      }
       r.lastError = "submission_unknown"; await journal.transition(r, "submission_unknown");
-      return { ...x402Result(r), next_action: `The seller did not answer, so the payment may or may not settle. Retry pay_x402_resource with the same request ID while the deadline is open; ${X402_UNKNOWN_ACTION(r.requestId)}` };
+      return { ...x402Result(r), next_action: `The seller did not answer, so the payment may or may not settle. ${replayable(req) ? "Retry pay_x402_resource with the same request ID while the deadline is open; " : ""}${X402_UNKNOWN_ACTION(r.requestId)}` };
     }
     const settled = settlement(response);
-    const paid = response.status >= 200 && response.status < 300 && settled?.success === true;
-    if (paid) {
-      if (typeof settled.transaction === "string" && /^0x[0-9a-fA-F]{64}$/.test(settled.transaction)) r.transactionHash = settled.transaction.toLowerCase();
-      delete r.lastError; r.delivered = true; await journal.transition(r, "submitted");
-    } else {
+    const served = response.status >= 200 && response.status < 300;
+    // The seller's report of a successful settlement is kept whatever the HTTP status, since an upfront payment
+    // can settle before a handler fails. Reconciliation verifies it on chain either way.
+    const paid = settled?.success === true && response.status !== 402;
+    if (settled?.success === true && typeof settled.transaction === "string" && /^0x[0-9a-fA-F]{64}$/.test(settled.transaction)) r.transactionHash = settled.transaction.toLowerCase();
+    if (served) r.delivered = true;
+    if (paid) { delete r.lastError; await journal.transition(r, "submitted"); }
+    else {
       r.lastError = response.status === 402 ? "x402_payment_refused" : "x402_settlement_unconfirmed";
       await journal.transition(r, "submission_unknown");
     }
     let sellerError: string | undefined;
     if (response.status === 402) try { sellerError = String(parsePaymentRequired(response).error ?? "").slice(0, 300) || undefined; } catch { /* no readable reason */ }
+    const recover = replayable(req) ? "Retry with the same request ID to ask the seller for it again; nothing more is paid." : "This wallet does not resend a paid POST without an Idempotency-Key header; ask the seller for the answer.";
     return {
       ...x402Result(r), settlement: settled ? { success: settled.success, transaction: settled.transaction, network: settled.network, payer: settled.payer, error_reason: settled.errorReason } : undefined,
       ...(sellerError ? { seller_error: sellerError } : {}),
-      // A refused or unconfirmed payment's content is not returned: the seller has not been paid for it.
-      ...(paid ? { content: responseContent(response) } : { http_status: response.status }),
-      next_action: paid ? "Paid. The settlement is confirmed on chain by get_agent_operation." : response.status === 402 ? `The seller refused the payment. ${X402_UNKNOWN_ACTION(r.requestId)}` : `The seller answered without confirming settlement. ${X402_UNKNOWN_ACTION(r.requestId)}`,
+      // Content the seller served is returned even when settlement is unconfirmed: it is already here.
+      ...(served ? { content: responseContent(response), settlement_confirmed: paid } : { http_status: response.status }),
+      next_action: paid && served ? "Paid. The settlement is confirmed on chain by get_agent_operation."
+        : paid ? `The seller reported settling the payment but answered HTTP ${response.status} without its answer. ${recover} The settlement is confirmed on chain by get_agent_operation.`
+        : response.status === 402 ? `The seller refused the payment. ${X402_UNKNOWN_ACTION(r.requestId)}`
+        : served ? `The seller served its answer without confirming settlement. ${X402_UNKNOWN_ACTION(r.requestId)}`
+        : `The seller answered without confirming settlement. ${X402_UNKNOWN_ACTION(r.requestId)}`,
     };
   }
   private balanceTokens(limits: Limits): string[] {
@@ -701,7 +731,7 @@ export class WalletService {
       await this.canSubmit(s);
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");
       replacement.operation.signature = await this.signRaw(s, validated.hash);
-      replacement.signed = true;
+      replacement.signed = true; replacement.fromBlock = state.block.toString();
       // Keep the original reservation as well: either signed operation might win.
       addSpend(r.reservation, gasToken, validated.gasCharge);
       await journal.transition(r, "superseding");
@@ -742,6 +772,15 @@ const nativeGasHint = (cfg: Config, gasToken: string) => gasToken === "native" ?
 /** Every policy exception records its reasons. Without any, a retry re-evaluates the request, so there is nothing to approve. */
 export function assertNeedsApproval(r: OperationRecord) {
   if (r.status === "approval_required" && !r.reasons?.length) throw new WalletError("validation_failed", "This request does not need terminal approval; retry it with the same request ID");
+}
+
+/** Whether a paid request may be sent again: a GET, or a POST the caller marked with an Idempotency-Key for the seller. */
+const replayable = (req: X402Request) => req.method === "GET" || !!req.headers["idempotency-key"];
+
+/** Transport failures that prove no request bytes reached the seller. */
+const NEVER_SENT_CODES = ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY"];
+function neverSent(error: unknown) {
+  return error instanceof WalletError || NEVER_SENT_CODES.includes((error as { code?: string } | undefined)?.code ?? "");
 }
 
 /** Policy expiry is checked again at the last moment before a payment is signed or first leaves this computer. */

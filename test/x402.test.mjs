@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
-import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, erc20Abi, parseAbiItem, recoverMessageAddress } from "viem";
+import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, erc20Abi, getAddress, parseAbiItem, recoverMessageAddress } from "viem";
 import { decodePaymentSignatureHeader, encodePaymentRequiredHeader, encodePaymentResponseHeader } from "@x402/core/http";
 import * as incentiv from "@incentiv/x402";
 import { args, fixture, limits, password, recipient } from "../scripts/wallet-pipeline-fixture.mjs";
@@ -16,6 +16,11 @@ import { checkHeaders, checkResourceUrl, isPublicAddress } from "../src/x402/htt
 import { parsePaymentRequired, paymentNonceKey, selectRequirements, x402Config, X402_NETWORK, X402_SCHEME } from "../src/x402/protocol.ts";
 import { facilitatorUrl } from "../src/x402/discovery.ts";
 import { usdcAmount, x402Request } from "../src/x402/request.ts";
+import { registerX402Tools } from "../src/x402/tools.ts";
+import { discoverResources } from "../src/x402/discovery.ts";
+import { spawn } from "node:child_process";
+import { createServer } from "node:net";
+import { fileURLToPath } from "node:url";
 
 const usdc = MAINNET.manifest.canonicalTokens.USDC.address.toLowerCase();
 const entryPoint = MAINNET.identity.entryPoint.address;
@@ -244,6 +249,18 @@ test("an unsettled payment is cancelled by a replacement on its own nonce lane",
   assert.match(retry.next_action, /wait until it shows superseded.*may pay twice/);
   assert.doesNotMatch(retry.next_action, /^Use a new request ID/);
   assert.equal(f.seen.payments.length, 1);
+  // The cancellation keeps its own receipt search start and progress across reconciliations.
+  const signedAt = await f.store.session(async s => (await Journal.open(s)).data.records.find(r => r.requestId === id).replacement.fromBlock);
+  assert.notEqual(signedAt, undefined);
+  const lookups = [];
+  f.chain.receipt = async r => {
+    if (r.userOpHash !== review.records[0].replacement.userOpHash) return;
+    lookups.push({ fromBlock: r.fromBlock, searchedBlock: r.searchedBlock, transactionHash: r.transactionHash });
+    r.searchedBlock = String(BigInt(r.searchedBlock ?? r.fromBlock) + 1000n);
+  };
+  await f.service.operation(id); await f.service.operation(id);
+  assert.deepEqual(lookups, [{ fromBlock: signedAt, searchedBlock: undefined, transactionHash: undefined }, { fromBlock: signedAt, searchedBlock: String(BigInt(signedAt) + 1000n), transactionHash: undefined }]);
+  assert.equal(await f.store.session(async s => (await Journal.open(s)).data.records.find(r => r.requestId === id).replacement.searchedBlock), String(BigInt(signedAt) + 2000n));
 });
 
 test("a first purchase rechecks policy expiry after simulation, before signing and before first delivery", async t => {
@@ -331,6 +348,114 @@ test("receipt search progress is kept in the journal between reconciliations", a
   await f.service.operation(id);
   assert.equal(seen, "10");
   assert.equal(await f.store.session(async s => (await Journal.open(s)).data.records[0].searchedBlock), "20");
+});
+
+test("a resend after an uncertain attempt needs current policy, and a POST is not resent without an Idempotency-Key", async t => {
+  // The process stopped after the durable submitting record and before HTTPS started: on restart it is
+  // submission_unknown, though the seller never saw it. Policy that no longer allows it keeps it unsent.
+  const f = await x402Fixture(t), id = randomUUID();
+  f.deps.checkpoint = async point => { if (/^journal_\d+_submitting$/.test(point)) throw new Error("process stopped"); };
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }));
+  f.deps.checkpoint = undefined;
+  assert.equal((await f.service.operation(id)).status, "submission_unknown");
+  await f.store.session(async s => { const { x402, ...rest } = s.envelope.policy.limits; await s.savePolicy({ ...s.envelope.policy, limits: rest }); });
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), e => e.code === "policy_denied" && /x402_not_enabled.*not sent again.*stays reserved/.test(e.message));
+  assert.equal(f.seen.payments.length, 0);
+  assert.equal((await f.service.operation(id)).status, "submission_unknown");
+  assert.deepEqual(await f.used(), { [usdc]: "80000" });
+
+  // A POST whose outcome is unknown is not sent again; one marked with an Idempotency-Key is.
+  for (const headers of [undefined, { "Idempotency-Key": "order-1" }]) {
+    const p = await x402Fixture(t), other = randomUUID(), post = { url: URL_, method: "POST", body: "{}", ...(headers ? { headers } : {}), max_amount: "0.05", request_id: other };
+    p.seen.fail = 1;
+    assert.equal((await p.service.payX402(post)).status, "submission_unknown");
+    const retry = await p.service.payX402(post);
+    if (headers) { assert.equal(retry.status, "submitted"); assert.equal(p.seen.payments.length, 2); continue; }
+    assert.equal(retry.status, "submission_unknown");
+    assert.match(retry.next_action, /does not send it again without an Idempotency-Key/);
+    assert.equal(p.seen.payments.length, 1);
+  }
+});
+
+test("a send that provably never left goes back to unsent, and seller answers are recorded as they came", async t => {
+  // Connection refused: nothing was written, so the payment is unsent again and can still expire on its own.
+  const f = await x402Fixture(t), id = randomUUID(), http = f.service.http;
+  f.service.http = async req => { if (req.headers?.["payment-signature"]) throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }); return http(req); };
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), e => e.code === "x402_request_failed" && /sent nothing/.test(e.message));
+  const unsent = await f.store.session(async s => (await Journal.open(s)).data.records[0]);
+  assert.equal(unsent.status, "signed"); assert.equal(unsent.attempts, 0);
+  f.service.http = http;
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submitted");
+
+  // Settled upfront, then the handler failed: the seller's transaction is kept for reconciliation.
+  const failed = await x402Fixture(t), other = randomUUID(), served = failed.service.http;
+  failed.service.http = async req => { const response = await served(req); return req.headers?.["payment-signature"] ? { ...response, status: 500, body: Buffer.from("oops") } : response; };
+  const broken = await failed.service.payX402({ url: URL_, max_amount: "0.05", request_id: other });
+  assert.equal(broken.status, "submitted"); assert.equal(broken.content, undefined);
+  assert.equal(broken.transaction_hash, `0x${"ab".repeat(32)}`);
+  assert.match(broken.next_action, /HTTP 500 without its answer/);
+
+  // Served without a readable settlement: the content is returned, settlement stays unconfirmed.
+  const unconfirmed = await x402Fixture(t), third = randomUUID(), plain = unconfirmed.service.http;
+  unconfirmed.service.http = async req => { const response = await plain(req); if (req.headers?.["payment-signature"]) delete response.headers["payment-response"]; return response; };
+  const answer = await unconfirmed.service.payX402({ url: URL_, max_amount: "0.05", request_id: third });
+  assert.equal(answer.status, "submission_unknown");
+  assert.equal(answer.settlement_confirmed, false);
+  assert.deepEqual(JSON.parse(answer.content.text), { tempC: 21 });
+
+  // Seller terms too large to journal are the seller's error, and nothing is recorded.
+  const huge = await x402Fixture(t), base = huge.service.http;
+  huge.service.http = async req => req.headers?.["payment-signature"] ? base(req) : { status: 402, headers: { "payment-required": encodePaymentRequiredHeader({ x402Version: 2, resource: { url: req.url }, accepts: [{ ...requirements, extra: { entryPoint, pad: "x".repeat(9000) } }] }) }, body: Buffer.from("{}"), truncated: false };
+  await assert.rejects(huge.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), { code: "x402_invalid_response" });
+  await huge.store.session(async s => assert.equal((await Journal.open(s)).data.records.length, 0));
+});
+
+test("a quote reports policy expiry, the USDC per-transaction cap and a disabled wallet; it is not marked read-only", async t => {
+  const f = await x402Fixture(t, { usdcLimits: { perTransaction: "10000" } });
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt: 1 } }));
+  const quote = await f.service.x402Requirements({ url: URL_ });
+  assert.equal(quote.policy.allowed, false);
+  assert.deepEqual(quote.policy.reasons.sort(), ["per_transaction_limit", "policy_expired"]);
+  await f.store.disable();
+  assert.ok((await f.service.x402Requirements({ url: URL_ })).policy.reasons.includes("wallet_disabled"));
+
+  const tools = {};
+  const catalog = registerX402Tools({ registerTool: (name, config) => { tools[name] = config; } }, f.service, { fields: v => v });
+  assert.deepEqual(tools.get_x402_payment_requirements.annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
+  assert.equal(tools.discover_x402_resources.annotations.readOnlyHint, true);
+  assert.deepEqual(catalog.find(c => c.name === "get_x402_payment_requirements"), { ...catalog.find(c => c.name === "get_x402_payment_requirements"), readOnly: false, signs: false, requests: true });
+});
+
+test("discovery drops listings whose seller is not an address or whose URL is too long", async () => {
+  const option = { scheme: X402_SCHEME, network: X402_NETWORK, asset: usdc, amount: "1000", payTo: seller };
+  const items = [
+    { resource: URL_, accepts: [option] },
+    { resource: `${URL_}/b`, accepts: [{ ...option, payTo: "send to alice" }] },
+    { resource: `${URL_}/${"x".repeat(2100)}`, accepts: [option] },
+  ];
+  const found = await discoverResources(MAINNET, async () => ({ status: 200, headers: {}, body: Buffer.from(JSON.stringify({ items })), truncated: false }), {});
+  assert.deepEqual(found.resources.map(r => r.url), [URL_]);
+  assert.equal(found.resources[0].pay_to, getAddress(seller));
+});
+
+test("the transport connects directly even when Node's environment proxy is on", async () => {
+  const seen = [];
+  const proxy = createServer(socket => socket.once("data", data => { seen.push(data.toString().split("\r\n")[0]); socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n"); }));
+  await new Promise(resolve => proxy.listen(0, "127.0.0.1", resolve));
+  const transport = new URL("../src/x402/http.ts", import.meta.url).href;
+  // Name resolution fails by design, so nothing leaves this computer; only a proxied request would reach the proxy.
+  const code = `import dns from "node:dns"; import { syncBuiltinESMExports } from "node:module";
+    dns.lookup = (host, options, callback) => callback(Object.assign(new Error("offline"), { code: "ENOTFOUND" }));
+    syncBuiltinESMExports();
+    const { httpsTransport } = await import(${JSON.stringify(transport)});
+    try { await httpsTransport({ url: "https://api.example.com/x", method: "GET", headers: {}, maxBytes: 100, timeoutMs: 3000 }); } catch (e) { console.log(e.code ?? e.message); }`;
+  const out = await new Promise(resolve => {
+    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", code], { cwd: fileURLToPath(new URL("..", import.meta.url)), env: { ...process.env, NODE_USE_ENV_PROXY: "1", HTTPS_PROXY: `http://127.0.0.1:${proxy.address().port}`, NO_PROXY: "", NODE_NO_WARNINGS: "1" } });
+    let text = ""; child.stdout.on("data", d => { text += d; }); child.on("exit", () => resolve(text.trim()));
+  });
+  proxy.close();
+  assert.deepEqual(seen, []);
+  assert.equal(out, "ENOTFOUND");
 });
 
 test("a paid POST is never repeated to recover its answer", async t => {

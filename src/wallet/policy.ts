@@ -120,6 +120,17 @@ export function policyViolations(limits: Limits, input: {
   }
   return [...new Set(reasons)];
 }
+/**
+ * What a quote reports before any operation exists: the x402 rules plus the USDC per-transaction cap and policy
+ * expiry. Daily limits, gas and balance depend on the operation and are checked when paying.
+ */
+export function x402QuoteViolations(limits: Limits, usdc: string, origin: string, payTo: string, amount: string, now = Date.now()): string[] {
+  const reasons = x402Violations(limits, origin, payTo, amount);
+  const cap = tokenLimits(limits, usdc);
+  if (!cap || BigInt(amount) > BigInt(cap.perTransaction)) reasons.push("per_transaction_limit");
+  if (limits.expiresAt && now >= limits.expiresAt) reasons.push("policy_expired");
+  return reasons;
+}
 /** Whether authenticated local policy lets this wallet pay `amount` to `payTo` for a resource at `origin`. */
 export function x402Violations(limits: Limits, origin: string, payTo: string, amount: string): string[] {
   const x402 = limits.x402;
