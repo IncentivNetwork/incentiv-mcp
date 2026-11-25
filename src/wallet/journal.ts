@@ -57,6 +57,9 @@ const recordSchema = z.strictObject({
     liveTest: z.strictObject({ requestId: z.string().uuid(), policyDigest: hash }).optional(),
   }).optional(),
   transactionHash: hash.optional(),
+  // x402 only: the block the payment was signed at, which bounds an on-chain search for it, and whether the
+  // seller's answer for it reached the caller.
+  fromBlock: uint.optional(), delivered: z.boolean().optional(),
   replacement: z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int() }).superRefine((replacement, ctx) => {
     if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
   }).optional(),

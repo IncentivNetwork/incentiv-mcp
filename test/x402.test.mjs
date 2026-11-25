@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
-import { encodeFunctionData, erc20Abi, recoverMessageAddress } from "viem";
+import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, erc20Abi, parseAbiItem, recoverMessageAddress } from "viem";
 import { decodePaymentSignatureHeader, encodePaymentRequiredHeader, encodePaymentResponseHeader } from "@x402/core/http";
 import * as incentiv from "@incentiv/x402";
 import { args, fixture, limits, password, recipient } from "../scripts/wallet-pipeline-fixture.mjs";
 import { MAINNET } from "../src/config.ts";
+import { Ctx } from "../src/context.ts";
+import { WalletChain } from "../src/wallet/chain.ts";
 import { accountFactoryAbi } from "../src/abi.ts";
 import { computeUserOpHash, encodeExecuteBatch, userOpFromJson } from "../src/userop.ts";
 import { Journal, digest, intentSchema } from "../src/wallet/journal.ts";
@@ -234,4 +236,91 @@ test("an unsettled payment is cancelled by a replacement on its own nonce lane",
   const replaced = await f.service.replace(id, password, digest(review.records[0]));
   assert.equal(replaced.status, "superseding");
   assert.equal(BigInt(f.submissions.at(-1).nonce), lane);
+});
+
+test("a signed payment that never left this computer is rechecked against full wallet policy before it is first sent", async t => {
+  for (const change of [
+    limits => ({ ...limits, expiresAt: 1 }),
+    limits => ({ ...limits, tokens: { ...limits.tokens, [usdc]: { ...limits.tokens[usdc], perTransaction: "1000", daily: "1000" } } }),
+  ]) {
+    const f = await x402Fixture(t), id = randomUUID();
+    f.seen.fail = 1;
+    await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+    await f.store.session(async s => {
+      const journal = await Journal.open(s); journal.data.records[0].status = "signed"; await journal.save();
+      await s.savePolicy({ ...s.envelope.policy, limits: change(s.envelope.policy.limits) });
+    });
+    await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), e => e.code === "policy_denied" && /never sent/.test(e.message));
+    assert.equal(f.seen.payments.length, 1);
+    assert.equal((await f.service.operation(id)).status, "signed");
+  }
+  // Its own reservation is not counted against it: within policy, the unsent payment goes out.
+  const f = await x402Fixture(t, { usdcLimits: { perTransaction: "80000", daily: "80000" } }), id = randomUUID();
+  f.seen.fail = 1;
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  await f.store.session(async s => { const journal = await Journal.open(s); journal.data.records[0].status = "signed"; await journal.save(); });
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submitted");
+});
+
+test("a settled payment whose answer was lost is offered to the seller again, never paid twice", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  f.seen.fail = 1;
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submission_unknown");
+  f.setReceipt({ success: true, actualGasCost: 1n, transactionHash: `0x${"cd".repeat(32)}` });
+  const served = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(served.status, "confirmed");
+  assert.equal(served.content_delivered, true);
+  assert.deepEqual(JSON.parse(served.content.text), { tempC: 21 });
+  assert.deepEqual(f.seen.payments[1], f.seen.payments[0]);
+  assert.match((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).next_action, /answer was returned/);
+  assert.equal(f.seen.payments.length, 2);
+
+  const lost = await x402Fixture(t), other = randomUUID();
+  lost.seen.fail = 1;
+  await lost.service.payX402({ url: URL_, max_amount: "0.05", request_id: other });
+  lost.setReceipt({ success: true, actualGasCost: 1n, transactionHash: `0x${"cd".repeat(32)}` });
+  lost.seen.refuse = true;
+  const unserved = await lost.service.payX402({ url: URL_, max_amount: "0.05", request_id: other });
+  assert.equal(unserved.status, "confirmed");
+  assert.equal(unserved.content_delivered, false);
+  assert.equal(unserved.content, undefined);
+  assert.match(unserved.next_action, /answer was lost.*pays again/);
+  assert.deepEqual(lost.seen.payments[1], lost.seen.payments[0]);
+});
+
+test("an x402 receipt is found from the seller's transaction or the EntryPoint's events when the bundler does not know it", async () => {
+  const event = parseAbiItem("event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)");
+  const sender = "0x30a343d137ed0492d9d7ad25fc55590d807629b3", userOpHash = `0x${"77".repeat(32)}`, nonce = (5n << 64n) | 3n;
+  const tx = `0x${"aa".repeat(32)}`, wrong = `0x${"bb".repeat(32)}`, blockHash = `0x${"cc".repeat(32)}`;
+  const log = { address: entryPoint, topics: encodeEventTopics({ abi: [event], eventName: "UserOperationEvent", args: { userOpHash, sender, paymaster } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [nonce, true, 1234n, 1n]) };
+  const record = { requestId: randomUUID(), intent: { kind: "x402_payment" }, userOpHash, nonce: nonce.toString(), fromBlock: "500", operation: { sender, paymaster } };
+  const make = laneUsed => {
+    const calls = { logs: [] };
+    const client = {
+      getBlockNumber: async () => 1000n,
+      getBlock: async () => ({ hash: blockHash }),
+      readContract: async ({ functionName, args }) => { assert.equal(functionName, "getNonce"); assert.equal(args[1], 5n); return laneUsed ? nonce + 1n : nonce; },
+      getLogs: async ({ args, fromBlock, toBlock }) => { calls.logs.push([fromBlock, toBlock]); return args.userOpHash === userOpHash && fromBlock <= 990n && 990n <= toBlock ? [{ transactionHash: tx }] : []; },
+      getTransactionReceipt: async ({ hash }) => ({ status: "success", blockHash, blockNumber: 990n, transactionHash: hash, logs: hash === tx ? [log] : [] }),
+    };
+    const chain = new WalletChain(new Ctx(MAINNET));
+    chain.clients = [client, client];
+    chain.bundlerHint = async () => undefined;
+    return { chain, calls };
+  };
+  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx };
+  let { chain, calls } = make(true);
+  assert.deepEqual(await chain.receipt({ ...record, transactionHash: tx }), expected);
+  assert.equal(calls.logs.length, 0);
+  ({ chain, calls } = make(true));
+  assert.deepEqual(await chain.receipt({ ...record, transactionHash: wrong }), expected);
+  assert.deepEqual(calls.logs, [[500n, 1000n]]); // From the head back to the block it was signed at.
+  ({ chain, calls } = make(true));
+  assert.deepEqual(await chain.receipt(record), expected);
+  ({ chain, calls } = make(false));
+  assert.equal(await chain.receipt(record), undefined);
+  assert.equal(calls.logs.length, 0);
+  // Other operations keep using only the wallet's bundler.
+  ({ chain, calls } = make(true));
+  assert.equal(await chain.receipt({ ...record, intent: { kind: "transfer" }, transactionHash: tx }), undefined);
 });

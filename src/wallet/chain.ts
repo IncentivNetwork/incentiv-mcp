@@ -18,6 +18,8 @@ const revertReasonEvent = parseAbiItem("event UserOperationRevertReason(bytes32 
 export { isTransportFailure };
 const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() === String(values[0]).toLowerCase());
 export const SWAP_DEADLINE_SECONDS = 60;
+/** How far back, and in what steps, an operation is looked for in EntryPoint events. */
+const SEARCH_CHUNK = 5_000n, SEARCH_BLOCKS = 1_000_000n;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
 export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
 export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string }
@@ -240,12 +242,51 @@ export class WalletChain {
     await beforeSubmit?.();
     return broadcastUserOp(this.ctx, userOpFromWire(operation));
   }
+  /** The bundle transaction the configured bundler reports for an operation, if it indexes it. A hint only. */
+  async bundlerHint(userOpHash: string): Promise<Hex | undefined> {
+    const hint = await bundlerRpc(this.ctx, "eth_getUserOperationReceipt", [userOpHash]) as { receipt?: { transactionHash?: Hex } } | null;
+    return hint?.receipt?.transactionHash;
+  }
   async receipt(record: OperationRecord): Promise<ChainReceipt | undefined> {
     if (!record.userOpHash || !record.operation) return;
     // Bundler is a discovery hint. Only matching EntryPoint events in RPC receipts settle reservations.
-    const hint = await bundlerRpc(this.ctx, "eth_getUserOperationReceipt", [record.userOpHash]) as { receipt?: { transactionHash?: Hex } } | null;
-    if (!hint?.receipt?.transactionHash) return;
-    const receipts = await Promise.all(this.clients.map(c => c.getTransactionReceipt({ hash: hint.receipt!.transactionHash! })));
+    if (record.intent.kind !== "x402_payment") {
+      const hint = await this.bundlerHint(record.userOpHash);
+      return hint ? this.verifiedReceipt(record, hint) : undefined;
+    }
+    // The seller's facilitator submits an x402 payment, possibly through another bundler, so its reported
+    // transaction and, once the payment's nonce lane has moved, the EntryPoint's own events are hints too.
+    const hint = await this.bundlerHint(record.userOpHash).catch(() => undefined);
+    if (hint) return this.verifiedReceipt(record, hint);
+    if (record.transactionHash) {
+      const reported = await this.verifiedReceipt(record, record.transactionHash as Hex).catch(() => undefined);
+      if (reported) return reported;
+    }
+    return this.searchOperation(record);
+  }
+  /**
+   * Finds an operation's bundle in the EntryPoint's events, searching back from the head to the block it was
+   * signed at. Only runs once the operation's nonce is used, so an unspent payment costs one read.
+   */
+  async searchOperation(record: OperationRecord): Promise<ChainReceipt | undefined> {
+    const nonce = BigInt(record.nonce!), sender = record.operation!.sender as Address, entryPoint = this.ctx.config.identity.entryPoint.address;
+    const heads = await Promise.all(this.clients.map(c => c.getBlockNumber({ cacheTime: 0 })));
+    const head = heads.reduce((a, b) => a < b ? a : b);
+    const lanes = await Promise.all(this.clients.map(c => c.readContract({ address: entryPoint, abi: entryPointAbi, functionName: "getNonce", args: [sender, nonce >> 64n], blockNumber: head })));
+    if (!same(lanes)) throw new Error("RPC nonces disagree");
+    if (lanes[0] <= nonce) return;
+    const floor = record.fromBlock !== undefined ? BigInt(record.fromBlock) : head > SEARCH_BLOCKS ? head - SEARCH_BLOCKS : 0n;
+    for (let to = head; to >= floor && head - to < SEARCH_BLOCKS; to -= SEARCH_CHUNK) {
+      const from = to - SEARCH_CHUNK + 1n > floor ? to - SEARCH_CHUNK + 1n : floor;
+      const logs = await this.clients[0].getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, fromBlock: from, toBlock: to });
+      if (logs[0]?.transactionHash) return this.verifiedReceipt(record, logs[0].transactionHash);
+      if (from === 0n) break;
+    }
+  }
+  /** The operation's outcome in one bundle transaction, agreed by every configured RPC; undefined until 2 blocks deep. */
+  async verifiedReceipt(record: OperationRecord, transactionHash: Hex): Promise<ChainReceipt | undefined> {
+    if (!record.userOpHash || !record.operation) return;
+    const receipts = await Promise.all(this.clients.map(c => c.getTransactionReceipt({ hash: transactionHash })));
     if (!same(receipts.map(r => r.blockHash)) || !same(receipts.map(r => r.blockNumber)) || receipts.some(r => r.status !== "success")) throw new Error("Receipt disagreement");
     const blocks = await Promise.all(this.clients.map((c, i) => c.getBlock({ blockNumber: receipts[i].blockNumber })));
     if (blocks.some((b, i) => b.hash !== receipts[i].blockHash)) throw new Error("Receipt is not in the canonical chain");
