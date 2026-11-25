@@ -289,8 +289,10 @@ export class WalletChain {
     const settled = head > REORG_MARGIN ? head - REORG_MARGIN : 0n;
     for (let from = start; from <= end; from += SEARCH_CHUNK) {
       const to = from + SEARCH_CHUNK - 1n < end ? from + SEARCH_CHUNK - 1n : end;
-      const logs = await this.clients[0].getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, fromBlock: from, toBlock: to });
-      if (logs[0]?.transactionHash) return this.verifiedReceipt(record, logs[0].transactionHash);
+      // Every RPC is searched: one with an incomplete log index must not move progress past the payment's block.
+      const found = (await Promise.all(this.clients.map(c => logsIn(c, from, to, range => c.getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, ...range }))))).flat();
+      const hash = found.find(log => log.transactionHash)?.transactionHash;
+      if (hash) return this.verifiedReceipt(record, hash);
       const covered = to < settled ? to : settled;
       if (covered >= start) record.searchedBlock = covered.toString();
     }
@@ -352,4 +354,13 @@ export function exactAmount(text: string, decimals: number): bigint {
   const amount = parseUnits(text, decimals);
   if (amount <= 0n || amount >= 2n ** 256n) throw new WalletError("validation_failed", "Amount is out of range");
   return amount;
+}
+
+/** Logs over [from, to], halving the range while an RPC refuses it as too large, down to 64 blocks. */
+async function logsIn<C, L>(_client: C, from: bigint, to: bigint, read: (range: { fromBlock: bigint; toBlock: bigint }) => Promise<L[]>): Promise<L[]> {
+  try { return await read({ fromBlock: from, toBlock: to }); } catch (error) {
+    if (to - from < 64n) throw error;
+    const mid = from + (to - from) / 2n;
+    return [...await logsIn(_client, from, mid, read), ...await logsIn(_client, mid + 1n, to, read)];
+  }
 }

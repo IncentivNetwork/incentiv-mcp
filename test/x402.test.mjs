@@ -689,7 +689,7 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   assert.equal(calls.logs.length, 0);
   ({ chain, calls } = make(true));
   assert.deepEqual(await chain.receipt({ ...record, transactionHash: wrong }), expected);
-  assert.deepEqual(calls.logs, [[500n, 1000n]]); // From the head back to the block it was signed at.
+  assert.deepEqual([...new Set(calls.logs.map(String))], ["500,1000"]); // Every RPC searches the same range. // From the head back to the block it was signed at.
   ({ chain, calls } = make(true));
   assert.deepEqual(await chain.receipt(record), expected);
   // A stale bundler hash, one that fails verification or is no longer found, falls through to the other sources.
@@ -701,7 +701,7 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   chain.bundlerHint = async () => wrong;
   for (const client of chain.clients) { const get = client.getTransactionReceipt; client.getTransactionReceipt = async a => { if (a.hash === wrong) throw new Error("not found"); return get(a); }; }
   assert.deepEqual(await chain.receipt(record), expected);
-  assert.deepEqual(calls.logs, [[500n, 1000n]]);
+  assert.deepEqual([...new Set(calls.logs.map(String))], ["500,1000"]); // Every RPC searches the same range.
   ({ chain, calls } = make(false));
   assert.equal(await chain.receipt(record), undefined);
   assert.equal(calls.logs.length, 0);
@@ -808,4 +808,15 @@ test("only an x402 payment may expire once signed or reopen once confirmed", asy
   f.setReceipt({ success: true, actualGasCost: 1n, transactionHash: `0x${"cd".repeat(32)}` });
   assert.equal((await f.service.operation(id)).status, "confirmed");
   await assert.rejects(move("submitted"), { code: "wallet_recovery_required" });
+});
+
+test("operation results never carry the seller's raw terms, and an interrupted preparation is closed", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const shown = await f.service.operation(id);
+  assert.equal(shown.intent.x402.accepted, undefined); assert.equal(shown.intent.x402.resource, undefined);
+  assert.ok(!JSON.stringify(await f.service.get()).includes("Weather"));
+  await f.store.session(async s => { const journal = await Journal.open(s); const r = journal.data.records[0]; r.status = "preparing"; await journal.save(); });
+  assert.equal((await f.service.operation(id)).status, "failed");
+  await assert.rejects(discoverResources(MAINNET, async () => ({ status: 200, headers: {}, body: Buffer.from("null"), truncated: false }), {}), { code: "x402_discovery_unavailable" });
 });

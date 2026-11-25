@@ -93,6 +93,9 @@ export class WalletService {
     for (const r of journal.data.records) if (r.intent.kind === "unlink_agent" && (r.status === "preparing" || r.status === "approval_required")) {
       delete r.approval; r.lastError = "registry_unlink_unsupported"; await journal.transition(r, "cancelled");
     }
+    // Reconciliation runs at the start of a locked session, so an x402 payment still preparing was interrupted
+    // before it was signed: nothing can send it, so it is closed.
+    for (const r of journal.data.records) if (r.intent.kind === "x402_payment" && r.status === "preparing") { r.lastError = "x402_preparation_interrupted"; await journal.transition(r, "failed"); }
     for (const r of journal.data.records.filter(r => ownsNonce(r.status))) {
       if (r.status === "signed") {
         // No network submission was started; exact bytes remain retryable. An x402 payment that was never sent
@@ -919,8 +922,10 @@ function x402Result(r: OperationRecord) {
 function result(r: OperationRecord) {
   const nativeGas = r.intent.gasToken === "native" && (r.status === "confirmed" || r.status === "reverted") && r.consumed?.native !== undefined
     ? (BigInt(r.consumed.native) - (r.status === "confirmed" && r.intent.token === "native" ? BigInt(r.intent.amount) : 0n)).toString() : undefined;
-  const { registryApproval, ...publicIntent } = r.intent;
-  const intent = registryApproval ? { ...publicIntent, registryApproval: { ...registryApproval, parent_signature: "[redacted]" } } : publicIntent;
+  const { registryApproval, x402, ...publicIntent } = r.intent;
+  // The seller's raw terms are third-party text that no tool screens here, so only the payment's own fields are shown.
+  const sellerFree = x402 ? (({ accepted: _accepted, resource: _resource, ...own }) => own)(x402) : undefined;
+  const intent = { ...publicIntent, ...(sellerFree ? { x402: sellerFree } : {}), ...(registryApproval ? { registryApproval: { ...registryApproval, parent_signature: "[redacted]" } } : {}) };
   const eventMissing = r.status === "confirmed" && r.lastError === "registry_event_missing";
   const registryError = eventMissing || (r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_")) ? r.lastError : undefined;
   const interrupted = r.status === "approval_required" && TEMPORARY_ERRORS.includes(r.lastError ?? "");

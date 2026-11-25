@@ -37,6 +37,7 @@ export async function discoverResources(cfg: Config, http: HttpTransport, args: 
   if (response.status !== 200) throw new WalletError("x402_discovery_unavailable", `The facilitator answered HTTP ${response.status}`);
   let body: { items?: unknown[]; resources?: unknown[]; pagination?: { total?: number } | null; partialResults?: boolean };
   try { body = JSON.parse(response.body.toString("utf8")); } catch { throw new WalletError("x402_discovery_unavailable", "The facilitator's catalog is not JSON"); }
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new WalletError("x402_discovery_unavailable", "The facilitator's catalog is not a JSON object");
   const entries = (query ? body.resources : body.items) ?? [];
   const resources = [];
   for (const raw of Array.isArray(entries) ? entries : []) {
