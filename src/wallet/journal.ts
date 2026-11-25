@@ -59,7 +59,7 @@ const recordSchema = z.strictObject({
   transactionHash: hash.optional(),
   // x402 only: the block the payment was signed at, which bounds an on-chain search for it, the last block that
   // search has covered without finding it, and whether the seller's answer for it was handed back.
-  fromBlock: uint.optional(), searchedBlock: uint.optional(), delivered: z.boolean().optional(),
+  fromBlock: uint.optional(), searchedBlock: uint.optional(), confirmedBlock: uint.optional(), delivered: z.boolean().optional(),
   // fromBlock and searchedBlock are the replacement's own receipt search start and progress, as for the original.
   replacement: z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int(), fromBlock: uint.optional(), searchedBlock: uint.optional() }).superRefine((replacement, ctx) => {
     if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
@@ -102,10 +102,10 @@ const transitions: Record<OperationRecord["status"], string[]> = {
   submission_unknown: ["submitting", "submitted", "confirmed", "reverted", "superseding"],
   superseding: ["confirmed", "reverted", "superseded"],
   // Only an x402 payment whose confirmation the chain no longer shows (its nonce is unused again) reopens.
-  confirmed: ["submitted"], reverted: [], failed: [], cancelled: [], expired: [], superseded: [],
+  confirmed: ["submitted", "superseding"], reverted: [], failed: [], cancelled: [], expired: [], superseded: [],
 };
 /** The moves above that only an x402 payment may make. */
-const X402_ONLY_TRANSITIONS = ["signed>expired", "signed>submission_unknown", "confirmed>submitted"];
+const X402_ONLY_TRANSITIONS = ["signed>expired", "signed>submission_unknown", "confirmed>submitted", "confirmed>superseding"];
 
 /** One atomic authenticated snapshot retains every request for the wallet lifetime.
  * ponytail: linear journal reads; segment with authenticated tombstones when history exceeds 16 MiB.

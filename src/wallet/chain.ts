@@ -20,10 +20,11 @@ const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() ==
 export const SWAP_DEADLINE_SECONDS = 60;
 /** How far back, and in what steps, an operation is looked for in EntryPoint events. */
 // One reconciliation searches at most SEARCH_PER_PASS blocks while it holds the wallet lock; saved progress continues it.
-const SEARCH_CHUNK = 5_000n, SEARCH_BLOCKS = 1_000_000n, SEARCH_PER_PASS = 100_000n, REORG_MARGIN = 128n;
+const SEARCH_CHUNK = 5_000n, SEARCH_BLOCKS = 1_000_000n, SEARCH_PER_PASS = 100_000n;
+export const REORG_MARGIN_BLOCKS = 128n;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
 export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
-export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string }
+export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string; blockNumber?: bigint }
 
 export class WalletChain {
   readonly clients: PublicClient[];
@@ -291,7 +292,7 @@ export class WalletChain {
     const start = record.searchedBlock !== undefined ? BigInt(record.searchedBlock) + 1n : record.fromBlock !== undefined ? BigInt(record.fromBlock) : head > SEARCH_BLOCKS ? head - SEARCH_BLOCKS : 0n;
     const end = start + SEARCH_PER_PASS - 1n < head ? start + SEARCH_PER_PASS - 1n : head;
     // Progress stops short of the head, so a reorg cannot hide an event in blocks already searched.
-    const settled = head > REORG_MARGIN ? head - REORG_MARGIN : 0n;
+    const settled = head > REORG_MARGIN_BLOCKS ? head - REORG_MARGIN_BLOCKS : 0n;
     for (let from = start; from <= end; from += SEARCH_CHUNK) {
       const to = from + SEARCH_CHUNK - 1n < end ? from + SEARCH_CHUNK - 1n : end;
       // Every RPC is searched: one with an incomplete log index must not move progress past the payment's block.
@@ -359,7 +360,7 @@ export class WalletChain {
       if (!same(errors)) throw new Error("Registry revert reason disagrees across RPCs");
       registryError = errors[0];
     }
-    return { ...matches[0][0], ...(registryError ? { registryError } : {}) };
+    return { ...matches[0][0], ...(record.intent.kind === "x402_payment" ? { blockNumber: receipts[0].blockNumber } : {}), ...(registryError ? { registryError } : {}) };
   }
 }
 /** The registry a signed registry operation called: its last call, after any gas-token payment. Undefined if it cannot be decoded. */

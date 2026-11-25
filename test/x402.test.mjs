@@ -567,6 +567,28 @@ test("a confirmation the chain drops reopens the payment, which is not sent agai
   assert.equal((await f.used())[usdc], "80000");
 });
 
+test("ordinary reconciliation restores a rolled-back payment's reservation before any new spend", async t => {
+  const f = await x402Fixture(t), state = f.chain.state, id = randomUUID();
+  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true, block: 100n });
+  f.chain.balances = async (_wallet, tokens) => Object.fromEntries(tokens.map(token => [
+    token.toLowerCase(), token === "native" ? "1000000" : token.toLowerCase() === usdc ? "80000" : "0",
+  ]));
+  const purchase = { url: URL_, max_amount: "0.05", request_id: id };
+  await f.service.payX402(purchase);
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}`, blockNumber: 98n });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+
+  f.unsettle();
+  await assert.rejects(f.service.payX402({ ...purchase, request_id: randomUUID() }), error =>
+    error.code === "policy_denied" && /beside other pending operations/.test(error.detail));
+  const reopened = await f.service.operation(id);
+  assert.equal(reopened.status, "submitted");
+  assert.equal(reopened.last_error, "x402_confirmation_rolled_back");
+  assert.equal(reopened.transaction_hash, undefined);
+  assert.equal((await f.service.get()).pending_reservations[usdc], "80000");
+  assert.equal(f.seen.payments.length, 1);
+});
+
 test("ended x402 payments are archived after two days with their hashes, and stay bound until the user clears them", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
@@ -707,7 +729,7 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
     chain.bundlerHint = async () => undefined;
     return { chain, calls };
   };
-  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx };
+  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: 990n };
   let { chain, calls } = make(true);
   assert.deepEqual(await chain.receipt({ ...record, transactionHash: tx }), expected);
   assert.equal(calls.logs.length, 0);
@@ -739,7 +761,7 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   assert.deepEqual(calls.logs[0], [100n, 5099n]);
   let found;
   for (let pass = 0; pass < 20 && !found; pass++) found = await chain.receipt(old);
-  assert.deepEqual(found, expected);
+  assert.deepEqual(found, { ...expected, blockNumber: 1_500_000n });
   assert.ok(calls.logs.at(-1)[0] <= 1_500_000n && 1_500_000n <= calls.logs.at(-1)[1]);
   ({ chain, calls } = make(true, 1000n, 2000n));
   const fresh = { ...record };
@@ -779,6 +801,10 @@ test("a payment is signed or resent only when the balance covers it beside every
   const failed = await f.service.operation(third);
   assert.equal(failed.status, "failed"); assert.equal(failed.archived, true);
   assert.equal((await f.records()).some(r => r.requestId === third), false);
+  const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: third });
+  assert.equal(retry.last_error, "policy_denied");
+  assert.match(retry.next_action, /ended before it was sent.*Nothing was paid/);
+  assert.equal(f.seen.payments.length, 2);
 });
 
 test("seller-written settlement text is cut short, malformed values are dropped, and the error reason is screened", async t => {
@@ -1022,7 +1048,7 @@ test("the receipt search reads every RPC, tries each distinct transaction, and n
     getTransactionReceipt: async ({ hash }) => { if (hash !== tx) throw new Error("transaction not found"); return { status: "success", blockHash, blockNumber: at, transactionHash: hash, logs: [log] }; },
   });
   const chain = (...clients) => { const c = new WalletChain(new Ctx(MAINNET)); c.clients = clients; c.bundlerHint = async () => undefined; return c; };
-  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx };
+  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: 990n };
   // Only the second RPC has the log: the first one's incomplete index does not hide it.
   const [missing, indexed] = [client([]), client([{ transactionHash: tx }])];
   assert.deepEqual(await chain(missing, indexed).searchOperation({ ...record }), expected);
