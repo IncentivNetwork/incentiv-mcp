@@ -99,7 +99,9 @@ export class WalletService {
     permitted();
   }
   private async reconcileX402Settlements(journal: Journal): Promise<void> {
+    const legacyCutoff = Date.now() - X402_RECONFIRM_MS;
     const settled = journal.data.records.filter(r => r.intent.kind === "x402_payment"
+      && (r.settledBlock !== undefined || (r.consumedAt ?? 0) > legacyCutoff)
       && r.nonce !== undefined && (r.status === "confirmed" || r.status === "reverted" || r.status === "superseded"));
     if (!settled.length) return;
     const wallet = journal.session.envelope;
@@ -493,12 +495,12 @@ export class WalletService {
     const archived = journal.data.archived?.find(a => a.requestId === requestId);
     if (archived) {
       if (archived.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
-      const nextAction = UNSENT_TERMINAL.includes(archived.status)
-        ? "This payment attempt ended before it was sent and is archived. Nothing was paid. Use a new request ID to try again."
-        : archived.status === "confirmed"
+      const paid = archived.status === "confirmed";
+      return { request_id: requestId, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archived.lastError, archived: true, content_delivered: false,
+        next_action: paid
           ? "This payment settled and its record is archived, so its answer is no longer available. Buying again with a new request ID pays again."
-          : "This payment attempt is archived. Use its status and transaction hash to check the outcome before starting a new purchase.";
-      return { request_id: requestId, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archived.lastError, archived: true, content_delivered: false, next_action: nextAction };
+          // Any outcome other than confirmed (never sent, expired, cancelled, reverted) left the seller unpaid.
+          : `This request ID's payment ended as ${archived.status}${archived.lastError ? ` (${archived.lastError})` : ""} without paying the seller, and its record is archived. This retry sent no payment. Use a new request ID to try again.` };
     }
     const existing = journal.data.records.find(r => r.requestId === requestId);
     if (existing) {
@@ -995,6 +997,10 @@ const replayable = (req: X402Request) => req.method === "GET" || !!req.headers["
  * slow settlement still returns the answer instead of finishing after the wallet stopped waiting.
  */
 const PAID_REQUEST_TIMEOUT_MS = 90_000;
+/**
+ * Reorg check window for existing settlements that predate recording their receipt block.
+ */
+const X402_RECONFIRM_MS = 60 * 60_000;
 /** Terminal x402 payments older than this are archived; the daily limit only looks back one day. */
 const COMPACT_AFTER_MS = 2 * 86_400_000;
 /** New x402 payments pause above this journal size, leaving room below the 16 MiB limit for everything else. */

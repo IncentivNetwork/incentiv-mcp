@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { WalletError } from "../src/wallet/errors.ts";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, erc20Abi, getAddress, HttpRequestError, parseAbiItem, recoverMessageAddress } from "viem";
@@ -829,7 +830,7 @@ test("a payment is signed or resent only when the balance covers it beside every
   assert.equal((await f.records()).some(r => r.requestId === third), false);
   const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: third });
   assert.equal(retry.last_error, "policy_denied");
-  assert.match(retry.next_action, /ended before it was sent.*Nothing was paid/);
+  assert.match(retry.next_action, /ended as failed.*without paying the seller/);
   assert.equal(f.seen.payments.length, 2);
 });
 
@@ -1132,4 +1133,54 @@ test("the outbound lookup refuses a public name that resolves to a private, loop
       if (ok) assert.deepEqual(result, answer); else assert.equal(error.code, "EX402PRIVATE");
     }
   } finally { dns.lookup = lookup; syncBuiltinESMExports(); }
+});
+
+test("a recent confirmation the chain drops is reopened by any status read, before a new payment can use its balance", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+  f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true });
+  let balance = "5000000";
+  f.chain.balances = async (_wallet, list) => Object.fromEntries(list.map(token => [token.toLowerCase(), token === "native" ? "1000000" : token.toLowerCase() === usdc ? balance : "0"]));
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  // A reorg drops the settlement: the seller's facilitator still holds the signed payment, which can settle again.
+  f.unsettle(); balance = "100000";
+  const reopened = await f.service.operation(id);
+  assert.equal(reopened.status, "submitted"); assert.equal(reopened.last_error, "x402_confirmation_rolled_back"); assert.equal(reopened.transaction_hash, undefined);
+  assert.equal((await f.service.get()).pending_reservations[usdc], "80000");
+  // The balance covers one payment, and the reopened one reserves it.
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), e => e.code === "policy_denied" && /beside other pending operations/.test(e.message));
+  assert.equal(f.seen.payments.length, 1);
+  // Once it settles again, it is confirmed again.
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"cd".repeat(32)}` });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+});
+
+test("a recent confirmation with an unreadable lane blocks new spend until the lane can be checked", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+  let head = 100n;
+  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true, block: head });
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}`, blockNumber: 98n });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  const laneNonce = f.chain.laneNonce;
+  f.chain.laneNonce = async () => { throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 }); };
+  await assert.rejects(f.service.operation(id), { code: "rpc_unavailable" });
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), { code: "rpc_unavailable" });
+  assert.equal(f.seen.payments.length, 1);
+  head = 226n;
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  f.chain.laneNonce = laneNonce;
+});
+
+test("retrying an archived request ID reports how it ended: a payment that never reached the seller is not called paid", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), simulate = f.chain.simulate;
+  f.chain.simulate = async () => { throw new WalletError("simulation_failed", "The exact validated operation failed simulation"); };
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), { code: "simulation_failed" });
+  f.chain.simulate = simulate;
+  const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(retry.archived, true); assert.equal(retry.status, "failed"); assert.equal(retry.last_error, "simulation_failed");
+  assert.match(retry.next_action, /ended as failed \(simulation_failed\) without paying the seller/);
+  assert.doesNotMatch(retry.next_action, /two days|paid for this request/);
+  assert.equal(f.seen.payments.length, 0);
 });
