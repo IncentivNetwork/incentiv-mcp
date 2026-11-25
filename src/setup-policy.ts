@@ -95,10 +95,15 @@ export async function promptX402(config: Config, limits: Pick<Limits, "tokens">,
   const usdc = config.manifest.canonicalTokens.USDC?.address;
   if (config.identity.chainId !== 24101 || !usdc || !Object.keys(limits.tokens).some(token => token.toLowerCase() === usdc.toLowerCase())) return undefined;
   tell("x402 lets this agent pay websites and APIs per request in USDC. Each payment also counts against the USDC limits above, and gas (about 0.03 USDC) is paid on top.");
+  // Every payment also has to pass the USDC input limit per operation, so a higher x402 maximum would never apply.
+  const cap = BigInt(Object.entries(limits.tokens).find(([token]) => token.toLowerCase() === usdc.toLowerCase())![1].perTransaction);
+  if (cap === 0n) { tell("USDC input per operation is 0, which refuses every x402 payment; raise it to allow x402."); return undefined; }
   if (!await yesNo(ask, tell, "Allow paying for x402 resources?")) return undefined;
-  const maxPerPayment = await answer(ask, tell, "USDC — maximum price per x402 payment [0.10]: ", value => {
-    const amount = allowance(value || "0.10", 6);
+  const fallback = formatUnits(cap < 100_000n ? cap : 100_000n, 6);
+  const maxPerPayment = await answer(ask, tell, `USDC — maximum price per x402 payment, at most the USDC input limit of ${formatUnits(cap, 6)} [${fallback}]: `, value => {
+    const amount = allowance(value || fallback, 6);
     if (amount === "0") throw new WalletError("validation_failed", "Set a positive maximum, or answer no to x402");
+    if (BigInt(amount) > cap) throw new WalletError("validation_failed", `The USDC input limit per operation (${formatUnits(cap, 6)} USDC) refuses larger payments; enter at most that`);
     return amount;
   });
   const origins = await answer(ask, tell, "Sites the agent may pay, as https origins separated by commas (blank allows any site): ", value => {
@@ -195,7 +200,10 @@ export function policySummary(limits: Limits, tokens: TokenInfo[], nativeSymbol 
   }
   if (limits.agentRegistry) lines.push(`  Agent Registry parents: ${limits.agentRegistry.parents.join(", ") || "none"}; connections are permanent`);
   const x402 = limits.x402;
-  lines.push(`  x402 payments: ${!x402 ? "disabled" : `up to ${formatUnits(BigInt(x402.maxPerPayment), 6)} USDC each, within the USDC limits; sites ${x402.origins.mode === "any" ? "ANY SITE" : x402.origins.origins.join(", ")}; sellers ${x402.payTo.mode === "any" ? "ANY ADDRESS" : x402.payTo.addresses.join(", ")}`}`);
+  // The USDC input limit per operation also bounds each payment, so the effective maximum is the lower of the two.
+  const usdcCap = Object.entries(limits.tokens).find(([address]) => tokens.find(t => t.address.toLowerCase() === address.toLowerCase())?.symbol === "USDC")?.[1].perTransaction;
+  const x402Max = x402 && usdcCap !== undefined && BigInt(usdcCap) < BigInt(x402.maxPerPayment) ? usdcCap : x402?.maxPerPayment;
+  lines.push(`  x402 payments: ${!x402 ? "disabled" : `up to ${formatUnits(BigInt(x402Max!), 6)} USDC each, within the USDC limits; sites ${x402.origins.mode === "any" ? "ANY SITE" : x402.origins.origins.join(", ")}; sellers ${x402.payTo.mode === "any" ? "ANY ADDRESS" : x402.payTo.addresses.join(", ")}`}`);
   lines.push(`  Recipients: ${limits.recipients.mode === "any" ? "ANY ADDRESS" : limits.recipients.addresses.join(", ") || "none (transfers blocked)"}`,
     `  Swaps: ${limits.swaps ? `enabled; ${limits.maxSlippageBps / 100}% maximum slippage, ${limits.maxQuoteDeviationBps / 100}% quote deviation` : "disabled"}`,
     `  Trusted RPCs: ${limits.trustedRpcOrigins?.join(", ") || "none"}; independent RPCs: ${limits.independentRpcOrigins.join(", ") || "none"}`,

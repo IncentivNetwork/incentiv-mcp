@@ -233,12 +233,18 @@ test("registry setup deduplicates parent addresses after case normalization", as
 
 test("guided policy offers x402 only with USDC, and records its cap, sites and sellers", async () => {
   const seller = "0x16e43840d8D79896A389a3De85aB0B0210C05685";
-  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "n", "y", "0", "0.05", "http://api.example.com", "https://api.example.com/path", "https://api.example.com, https://data.example.org", seller.toLowerCase()];
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "n", "y", "0", "20", "0.05", "http://api.example.com", "https://api.example.com/path", "https://api.example.com, https://data.example.org", seller.toLowerCase()];
   const messages = [];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, message => messages.push(message));
   assert.deepEqual(policy.x402, { origins: { mode: "allowlist", origins: ["https://api.example.com", "https://data.example.org"] }, payTo: { mode: "allowlist", addresses: [seller] }, maxPerPayment: "50000" });
   assert.equal(replies.length, 0);
   assert.match(policySummary(policy, [native, usdc]), /x402 payments: up to 0\.05 USDC each/);
+  // A maximum above the USDC input limit per operation is refused: that limit would refuse every such payment.
+  assert.ok(messages.some(m => /USDC input limit per operation \(10 USDC\) refuses larger payments/.test(m)));
+  // The summary shows the lower of the two caps.
+  const usdcKey = Object.keys(policy.tokens).find(k => k.toLowerCase() === usdc.address.toLowerCase());
+  const tighter = { ...policy, tokens: { ...policy.tokens, [usdcKey]: { ...policy.tokens[usdcKey], perTransaction: "10000" } } };
+  assert.match(policySummary(tighter, [native, usdc]), /x402 payments: up to 0\.01 USDC each/);
   // Without USDC in the policy the question is never asked.
   const nativeOnly = ["CENT", recipient, "n", "1", "100", "1000", "20", "20", "n", "n"];
   const { limits: plain } = await promptPolicy(MAINNET, async () => native, async () => { assert.ok(nativeOnly.length); return nativeOnly.shift(); }, () => {});

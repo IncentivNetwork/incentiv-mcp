@@ -103,6 +103,8 @@ const transitions: Record<OperationRecord["status"], string[]> = {
   // Only an x402 payment whose confirmation the chain no longer shows (its nonce is unused again) reopens.
   confirmed: ["submitted"], reverted: [], failed: [], cancelled: [], expired: [], superseded: [],
 };
+/** The moves above that only an x402 payment may make. */
+const X402_ONLY_TRANSITIONS = ["signed>expired", "submitting>signed", "confirmed>submitted"];
 
 /** One atomic authenticated snapshot retains every request for the wallet lifetime.
  * ponytail: linear journal reads; segment with authenticated tombstones when history exceeds 16 MiB.
@@ -153,7 +155,7 @@ export class Journal {
     await this.session.checkpoint?.(`journal_${this.data.sequence}_${this.data.records.at(-1)?.status ?? "empty"}`);
   }
   async transition(record: OperationRecord, status: OperationRecord["status"]): Promise<void> {
-    if (!transitions[record.status].includes(status)) throw new WalletError("wallet_recovery_required", "Invalid operation transition");
+    if (!transitions[record.status].includes(status) || (record.intent.kind !== "x402_payment" && X402_ONLY_TRANSITIONS.includes(`${record.status}>${status}`))) throw new WalletError("wallet_recovery_required", "Invalid operation transition");
     record.status = status; record.updatedAt = Date.now(); record.sequence = ++this.data.sequence;
     await this.save();
   }
