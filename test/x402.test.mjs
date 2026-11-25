@@ -820,3 +820,14 @@ test("operation results never carry the seller's raw terms, and an interrupted p
   assert.equal((await f.service.operation(id)).status, "failed");
   await assert.rejects(discoverResources(MAINNET, async () => ({ status: 200, headers: {}, body: Buffer.from("null"), truncated: false }), {}), { code: "x402_discovery_unavailable" });
 });
+
+test("saved POST bindings are cleared only as reviewed, older than the cutoff, with the administration passphrase", async t => {
+  const f = await x402Fixture(t), now = Date.now(), old = randomUUID(), recent = randomUUID();
+  await f.store.session(async s => { const journal = await Journal.open(s); journal.data.probes = [{ requestId: old, request: digest("a"), outcome: "not_required", at: now - 40 * 86_400_000 }, { requestId: recent, request: digest("b"), outcome: "sending", at: now }]; await journal.save(); });
+  const cutoff = now - 30 * 86_400_000, review = await f.service.x402Bindings(cutoff);
+  assert.equal(review.total, 2); assert.deepEqual(review.request_ids, [old]); assert.deepEqual(review.by_outcome, { sending: 0, not_required: 1, payment_required: 0 });
+  await assert.rejects(f.service.clearX402Bindings(cutoff, password, digest([old, recent])), { code: "approval_required" });
+  await assert.rejects(f.service.clearX402Bindings(cutoff, Buffer.from("wrong administration password"), digest(review.request_ids)));
+  assert.deepEqual(await f.service.clearX402Bindings(cutoff, password, digest(review.request_ids)), { cleared: 1, remaining: 1 });
+  assert.deepEqual((await f.store.session(async s => (await Journal.open(s)).data.probes)).map(p => p.requestId), [recent]);
+});

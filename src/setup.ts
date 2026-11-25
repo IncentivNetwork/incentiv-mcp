@@ -70,9 +70,12 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
         if (registry.agentRegistry) limits = limitsSchema.parse({ ...limits, agentRegistry: registry.agentRegistry, targets: { ...limits.targets, ...registry.targets } });
       } else tell("To connect this agent to Portal accounts, run wallet capabilities approve, then rerun setup.");
     }
-    if (!limits.x402) {
+    // x402 is asked about when it is off, and when it is on unless the user keeps it: answering no to
+    // "Allow paying" there turns it off.
+    if (!limits.x402 || !await yesNo(ask, tell, "Keep the current x402 payment permissions?", true)) {
       const x402 = await promptX402(config, limits, ask, tell);
-      if (x402) limits = limitsSchema.parse({ ...limits, x402 });
+      const { x402: _previous, ...rest } = limits;
+      limits = limitsSchema.parse({ ...rest, ...(x402 ? { x402 } : {}) });
     }
     tokens = await Promise.all(Object.keys(limits.tokens).map(token => service.chain.token(token)));
   } else {

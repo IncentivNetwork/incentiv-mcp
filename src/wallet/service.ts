@@ -459,7 +459,7 @@ export class WalletService {
       if (replayable(req)) return;
       journal.data.probes = (journal.data.probes ?? []).filter(p => p.requestId !== requestId);
       // A binding that may guard an acted-on POST is never dropped, so their number is capped instead.
-      if (outcome === "sending" && journal.data.probes.length >= MAX_PROBES) throw new WalletError("policy_denied", `This wallet already keeps ${MAX_PROBES} unpaid POST requests bound to their request IDs, so it sends no more without an Idempotency-Key header the seller honours; nothing was sent or paid`);
+      if (outcome === "sending" && journal.data.probes.length >= MAX_PROBES) throw new WalletError("policy_denied", `This wallet already keeps ${MAX_PROBES} unpaid POST requests bound to their request IDs, so it sends no more without an Idempotency-Key header the seller honours; nothing was sent or paid. The user can clear old bindings with incentiv-mcp wallet x402 clear-bindings in their own terminal`);
       if (outcome) { probe = { requestId, request, outcome, at: Date.now() }; journal.data.probes.push(probe); }
       await journal.save();
     };
@@ -744,6 +744,33 @@ export class WalletService {
       // Only the seller submits an x402 payment; this wallet never relays it, and cancels it only by replacement.
       else if (r.intent.kind !== "x402_payment" && (r.status === "signed" || r.status === "submission_unknown")) await this.submit(s, journal, r);
       return result(r);
+    });
+  }
+
+  /**
+   * The saved bindings of unpaid POSTs made at or before `cutoff`, for the user to review before clearing them.
+   * A cleared request ID is free again, so a retry under it would send its POST once more.
+   */
+  async x402Bindings(cutoff: number) {
+    return this.store.session(async s => {
+      const journal = await Journal.open(s); await this.reconcile(journal);
+      const probes = journal.data.probes ?? [], clearable = probes.filter(p => p.at <= cutoff);
+      return { wallet: publicWallet(s.envelope), cutoff: new Date(cutoff).toISOString(), total: probes.length, limit: MAX_PROBES, clearable: clearable.length,
+        by_outcome: Object.fromEntries(["sending", "not_required", "payment_required"].map(o => [o, clearable.filter(p => p.outcome === o).length])),
+        request_ids: clearable.map(p => p.requestId) };
+    });
+  }
+  /** Clears exactly the reviewed bindings, with the administration passphrase. */
+  async clearX402Bindings(cutoff: number, passphrase: Buffer, reviewedDigest: Hex) {
+    return this.store.session(async s => {
+      await authorize(s.envelope.policy, passphrase);
+      const journal = await Journal.open(s); await this.reconcile(journal);
+      const ids = (journal.data.probes ?? []).filter(p => p.at <= cutoff).map(p => p.requestId);
+      if (digest(ids) !== reviewedDigest) throw new WalletError("approval_required", "Saved POST bindings changed; review them again");
+      const cleared = new Set(ids);
+      journal.data.probes = (journal.data.probes ?? []).filter(p => !cleared.has(p.requestId));
+      journal.data.sequence++; await journal.save();
+      return { cleared: ids.length, remaining: journal.data.probes.length };
     });
   }
 

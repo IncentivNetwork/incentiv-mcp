@@ -263,3 +263,20 @@ test("setup's default gas-unit limit admits a token-paid first operation that de
   await promptPolicy(MAINNET, async ref => ({ address: ref === "CENT" ? "native" : MAINNET.manifest.canonicalTokens.USDC.address, symbol: ref, name: ref, decimals: ref === "CENT" ? 18 : 6 }), async q => { asked.push(q); return answers.shift() ?? "n"; }, m => told.push(m)).catch(() => {});
   assert.ok(told.some(m => m.includes("1,500,000 gas units") && m.includes("100,000 gwei fee ceiling")), "setup states the defaults it applies");
 });
+
+test("keeping current permissions lets the user keep, change or turn off x402 payments", async t => {
+  const old = await fixture(t), f = await fixture(t, { root: old.root, existing: true }), portal = "0x0000000000000000000000000000000000000002";
+  const registry = MAINNET.manifest.agentRegistry.proxy.address.toLowerCase(), link = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)");
+  const usdcLimits = { perTransaction: "1000000", daily: "2000000", exposure: "100000000", gasPayment: "100000" };
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false, limits: { ...s.envelope.policy.limits, tokens: { ...s.envelope.policy.limits.tokens, [usdc.address]: usdcLimits }, agentRegistry: { parents: [portal], allowUnlink: false }, targets: { ...s.envelope.policy.limits.targets, [registry]: [link] }, x402: { origins: { mode: "any" }, payTo: { mode: "any" }, maxPerPayment: "100000" } } }));
+  f.chain.token = async ref => ref.toLowerCase() === usdc.address ? usdc : native;
+  // Change: from any site to one site, at a lower maximum.
+  const changed = interaction(["", "y", "n", "y", "0.05", "https://api.example.com", "", "y", "y", "ENABLE"], join(old.parent, "changed.json"));
+  await setupWallet(f.service, f.root, changed.io);
+  assert.deepEqual((await f.service.review()).wallet.policy.limits.x402, { origins: { mode: "allowlist", origins: ["https://api.example.com"] }, payTo: { mode: "any" }, maxPerPayment: "50000" });
+  // Off: answering no to allowing x402 removes it.
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false }));
+  const off = interaction(["", "y", "n", "n", "y", "y", "ENABLE"], join(old.parent, "off.json"));
+  await setupWallet(f.service, f.root, off.io);
+  assert.equal((await f.service.review()).wallet.policy.limits.x402, undefined);
+});
