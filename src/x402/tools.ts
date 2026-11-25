@@ -41,14 +41,14 @@ export function registerX402Tools(server: McpServer, wallet: WalletService, scre
 
   add("discover_x402_resources",
     "Find paid HTTP resources on Incentiv in the x402 facilitator's catalog (Bazaar). Lists only resources this wallet can pay in USDC. Listings and their prices are not verified; check the live price with get_x402_payment_requirements.",
-    { query: z.string().max(200).optional().describe("Search words; omit to list"), limit: z.number().int().min(1).max(50).optional(), offset: z.number().int().min(0).optional() },
+    { query: z.string().max(200).optional().describe("Search words; omit to list"), limit: z.number().int().min(1).max(50).optional(), offset: z.number().int().min(0).optional().describe("Skip this many listings; for the catalog only, not with query") },
     "read", async args => {
       const found = await discoverResources(wallet.ctx.config, wallet.http, args as { query?: string; limit?: number; offset?: number });
       return { result: { ...found, resources: found.resources.map(r => screening.fields(r, ["service_name", "description"], "input")) } };
     });
 
   add("get_x402_payment_requirements",
-    "Ask an x402 resource what it costs, without paying: sends the request once unpaid and reads its 402 answer. Reports the price, whether this wallet can pay it, and whether local policy allows it. Signs nothing. The request is sent as given, POST body included, so an endpoint that does not ask for payment acts on it.",
+    "Ask an x402 resource what it costs, without paying: sends the request once unpaid and reads its 402 answer. Needs x402 on in local wallet policy and the site allowed; otherwise nothing is sent. Reports the price, whether this wallet can pay it, and whether local policy allows it. Signs nothing. The request is sent as given, POST body included, so an endpoint that does not ask for payment acts on it.",
     request, "request", async args => {
       const answer = await wallet.x402Requirements(args);
       return { result: "description" in answer || "unsupported" in answer ? screening.fields(answer as Record<string, unknown>, ["description", "unsupported"]) : answer };
@@ -62,7 +62,10 @@ export function registerX402Tools(server: McpServer, wallet: WalletService, scre
       // Seller-written text: the refusal reason and the settlement's error reason, which _meta repeats.
       const settlement = typeof answer.settlement?.error_reason === "string" ? screening.fields(answer.settlement, ["error_reason"]) : answer.settlement;
       const screened = { ...("seller_error" in answer ? screening.fields(answer, ["seller_error"]) : answer), ...(settlement ? { settlement } : {}) };
-      return { result: screened, ...(settlement ? { meta: { [PAYMENT_RESPONSE_META_KEY]: settlement } } : {}) };
+      // _meta carries the x402 SettleResponse that x402 MCP clients read, and only for a settlement the seller reported.
+      const s = settlement as { success?: boolean; transaction?: string; network?: string; payer?: string; error_reason?: string } | undefined;
+      const settleResponse = s?.success ? { success: true, ...(s.transaction ? { transaction: s.transaction } : {}), ...(s.network ? { network: s.network } : {}), ...(s.payer ? { payer: s.payer } : {}), ...(s.error_reason ? { errorReason: s.error_reason } : {}) } : undefined;
+      return { result: screened, ...(settleResponse ? { meta: { [PAYMENT_RESPONSE_META_KEY]: settleResponse } } : {}) };
     });
   return catalog;
 }

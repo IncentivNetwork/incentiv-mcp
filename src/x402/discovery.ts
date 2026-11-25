@@ -29,6 +29,8 @@ export async function discoverResources(cfg: Config, http: HttpTransport, args: 
   const base = facilitatorUrl();
   const limit = Math.min(Math.max(Math.trunc(args.limit ?? 20), 1), 50);
   const query = args.query?.trim();
+  // The search endpoint returns its best matches only; silently ignoring offset would page back to the start.
+  if (query && args.offset) throw new WalletError("validation_failed", "offset pages the catalog listing only; a search returns its best matches, so refine query instead");
   if (query && (query.length > 200 || query.split(/\s+/).length > 10)) throw new WalletError("validation_failed", "A search is at most 200 characters and 10 words");
   const params = new URLSearchParams({ type: "http", network: X402_NETWORK, scheme: X402_SCHEME, limit: String(limit) });
   if (query) params.set("query", query); else if (args.offset) params.set("offset", String(Math.max(0, Math.trunc(args.offset))));

@@ -74,7 +74,7 @@ const publicLookup: LookupFunction = (hostname, options, callback) => {
 };
 
 /** Headers a caller may not set: they belong to the transport or to the payment itself. */
-const RESERVED_HEADERS = new Set(["host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "proxy-authorization", "proxy-connection", "expect", "payment-signature", "payment-required", "payment-response", "x-payment", "x-payment-response"]);
+const RESERVED_HEADERS = new Set(["host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "proxy-authorization", "proxy-connection", "expect", "payment-signature", "payment-required", "payment-response", "x-payment", "x-payment-response", "accept-encoding"]);
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$/;
 
 /** Validates caller headers: at most 20, printable values, none reserved. */
@@ -102,7 +102,7 @@ export const directAgent = new Agent({ keepAlive: false });
 export const httpsTransport: HttpTransport = (req) => new Promise((resolve, reject) => {
   const url = checkResourceUrl(req.url);
   const body = req.body === undefined ? undefined : Buffer.from(req.body, "utf8");
-  const headers: Record<string, string> = { "user-agent": "incentiv-mcp", accept: "application/json, text/*;q=0.9, */*;q=0.5", ...req.headers };
+  const headers: Record<string, string> = { "user-agent": "incentiv-mcp", accept: "application/json, text/*;q=0.9, */*;q=0.5", ...req.headers, "accept-encoding": "identity" };
   if (body) { headers["content-length"] = String(body.length); headers["content-type"] ??= "application/json"; }
   const timeout = req.timeoutMs ?? 60_000;
   const call = httpsRequest(url, { method: req.method, headers, agent: directAgent, lookup: publicLookup, timeout }, res => {

@@ -49,9 +49,17 @@ export function responseContent(response: HttpResponse) {
   const type = response.headers["content-type"]?.slice(0, 200) ?? "application/octet-stream";
   const sha256 = createHash("sha256").update(response.body).digest("hex");
   const base = { http_status: response.status, content_type: type, bytes: response.body.length, sha256, truncated: response.truncated, third_party_content: true };
-  if (TEXTUAL.test(type) || !response.headers["content-type"]) {
-    const text = response.body.toString("utf8");
+  // Without a declared type, the body is text only if it is valid UTF-8 (a cut may end inside a character).
+  const untyped = response.headers["content-type"] ? undefined : utf8(response.body, response.truncated);
+  if (TEXTUAL.test(type) || untyped !== undefined) {
+    const text = untyped ?? response.body.toString("utf8");
     return { ...base, text: text.length > MAX_TEXT_CHARS ? text.slice(0, MAX_TEXT_CHARS) : text, truncated: response.truncated || text.length > MAX_TEXT_CHARS };
   }
   return response.body.length <= 64 * 1024 ? { ...base, base64: response.body.toString("base64") } : base;
+}
+
+function utf8(body: Buffer, truncated: boolean): string | undefined {
+  for (let cut = 0; cut <= (truncated ? 3 : 0) && cut <= body.length; cut++) {
+    try { return new TextDecoder("utf-8", { fatal: true }).decode(body.subarray(0, body.length - cut)); } catch { /* not UTF-8 at this length */ }
+  }
 }

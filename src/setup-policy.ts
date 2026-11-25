@@ -111,7 +111,7 @@ export async function promptX402(config: Config, limits: Pick<Limits, "tokens">,
     return list.map(item => {
       let url: URL;
       try { url = new URL(item); } catch { throw new WalletError("validation_failed", "Enter origins such as https://api.example.com"); }
-      if (url.protocol !== "https:" || url.origin !== item.replace(/\/$/, "")) throw new WalletError("validation_failed", "Enter https origins without a path, such as https://api.example.com");
+      if (url.protocol !== "https:" || url.pathname !== "/" || url.search || url.hash || url.username || url.password || item.endsWith("?") || item.endsWith("#")) throw new WalletError("validation_failed", "Enter https origins without a path, such as https://api.example.com");
       return url.origin;
     });
   });

@@ -76,6 +76,8 @@ export type OperationRecord = z.infer<typeof recordSchema>;
  */
 export const probeSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, outcome: z.enum(["sending", "payment_required", "not_required"]), at: z.number().int() });
 export type Probe = z.infer<typeof probeSchema>;
+/** x402 only: what is left of an ended payment once its record is archived, so its request ID stays bound for a while. */
+export const archivedSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, status: z.enum(statuses), lastError: z.string().max(64).optional(), at: z.number().int() });
 export const journalSchema = z.strictObject({
   schemaVersion: z.literal(1), walletId: z.string().uuid(), networkId: hash, manifestId: hash,
   approvedManifestIds: z.array(hash).optional(),
@@ -83,6 +85,7 @@ export const journalSchema = z.strictObject({
   implementationUpgrade: z.strictObject({ previousManifestId: hash, manifestId: hash }).optional(),
   sequence: z.number().int().nonnegative(), records: z.array(recordSchema),
   probes: z.array(probeSchema).optional(),
+  archived: z.array(archivedSchema).optional(),
 });
 export type JournalData = z.infer<typeof journalSchema>;
 export const journalApprovesManifest = (data: JournalData, id: string) => data.manifestId === id || !!data.approvedManifestIds?.includes(id);
@@ -110,12 +113,15 @@ const X402_ONLY_TRANSITIONS = ["signed>expired", "submitting>signed", "confirmed
  * ponytail: linear journal reads; segment with authenticated tombstones when history exceeds 16 MiB.
  */
 export class Journal {
+  /** The size of the journal as last read or written, in bytes. */
+  bytes = 0;
   private constructor(readonly session: WalletSession, readonly data: JournalData) {}
   static async open(session: WalletSession, initialize = false): Promise<Journal> {
     const path = join(session.directory, "operations", "journal.json");
-    let data: JournalData;
+    let data: JournalData, size = 0;
     if (await exists(path)) {
       const bytes = await readPrivate(path, 16 * 1024 * 1024);
+      size = bytes.length;
       try {
         const parsed = signedSchema.parse(JSON.parse(bytes.toString("utf8")));
         const expected = Buffer.from(Journal.mac(session, parsed.data), "hex");
@@ -138,8 +144,11 @@ export class Journal {
       if (ids.has(record.requestId) || record.intentHash !== digest(record.intent) || record.sequence > data.sequence || !journalApprovesManifest(data, manifest) || (ownsNonce(record.status) && (!record.operation || !record.userOpHash || record.nonce === undefined || (manifest !== wallet.approvedCapabilityManifestId && !compatiblePending)))) throw new WalletError("wallet_recovery_required", "Invalid journal record");
       ids.add(record.requestId);
     }
+    for (const a of data.archived ?? []) { if (ids.has(a.requestId)) throw new WalletError("wallet_recovery_required", "Invalid journal record"); ids.add(a.requestId); }
     if (new Set(data.probes?.map(p => p.requestId)).size !== (data.probes?.length ?? 0)) throw new WalletError("wallet_recovery_required", "Invalid journal record");
-    return new Journal(session, data);
+    const journal = new Journal(session, data);
+    journal.bytes = size;
+    return journal;
   }
   static mac(session: WalletSession, data: JournalData): string {
     const key = Buffer.from(hkdfSync("sha256", session.wrappingKey, Buffer.from(session.envelope.walletId), "incentiv-mcp/journal/v1", 32));
@@ -150,7 +159,8 @@ export class Journal {
     await this.session.assertOwned();
     journalSchema.parse(this.data);
     const content = canonicalJson({ data: this.data, mac: Journal.mac(this.session, this.data) });
-    if (Buffer.byteLength(content) > 16 * 1024 * 1024) throw new WalletError("wallet_recovery_required", "Journal capacity reached; authenticated migration required");
+    this.bytes = Buffer.byteLength(content);
+    if (this.bytes > 16 * 1024 * 1024) throw new WalletError("wallet_recovery_required", "Journal capacity reached; authenticated migration required");
     await replacePrivate(join(this.session.directory, "operations", "journal.json"), content, point => this.session.checkpoint?.(`journal_${this.data.records.at(-1)?.status ?? "empty"}:${point}`) ?? Promise.resolve());
     await this.session.checkpoint?.(`journal_${this.data.sequence}_${this.data.records.at(-1)?.status ?? "empty"}`);
   }

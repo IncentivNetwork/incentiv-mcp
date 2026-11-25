@@ -190,7 +190,7 @@ export class WalletService {
       const journal = await Journal.open(s);
       const intent = intentSchema.parse(await this.chain.normalize(kind, args));
       let r = journal.data.records.find(r => r.requestId === requestId);
-      if ((r && r.intentHash !== digest(intent)) || (!r && journal.data.probes?.some(p => p.requestId === requestId))) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different intent");
+      if ((r && r.intentHash !== digest(intent)) || (!r && (journal.data.probes?.some(p => p.requestId === requestId) || journal.data.archived?.some(a => a.requestId === requestId)))) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different intent");
       await this.reconcile(journal);
       if (r && terminal(r.status)) return result(r);
       if (r && ownsNonce(r.status)) {
@@ -287,7 +287,8 @@ export class WalletService {
       const deadline = Date.now() + 30_000;
       while (ownsNonce(response.status) && Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 1000));
-        response = await this.operation(requestId);
+        // An archived record is an x402 payment, which a request ID bound to this intent never is.
+        response = await this.operation(requestId) as typeof response;
       }
     }
     return response;
@@ -379,6 +380,13 @@ export class WalletService {
   /** Asks an x402 resource what it costs, without paying. Signs and records nothing. */
   async x402Requirements(args: Record<string, unknown>) {
     const req = x402Request(args);
+    // The request goes out from this computer and the endpoint may act on it, so x402 must be on and the site allowed.
+    await this.store.session(async s => {
+      const policy = s.envelope.policy;
+      if (!policy.configured) throw new WalletError("policy_not_configured", "Run incentiv-mcp setup in your local terminal; nothing was sent");
+      if (!policy.limits.x402) throw new WalletError("policy_denied", "x402 payments are off in local wallet policy, so this wallet sends no x402 requests; the user can enable them with incentiv-mcp setup");
+      if (x402Violations(policy.limits, req.origin, ZERO_ADDRESS, "0").includes("x402_origin_not_allowed")) throw new WalletError("policy_denied", "Local wallet policy does not allow this site for x402, so nothing was sent");
+    });
     const response = await this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: 30_000 });
     if (response.status !== 402) return { url: req.url, payment_required: false, content: responseContent(response), next_action: "This request needs no payment; its answer is in content." };
     const required = parsePaymentRequired(response);
@@ -426,6 +434,11 @@ export class WalletService {
     const cfg = this.ctx.config, xcfg = x402Config(cfg);
     const limits = await this.enabled(s);
     const journal = await Journal.open(s); await this.reconcile(journal);
+    const archived = journal.data.archived?.find(a => a.requestId === requestId);
+    if (archived) {
+      if (archived.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
+      return { request_id: requestId, status: archived.status, archived: true, content_delivered: false, next_action: "This request ID was used for a payment that ended more than two days ago, and its record is archived, so its answer cannot be asked for again. Nothing more was paid. Buying again with a new request ID pays again." };
+    }
     const existing = journal.data.records.find(r => r.requestId === requestId);
     if (existing) {
       if (existing.intent.kind !== "x402_payment" || existing.intent.x402!.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
@@ -502,6 +515,8 @@ export class WalletService {
     const intent = parsed.data;
     // The payment record now binds the request ID; its probe is no longer needed.
     if (journal.data.probes) journal.data.probes = journal.data.probes.filter(p => p.requestId !== requestId);
+    // Past this size, new payments wait so that transfers and recovery always have room; old ones are archived over time.
+    if (journal.bytes > X402_JOURNAL_BYTES) throw new WalletError("policy_denied", "The wallet's operation history is nearly full, so x402 payments pause until older payment records are archived and dropped (after two and 30 days); transfers still work. Nothing was paid");
     const r = await journal.create(requestId, intent);
     try {
       const key = paymentNonceKey(paymentId, validUntil);
@@ -681,6 +696,8 @@ export class WalletService {
     return this.store.session(async s => {
       const journal = await Journal.open(s); await this.reconcile(journal);
       const r = journal.data.records.find(r => r.requestId === id.toLowerCase() || r.userOpHash === id.toLowerCase());
+      const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === id.toLowerCase());
+      if (archived) return { request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status, last_error: archived.lastError, archived: true };
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
       return result(r);
     });
@@ -870,35 +887,39 @@ export function assertNeedsApproval(r: OperationRecord) {
 /** Whether a paid request may be sent again: a GET, or a POST the caller marked with an Idempotency-Key for the seller. */
 const replayable = (req: X402Request) => req.method === "GET" || !!req.headers["idempotency-key"]?.trim();
 
-/** Terminal x402 payments older than this are compacted; the daily limit only looks back one day. */
+/** Terminal x402 payments older than this are archived; the daily limit only looks back one day. */
 const COMPACT_AFTER_MS = 2 * 86_400_000;
-/** Payments that never reached a seller: nothing can send them again or ask for their answer, so they are compacted at once. */
+/** An archived payment keeps its request ID bound this long; a retry after that is no longer expected. */
+const ARCHIVE_KEEP_MS = 30 * 86_400_000;
+/** New x402 payments pause above this journal size, leaving room below the 16 MiB limit for everything else. */
+const X402_JOURNAL_BYTES = 12 * 1024 * 1024;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+/** Payments that never reached a seller: nothing can send them again or ask for their answer, so they are archived at once. */
 const UNSENT_TERMINAL = ["failed", "expired", "cancelled"];
 /** A refused unpaid request needs its binding only while a retry with its request ID is likely. */
 const REFUSED_PROBE_MS = 86_400_000;
 /** Bindings of unpaid POSTs that the resource may have acted on are kept for good, up to this many (about 2 MB). */
 const MAX_PROBES = 10_000;
 /**
- * Keeps x402 volume from filling the journal. A terminal payment keeps what binds its request ID (the request
- * digest), its outcome and what it consumed, but its seller terms become a digest and its signed operation is
- * dropped: at once if it never reached a seller, otherwise after two days, since a settled one may be asked for its
- * answer again. A refused unpaid request's binding is dropped after a day: the resource did not act on it.
+ * Keeps x402 volume from filling the journal. A terminal payment is replaced by a small archive entry that keeps
+ * only what binds its request ID (the request digest) and its outcome: at once if it never reached a seller,
+ * otherwise after two days, since a settled one may be asked for its answer again and its spend counts against the
+ * daily limit for a day. Archive entries are dropped after 30 days, and a refused unpaid request's binding after a
+ * day: the resource did not act on it.
  */
 async function compactX402(journal: Journal, now = Date.now()) {
   let changed = false;
   const probes = journal.data.probes?.filter(p => p.outcome !== "payment_required" || p.at > now - REFUSED_PROBE_MS);
   if (probes && probes.length !== journal.data.probes!.length) { journal.data.probes = probes; changed = true; }
-  for (const r of journal.data.records) {
-    const x = r.intent.x402;
-    if (r.intent.kind !== "x402_payment" || !x || x.compacted || !terminal(r.status) || (!UNSENT_TERMINAL.includes(r.status) && r.updatedAt > now - COMPACT_AFTER_MS)) continue;
-    const { resource: _resource, ...kept } = x;
-    r.intent = { ...r.intent, x402: { ...kept, accepted: digest(x.accepted), compacted: true } };
-    r.intentHash = digest(r.intent);
-    delete r.operation;
-    if (r.replacement) r.replacement.operation = {};
-    changed = true;
-  }
-  if (changed) { journal.data.sequence++; await journal.save(); }
+  const archive = (journal.data.archived ?? []).filter(a => a.at > now - ARCHIVE_KEEP_MS);
+  if (archive.length !== (journal.data.archived?.length ?? 0)) changed = true;
+  const records = journal.data.records.filter(r => {
+    if (r.intent.kind !== "x402_payment" || !terminal(r.status) || (!UNSENT_TERMINAL.includes(r.status) && r.updatedAt > now - COMPACT_AFTER_MS)) return true;
+    archive.push({ requestId: r.requestId, request: r.intent.x402!.request, status: r.status, ...(r.lastError ? { lastError: r.lastError.slice(0, 64) } : {}), at: r.updatedAt });
+    return false;
+  });
+  if (records.length !== journal.data.records.length) changed = true;
+  if (changed) { journal.data.records = records; journal.data.archived = archive; journal.data.sequence++; await journal.save(); }
 }
 
 /**
@@ -943,7 +964,7 @@ const X402_UNKNOWN_ACTION = (id: string) => `Its amount stays reserved until the
 /** An x402 record for the agent: the request and payment, without the seller's raw JSON. */
 function x402Result(r: OperationRecord) {
   const { accepted, resource, request, ...x402 } = r.intent.x402!;
-  return { ...result(r), intent: { kind: r.intent.kind, amount: formatUnits(BigInt(r.intent.amount), USDC_DECIMALS), asset: "USDC", pay_to: r.intent.to, gas_token: r.intent.gasToken, scheme: X402_SCHEME, ...x402 } };
+  return { ...result(r), intent: { kind: r.intent.kind, amount: formatUnits(BigInt(r.intent.amount), USDC_DECIMALS), asset: "USDC", pay_to: r.intent.to, gas_token: r.intent.gasToken, scheme: X402_SCHEME, ...x402, maxAmount: formatUnits(BigInt(x402.maxAmount), USDC_DECIMALS) } };
 }
 
 function result(r: OperationRecord) {

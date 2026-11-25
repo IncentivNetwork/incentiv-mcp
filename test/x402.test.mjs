@@ -567,27 +567,29 @@ test("a confirmation the chain drops reopens the payment, which is not sent agai
   assert.equal((await f.used())[usdc], "80000");
 });
 
-test("terminal x402 payments are compacted after two days, keeping the request ID's binding and the daily spend", async t => {
+test("ended x402 payments are archived after two days, keeping the request ID's binding for 30 days", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
   await f.service.operation(id);
-  const size = async () => f.store.session(async s => JSON.stringify((await Journal.open(s)).data).length);
-  const before = await size();
-  assert.equal((await f.records())[0].intent.x402.compacted, undefined); // Too recent.
-  await f.store.session(async s => { const journal = await Journal.open(s); journal.data.records[0].updatedAt -= 3 * 86_400_000; await journal.save(); });
-  await f.service.operation(id);
-  const [r] = await f.records();
-  assert.equal(r.intent.x402.compacted, true);
-  assert.match(r.intent.x402.accepted, /^0x[0-9a-f]{64}$/);
-  assert.equal(r.intent.x402.resource, undefined); assert.equal(r.operation, undefined);
-  assert.equal(r.intentHash, digest(r.intent));
-  assert.ok(await size() < before);
-  assert.equal(r.consumed[usdc], "80000");
+  const journal = () => f.store.session(async s => (await Journal.open(s)).data);
+  assert.equal((await f.records()).length, 1); // Too recent: its answer may still be asked for, and its spend counts today.
+  assert.equal((await f.used())[usdc], "80000");
+  await f.store.session(async s => { const j = await Journal.open(s); j.data.records[0].updatedAt -= 3 * 86_400_000; await j.save(); });
+  const shown = await f.service.operation(id);
+  assert.equal(shown.status, "confirmed"); assert.equal(shown.archived, true);
+  const data = await journal();
+  assert.equal(data.records.length, 0);
+  assert.deepEqual(Object.keys(data.archived[0]).sort(), ["at", "request", "requestId", "status"]);
   const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
-  assert.equal(retry.content_delivered, false); assert.match(retry.next_action, /compacted/);
+  assert.equal(retry.content_delivered, false); assert.match(retry.next_action, /archived/);
   await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.06", request_id: id }), { code: "idempotency_conflict" });
+  await assert.rejects(f.service.send("transfer", args(id)), { code: "idempotency_conflict" });
   assert.equal(f.seen.payments.length, 1);
+  // After 30 days the binding is dropped.
+  await f.store.session(async s => { const j = await Journal.open(s); j.data.archived[0].at -= 30 * 86_400_000; await j.save(); });
+  await assert.rejects(f.service.operation(id), { code: "operation_not_found" });
+  assert.equal((await journal()).archived.length, 0);
 });
 
 test("an unpaid POST answered by a 402 that is not an x402 challenge stays bound as uncertain", async t => {
@@ -710,9 +712,12 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   ({ chain, calls } = make(true, 3_000_000n, 1_500_000n));
   const old = { ...record, fromBlock: "100" };
   assert.equal(await chain.receipt(old), undefined);
-  assert.equal(old.searchedBlock, "1000099");
+  // One pass searches at most 100,000 blocks while it holds the wallet lock; later passes continue from there.
+  assert.equal(old.searchedBlock, "100099");
   assert.deepEqual(calls.logs[0], [100n, 5099n]);
-  assert.deepEqual(await chain.receipt(old), expected);
+  let found;
+  for (let pass = 0; pass < 20 && !found; pass++) found = await chain.receipt(old);
+  assert.deepEqual(found, expected);
   assert.ok(calls.logs.at(-1)[0] <= 1_500_000n && 1_500_000n <= calls.logs.at(-1)[1]);
   ({ chain, calls } = make(true, 1000n, 2000n));
   const fresh = { ...record };
@@ -748,10 +753,10 @@ test("a payment is signed or resent only when the balance covers it beside every
   const third = randomUUID();
   await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: third }), e => e.code === "policy_denied" && /maximum gas payment beside other pending operations/.test(e.message));
   assert.equal(f.seen.payments.length, 2);
-  // It never reached a seller, so its seller terms are compacted at once.
-  assert.equal((await f.service.operation(third)).status, "failed");
-  const failed = (await f.records()).find(r => r.requestId === third);
-  assert.equal(failed.intent.x402.compacted, true); assert.equal(failed.intent.x402.resource, undefined);
+  // It never reached a seller, so it is archived at once, keeping only its binding and outcome.
+  const failed = await f.service.operation(third);
+  assert.equal(failed.status, "failed"); assert.equal(failed.archived, true);
+  assert.equal((await f.records()).some(r => r.requestId === third), false);
 });
 
 test("seller-written settlement text is cut short, malformed values are dropped, and the error reason is screened", async t => {
@@ -766,7 +771,8 @@ test("seller-written settlement text is cut short, malformed values are dropped,
   const answer = await tools.pay_x402_resource({ url: URL_, max_amount: "0.05", request_id: randomUUID() });
   const result = JSON.parse(answer.content[0].text);
   assert.deepEqual(result.settlement, { success: false, error_reason: "[screened]" });
-  assert.deepEqual(answer._meta["x402/payment-response"], result.settlement);
+  // _meta carries a SettleResponse only for a settlement the seller reported.
+  assert.equal(answer._meta, undefined);
   const direct = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() });
   assert.equal(direct.settlement.error_reason.length, 300);
   assert.equal(direct.settlement.transaction, undefined); assert.equal(direct.settlement.network, undefined); assert.equal(direct.settlement.payer, undefined);
@@ -830,4 +836,39 @@ test("saved POST bindings are cleared only as reviewed, older than the cutoff, w
   await assert.rejects(f.service.clearX402Bindings(cutoff, Buffer.from("wrong administration password"), digest(review.request_ids)));
   assert.deepEqual(await f.service.clearX402Bindings(cutoff, password, digest(review.request_ids)), { cleared: 1, remaining: 1 });
   assert.deepEqual((await f.store.session(async s => (await Journal.open(s)).data.probes)).map(p => p.requestId), [recent]);
+});
+
+test("quotes send nothing while x402 is off or the site is not allowed", async t => {
+  const off = await x402Fixture(t, { policy: null });
+  await assert.rejects(off.service.x402Requirements({ url: URL_, method: "POST", body: "{}" }), e => e.code === "policy_denied" && /x402 payments are off/.test(e.message));
+  const f = await x402Fixture(t);
+  await assert.rejects(f.service.x402Requirements({ url: "https://other.example.com/x" }), e => e.code === "policy_denied" && /does not allow this site/.test(e.message));
+  assert.equal(off.seen.unpaid + f.seen.unpaid, 0);
+  assert.equal((await f.service.x402Requirements({ url: URL_ })).payment_required, true);
+});
+
+test("a paid result shows amounts in USDC, _meta carries the x402 SettleResponse, and a full journal pauses new payments", async t => {
+  const f = await x402Fixture(t), tools = {}, state = f.chain.state;
+  f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true });
+  registerX402Tools({ registerTool: (name, _config, handler) => { tools[name] = handler; } }, f.service, { fields: v => v });
+  const answer = await tools.pay_x402_resource({ url: URL_, max_amount: "0.05", request_id: randomUUID() });
+  const result = JSON.parse(answer.content[0].text);
+  assert.equal(result.intent.amount, "0.05"); assert.equal(result.intent.maxAmount, "0.05");
+  assert.deepEqual(answer._meta["x402/payment-response"], { success: true, transaction: `0x${"ab".repeat(32)}`, network: X402_NETWORK, payer: result.settlement.payer });
+  const open = Journal.open;
+  t.after(() => { Journal.open = open; });
+  Journal.open = async (...a) => Object.assign(await open.call(Journal, ...a), { bytes: 13 * 1024 * 1024 });
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), e => e.code === "policy_denied" && /nearly full/.test(e.message));
+  assert.equal(f.seen.payments.length, 1);
+});
+
+test("discovery refuses offset with a search, and untyped answers are text only when they are UTF-8", async () => {
+  await assert.rejects(discoverResources(MAINNET, async () => { throw new Error("not sent"); }, { query: "weather", offset: 20 }), { code: "validation_failed" });
+  const { responseContent } = await import("../src/x402/request.ts");
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe]);
+  assert.equal(responseContent({ status: 200, headers: {}, body: png, truncated: false }).base64, png.toString("base64"));
+  assert.equal(responseContent({ status: 200, headers: {}, body: Buffer.from("héllo"), truncated: false }).text, "héllo");
+  // A cut inside a multi-byte character is still text.
+  assert.equal(responseContent({ status: 200, headers: {}, body: Buffer.from("hé").subarray(0, 2), truncated: true }).text, "h");
+  assert.throws(() => x402Request({ url: URL_, headers: { "Accept-Encoding": "gzip" } }), { code: "validation_failed" });
 });

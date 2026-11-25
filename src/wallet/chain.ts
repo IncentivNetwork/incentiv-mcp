@@ -19,7 +19,8 @@ export { isTransportFailure };
 const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() === String(values[0]).toLowerCase());
 export const SWAP_DEADLINE_SECONDS = 60;
 /** How far back, and in what steps, an operation is looked for in EntryPoint events. */
-const SEARCH_CHUNK = 5_000n, SEARCH_BLOCKS = 1_000_000n, REORG_MARGIN = 128n;
+// One reconciliation searches at most SEARCH_PER_PASS blocks while it holds the wallet lock; saved progress continues it.
+const SEARCH_CHUNK = 5_000n, SEARCH_BLOCKS = 1_000_000n, SEARCH_PER_PASS = 100_000n, REORG_MARGIN = 128n;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
 export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
 export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string }
@@ -274,7 +275,7 @@ export class WalletChain {
   /**
    * Finds an operation's bundle in the EntryPoint's events, searching forward from the block it was signed at.
    * Only runs once the operation's nonce is used, so an unspent payment costs one read. Each call covers at most
-   * SEARCH_BLOCKS and records how far it got in `searchedBlock`, so an old payment is still reached.
+   * SEARCH_PER_PASS blocks and records how far it got in `searchedBlock`, so an old payment is still reached.
    */
   async searchOperation(record: OperationRecord): Promise<ChainReceipt | undefined> {
     const nonce = BigInt(record.nonce!), sender = record.operation!.sender as Address, entryPoint = this.ctx.config.identity.entryPoint.address;
@@ -284,7 +285,7 @@ export class WalletChain {
     if (!same(lanes)) throw new Error("RPC nonces disagree");
     if (lanes[0] <= nonce) return;
     const start = record.searchedBlock !== undefined ? BigInt(record.searchedBlock) + 1n : record.fromBlock !== undefined ? BigInt(record.fromBlock) : head > SEARCH_BLOCKS ? head - SEARCH_BLOCKS : 0n;
-    const end = start + SEARCH_BLOCKS - 1n < head ? start + SEARCH_BLOCKS - 1n : head;
+    const end = start + SEARCH_PER_PASS - 1n < head ? start + SEARCH_PER_PASS - 1n : head;
     // Progress stops short of the head, so a reorg cannot hide an event in blocks already searched.
     const settled = head > REORG_MARGIN ? head - REORG_MARGIN : 0n;
     for (let from = start; from <= end; from += SEARCH_CHUNK) {

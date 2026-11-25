@@ -233,7 +233,7 @@ test("registry setup deduplicates parent addresses after case normalization", as
 
 test("guided policy offers x402 only with USDC, and records its cap, sites and sellers", async () => {
   const seller = "0x16e43840d8D79896A389a3De85aB0B0210C05685";
-  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "n", "y", "0", "20", "0.05", "http://api.example.com", "https://api.example.com/path", "https://api.example.com, https://data.example.org", seller.toLowerCase()];
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "n", "y", "0", "20", "0.05", "http://api.example.com", "https://api.example.com/path", "https://API.Example.com:443, https://data.example.org/", seller.toLowerCase()];
   const messages = [];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, message => messages.push(message));
   assert.deepEqual(policy.x402, { origins: { mode: "allowlist", origins: ["https://api.example.com", "https://data.example.org"] }, payTo: { mode: "allowlist", addresses: [seller] }, maxPerPayment: "50000" });
