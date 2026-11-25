@@ -214,9 +214,13 @@ export class WalletChain {
   async verifyAgentLinkSignature(wallet: WalletEnvelope, digest: Hex, signature: Hex, block: bigint) {
     await this.registryRead(wallet, () => Promise.all(this.clients.map(client => assertAgentSignature(client, wallet.account as Address, digest, signature, block))));
   }
+  /**
+   * An x402 payment is built like a token transfer, on the nonce in `state` (its own lane), so its USDC gas fee
+   * comes from the pinned paymaster's own fee schedule, as for any transfer.
+   */
   async build(wallet: WalletEnvelope, intent: Intent, state: ChainState, deadline?: number) {
     const input = await this.token(intent.token), gasToken = await this.token(intent.gasToken);
-    const calls = isRegistryIntent(intent) ? [registryCall(this.ctx.config, wallet.account as Address, intent)] : intent.kind === "transfer" ? (input.address === "native" ? [{ to: intent.to as Address, value: BigInt(intent.amount), data: "0x" as Hex }] : [{ to: input.address, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [intent.to as Address, BigInt(intent.amount)] }) }]) : buildSwapCalls(this.ctx, input, await this.token(intent.tokenOut!), planRoute(this.ctx, input, await this.token(intent.tokenOut!), intent.feeTier), BigInt(intent.amount), BigInt(intent.minimumOut!), wallet.account as Address, true, BigInt(deadline!));
+    const calls = isRegistryIntent(intent) ? [registryCall(this.ctx.config, wallet.account as Address, intent)] : intent.kind === "transfer" || intent.kind === "x402_payment" ? (input.address === "native" ? [{ to: intent.to as Address, value: BigInt(intent.amount), data: "0x" as Hex }] : [{ to: input.address, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [intent.to as Address, BigInt(intent.amount)] }) }]) : buildSwapCalls(this.ctx, input, await this.token(intent.tokenOut!), planRoute(this.ctx, input, await this.token(intent.tokenOut!), intent.feeTier), BigInt(intent.amount), BigInt(intent.minimumOut!), wallet.account as Address, true, BigInt(deadline!));
     return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, calls, gasToken, state });
   }
   async simulate(validated: ReturnType<typeof validateOperation>): Promise<void> {

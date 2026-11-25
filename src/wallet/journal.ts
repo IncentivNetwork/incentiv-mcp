@@ -66,12 +66,20 @@ const recordSchema = z.strictObject({
   }).optional(),
 });
 export type OperationRecord = z.infer<typeof recordSchema>;
+/**
+ * x402 only: an unpaid request that cannot safely be sent twice (a POST without an Idempotency-Key), journaled
+ * under its request ID before it is sent, so a retry with that ID never sends it again unless it was refused
+ * with a 402, which means the resource did not act on it.
+ */
+export const probeSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, outcome: z.enum(["sending", "payment_required", "not_required"]), at: z.number().int() });
+export type Probe = z.infer<typeof probeSchema>;
 export const journalSchema = z.strictObject({
   schemaVersion: z.literal(1), walletId: z.string().uuid(), networkId: hash, manifestId: hash,
   approvedManifestIds: z.array(hash).optional(),
   approvedNetworkIds: z.array(hash).optional(),
   implementationUpgrade: z.strictObject({ previousManifestId: hash, manifestId: hash }).optional(),
   sequence: z.number().int().nonnegative(), records: z.array(recordSchema),
+  probes: z.array(probeSchema).optional(),
 });
 export type JournalData = z.infer<typeof journalSchema>;
 export const journalApprovesManifest = (data: JournalData, id: string) => data.manifestId === id || !!data.approvedManifestIds?.includes(id);
@@ -124,6 +132,7 @@ export class Journal {
       if (ids.has(record.requestId) || record.intentHash !== digest(record.intent) || record.sequence > data.sequence || !journalApprovesManifest(data, manifest) || (ownsNonce(record.status) && (!record.operation || !record.userOpHash || record.nonce === undefined || (manifest !== wallet.approvedCapabilityManifestId && !compatiblePending)))) throw new WalletError("wallet_recovery_required", "Invalid journal record");
       ids.add(record.requestId);
     }
+    if (new Set(data.probes?.map(p => p.requestId)).size !== (data.probes?.length ?? 0)) throw new WalletError("wallet_recovery_required", "Invalid journal record");
     return new Journal(session, data);
   }
   static mac(session: WalletSession, data: JournalData): string {

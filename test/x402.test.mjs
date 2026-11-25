@@ -105,7 +105,7 @@ function prepare(_chain, o) {
   const transfer = (to, amount) => ({ to: o.asset, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [to, amount] }) });
   const calls = o.gas === "native" ? [transfer(o.payTo, o.amount)] : [transfer(paymaster, GAS_FEE), transfer(o.payTo, o.amount)];
   const op = {
-    sender: o.account, nonce: paymentNonceKey(o.paymentId, o.validUntil) << 64n,
+    sender: o.account, nonce: o.nonce ?? paymentNonceKey(o.paymentId, o.validUntil) << 64n,
     factory: MAINNET.identity.accountFactory.address, factoryData: encodeFunctionData({ abi: accountFactoryAbi, functionName: "createAccount", args: [o.owner, [zero, zero], 0n] }),
     callData: encodeExecuteBatch(calls), callGasLimit: 100n, verificationGasLimit: 100n, preVerificationGas: 100n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n,
     ...(o.gas === "native" ? {} : { paymaster, paymasterVerificationGasLimit: 100n, paymasterPostOpGasLimit: 100n, paymasterData: "0x" }),
@@ -120,7 +120,10 @@ async function x402Fixture(t, { policy = x402Policy, usdcLimits = {} } = {}) {
   await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, limits: limitsSchema.parse({ ...limits, tokens, targets: { [usdc]: ["0xa9059cbb"] }, ...(policy ? { x402: policy } : {}) }) }));
   f.chain.balances = async (_wallet, list) => Object.fromEntries(list.map(token => [token.toLowerCase(), token === "native" ? "1000000" : token.toLowerCase() === usdc ? "5000000" : "0"]));
   f.chain.laneNonce = async (_wallet, key) => key << 64n;
-  f.service.x402Loader = async () => ({ ...incentiv, makeChain: () => ({}), preparePayment: async (chain, o) => prepare(chain, o) });
+  // The wallet builds the payment like a transfer; offline, the reference shape stands in for the bundler's estimate.
+  const build = f.chain.build;
+  f.chain.build = async (wallet, intent, state) => intent.kind !== "x402_payment" ? build(wallet, intent, state)
+    : prepare(undefined, { account: wallet.account, owner: wallet.owner, asset: intent.token, payTo: intent.to, amount: BigInt(intent.amount), paymentId: intent.x402.paymentId, validUntil: intent.x402.validUntil, nonce: state.nonce, gas: intent.gasToken === "native" ? "native" : "token" });
   const seen = { unpaid: 0, payments: [], headers: [], fail: 0, refuse: false };
   f.service.http = async req => {
     const header = req.headers?.["payment-signature"];
@@ -156,12 +159,19 @@ test("pays a resource within policy: the signed payment is exactly the quoted on
   assert.deepEqual(await f.used(), { [usdc]: "80000" });
   // Its own nonce lane: a transfer is not blocked while the payment settles.
   assert.equal((await f.service.send("transfer", args(randomUUID()))).status, "submitted");
-  // A retry never pays twice, even before the receipt shows: it offers the same signed payment again for the
-  // answer, and the request ID stays bound to this request.
+  // A retry never pays twice, even before the receipt shows. While the nonce is unused, the seller could still
+  // submit it, so it is not sent again; once the lane is used, the same signed payment is offered for the answer.
   assert.equal((await f.service.operation(id)).status, "submitted");
+  const early = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(early.status, "submitted"); assert.equal(early.content_delivered, false);
+  assert.match(early.next_action, /not on chain yet/);
+  assert.equal(f.seen.payments.length, 1);
+  const lane = f.chain.laneNonce;
+  f.chain.laneNonce = async (...a) => (await lane(...a)) + 1n;
   const again = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   assert.equal(again.status, "submitted"); assert.equal(again.content_delivered, true);
   assert.equal(f.seen.payments.length, 2); assert.deepEqual(f.seen.payments[1], f.seen.payments[0]);
+  f.chain.laneNonce = lane;
   assert.equal((await f.used())[usdc], "80000");
   await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.06", request_id: id }), { code: "idempotency_conflict" });
   await assert.rejects(f.service.send("transfer", args(id)), { code: "idempotency_conflict" });
@@ -456,6 +466,79 @@ test("the transport connects directly even when Node's environment proxy is on",
   proxy.close();
   assert.deepEqual(seen, []);
   assert.equal(out, "ENOTFOUND");
+});
+
+test("an x402 payment's USDC gas follows the pinned paymaster's schedule at any base fee, and passes @incentiv/x402's check", async t => {
+  const fetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = fetch; });
+  globalThis.fetch = async () => Response.json({ result: { callGasLimit: "0x30d40", verificationGasLimit: "0x7a120", preVerificationGas: "0x15f90" } });
+  const schedule = g => g <= 200_000n ? 26_000n : 26_000n + ((g - 200_000n) * 38_000n) / 600_000n;
+  const account = "0x214324E3412eD8864Da4EfB2c2D34c3281dbEe7A";
+  const paid = [];
+  // 8,093.75 gwei is the low base fee at which the reference client's CENT-quoted fee fell short of the schedule.
+  for (const base of [8_093_750_000_000n, 12_600n * 10n ** 9n, 66_400n * 10n ** 9n]) {
+    const chain = new WalletChain(new Ctx(MAINNET));
+    chain.ctx.client = { readContract: async ({ address, functionName, args }) => {
+      assert.equal(address, paymaster, `only the paymaster is read, not ${functionName}`);
+      return { usdcToken: () => usdc, usdcPoolFee: () => 500, overheadGas: () => 50_000n, maxVerificationGas: () => 2_000_000n, requiredPaymentUsdc: () => schedule(args[0]) }[functionName]();
+    } };
+    chain.token = async ref => ref === "native" ? { address: "native", symbol: "CENT", decimals: 18, name: "CENT" } : { address: getAddress(usdc), symbol: "USDC", decimals: 6, name: "USDC" };
+    const paymentId = digest(`p${base}`), validUntil = 1_800_000_000, nonce = paymentNonceKey(paymentId, validUntil) << 64n;
+    const intent = { intentSchemaVersion: 1, kind: "x402_payment", token: usdc, amount: "50000", gasToken: usdc, to: seller, slippageBps: 0, feeTier: 3000, x402: { paymentId, validUntil } };
+    const fees = { maxFeePerGas: base * 2n, maxPriorityFeePerGas: 10n ** 9n, baseFeePerGas: base };
+    const built = await chain.build({ account, owner: recipient }, intent, { deployed: true, nonce, fees, block: 1n });
+    assert.equal(built.op.nonce, nonce);
+    const decoded = incentiv.decodePaymentOp(built.op, incentiv.MAINNET);
+    incentiv.checkPaysRequirements(decoded, requirements);
+    assert.equal(built.gasToken.requiredUsdc, schedule(built.op.preVerificationGas + built.op.callGasLimit + 50_000n));
+    paid.push(built.gasToken.tokenAmount);
+  }
+  assert.equal(new Set(paid).size, 1, "the USDC gas fee does not move with the base fee");
+});
+
+test("a seller-reported settlement is not sent again under removed policy while its nonce is unused", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submitted");
+  await f.store.session(async s => { const { x402, ...rest } = s.envelope.policy.limits; await s.savePolicy({ ...s.envelope.policy, limits: rest }); });
+  const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(retry.content_delivered, false);
+  assert.equal(f.seen.payments.length, 1);
+});
+
+test("an unpaid POST is bound to its request ID before it is sent, so a retry never sends it twice", async t => {
+  // The resource needs no payment and acts on the POST: the same ID does not send it again.
+  const f = await x402Fixture(t), id = randomUUID(), post = { url: URL_, method: "POST", body: '{"order":1}', max_amount: "0.05", request_id: id };
+  let handled = 0;
+  f.service.http = async () => { handled++; return { status: 200, headers: { "content-type": "application/json" }, body: Buffer.from('{"ok":true}'), truncated: false }; };
+  assert.equal((await f.service.payX402(post)).status, "not_required");
+  const again = await f.service.payX402(post);
+  assert.equal(again.status, "not_required"); assert.match(again.next_action, /does not send it again/);
+  assert.equal(handled, 1);
+  await assert.rejects(f.service.payX402({ ...post, body: "{}" }), { code: "idempotency_conflict" });
+  await assert.rejects(f.service.send("transfer", args(id)), { code: "idempotency_conflict" });
+  // A GET is not bound: sending it again is safe.
+  const get = { url: URL_, max_amount: "0.05", request_id: randomUUID() };
+  await f.service.payX402(get); await f.service.payX402(get);
+  assert.equal(handled, 3);
+
+  // An unanswered POST may have been acted on; a refused connection proves it was not.
+  const lost = await x402Fixture(t), other = randomUUID(), lostPost = { ...post, request_id: other };
+  let failure = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+  lost.service.http = async () => { throw failure; };
+  await assert.rejects(lost.service.payX402(lostPost), e => e.code === "x402_request_failed" && /does not send it again/.test(e.message));
+  await assert.rejects(lost.service.payX402(lostPost), { code: "x402_request_uncertain" });
+  const refused = { ...post, request_id: randomUUID() };
+  failure = Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+  await assert.rejects(lost.service.payX402(refused), { code: "x402_request_failed" });
+  failure = undefined;
+  lost.service.http = async () => ({ status: 200, headers: {}, body: Buffer.from("ok"), truncated: false });
+  assert.equal((await lost.service.payX402(refused)).status, "not_required");
+
+  // A 402 means the resource did not act on it, so a retry may ask again, here after a price above max_amount.
+  const priced = await x402Fixture(t), third = { ...post, request_id: randomUUID(), max_amount: "0.01" };
+  await assert.rejects(priced.service.payX402(third), { code: "x402_price_above_max" });
+  await assert.rejects(priced.service.payX402(third), { code: "x402_price_above_max" });
+  assert.equal(priced.seen.unpaid, 2);
 });
 
 test("a paid POST is never repeated to recover its answer", async t => {
