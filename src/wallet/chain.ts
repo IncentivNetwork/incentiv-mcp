@@ -1,5 +1,5 @@
 import { AGENT_LINK_MIN_SECONDS, AGENT_LINK_REQUEST_SECONDS, assertAgentSignature, assertNotUnlink, assertRegistryApproved, freshBlockTime, hasRegistryEvent, linkBlocker, parentBlocker, readAgentLinkDigest, isContractRejection, isRegistryIntent, isTransportFailure, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
-import { createPublicClient, decodeEventLog, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
+import { createPublicClient, decodeEventLog, decodeFunctionData, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
 import { accountAbi, accountFactoryAbi, dexFactoryAbi, dexPoolAbi, entryPointAbi, erc20Abi, quoterAbi, swapRouterAbi, transferGateAbi } from "../abi.js";
@@ -248,6 +248,8 @@ export class WalletChain {
     if (matches.some(m => m.length !== 1) || !same(matches.map(m => `${m[0].success}:${m[0].actualGasCost}`))) throw new Error("Receipt event mismatch");
     let registryError: string | undefined;
     if (isRegistryIntent(record.intent) && record.userOpHash !== record.replacement?.userOpHash) {
+      // The event comes from the registry this operation called, which a later release may have moved.
+      const registry = calledRegistry(record.operation);
       const errors: (string | undefined)[] = [];
       for (const receipt of receipts) {
         const index = receipt.logs.findIndex(log => {
@@ -263,7 +265,7 @@ export class WalletChain {
         // Without that boundary this operation's logs cannot be isolated, so its registry event counts as missing.
         const logs = start < 0 ? [] : receipt.logs.slice(start + 1, index);
         // The EntryPoint result settles the nonce either way, so a missing event is reported rather than blocking the wallet.
-        let code = matches[0][0].success && !hasRegistryEvent(this.ctx.config, record.intent, record.operation.sender, logs) ? "registry_event_missing" : undefined;
+        let code = matches[0][0].success && !hasRegistryEvent(this.ctx.config, record.intent, record.operation.sender, logs, registry) ? "registry_event_missing" : undefined;
         // Revert reasons are keyed by userOpHash, so they are safe to read from the whole bundle prefix.
         for (const log of start < 0 ? receipt.logs.slice(0, index) : logs) {
           if (log.address.toLowerCase() !== this.ctx.config.identity.entryPoint.address.toLowerCase()) continue;
@@ -279,6 +281,13 @@ export class WalletChain {
     }
     return { ...matches[0][0], ...(registryError ? { registryError } : {}) };
   }
+}
+/** The registry a signed registry operation called: its last call, after any gas-token payment. Undefined if it cannot be decoded. */
+function calledRegistry(operation: Record<string, string>): Address | undefined {
+  try {
+    const { functionName, args } = decodeFunctionData({ abi: accountAbi, data: operation.callData as Hex });
+    return functionName === "executeBatch" ? (args as readonly [readonly Address[], ...unknown[]])[0].at(-1) : undefined;
+  } catch { return undefined; }
 }
 export function exactAmount(text: string, decimals: number): bigint {
   if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(text) || (text.split(".")[1]?.length ?? 0) > decimals) throw new WalletError("validation_failed", "Amount must be a positive decimal without rounding");

@@ -66,9 +66,13 @@ export class WalletService {
     if (digest(validated.spend) !== digest(r.reservation)) throw new WalletError("wallet_recovery_required", "Operation reservation does not match the signed spend");
     const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
     if (ownsNonce(r.status)) for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
-    const violations = policyViolations(limits, { ...this.registryPolicy(r.intent), token: r.intent.token, tokenOut: r.intent.tokenOut, amount: r.intent.amount, to: r.intent.to, swap: r.intent.kind === "swap", slippage: r.intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
-    if (violations.includes("exposure_limit") || (violations.length && (!this.approved(s, r) || r.approval?.liveTest))) throw new WalletError("policy_denied", "Current policy does not permit this signed operation; reservation preserved");
-    if (r.approval && !this.approved(s, r)) throw new WalletError("approval_required", "Exact-operation approval expired or policy changed; reservation preserved");
+    const policyInput = { ...this.registryPolicy(r.intent), token: r.intent.token, tokenOut: r.intent.tokenOut, amount: r.intent.amount, to: r.intent.to, swap: r.intent.kind === "swap", slippage: r.intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls };
+    const permitted = () => {
+      const violations = policyViolations(limits, policyInput);
+      if (violations.includes("exposure_limit") || (violations.length && (!this.approved(s, r) || r.approval?.liveTest))) throw new WalletError("policy_denied", "Current policy does not permit this signed operation; reservation preserved");
+      if (r.approval && !this.approved(s, r)) throw new WalletError("approval_required", "Exact-operation approval expired or policy changed; reservation preserved");
+    };
+    permitted();
     if (Object.entries(validated.spend).some(([token, amount]) => BigInt(balances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "Balance cannot cover input plus maximum gas");
     if (state.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Gas fee no longer covers the current base fee");
     if (isRegistryIntent(r.intent)) await this.chain.verifyRegistry(s.envelope, r.intent, state).catch((error: unknown) => {
@@ -81,6 +85,8 @@ export class WalletService {
     await this.chain.simulate(validated);
     await this.canSubmit(s, r);
     if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", "Operation deadline is too close; reconcile or review a same-nonce replacement");
+    // Policy and approval expiry may pass during the reads above, so they are checked again with nothing awaited before the broadcast.
+    permitted();
   }
   private async reconcile(journal: Journal): Promise<void> {
     // Connections are permanent: an unlink an earlier build left awaiting approval can never be approved, so it is cancelled.
@@ -144,13 +150,19 @@ export class WalletService {
     }
     await this.revalidate(s, journal, r);
     // Reconcile happened under the same cross-process lock before this retry.
+    const prior = r.status as "signed" | "submission_unknown";
     r.attempts++;
     await journal.transition(r, "submitting");
-    await this.canSubmit(s, r);
+    // Only a check that refused is known to have sent nothing; any other failure may follow a broadcast.
+    let refusal: { error: unknown } | undefined;
+    const check = async (step: () => Promise<void>) => { try { await step(); } catch (error) { refusal = { error }; throw error; } };
     try {
-      const returned = await this.chain.relay(r.operation, () => this.revalidate(s, journal, r));
+      await check(() => this.canSubmit(s, r));
+      const returned = await this.chain.relay(r.operation, () => check(() => this.revalidate(s, journal, r)));
       if (returned !== r.userOpHash) throw new Error();
     } catch {
+      // The request keeps its state, and the refusal keeps its own guidance, such as how to replace bytes that can never land.
+      if (refusal) { r.attempts--; await journal.transition(r, prior); throw refusal.error; }
       r.lastError = "submission_unknown";
       await journal.transition(r, "submission_unknown"); return;
     }
@@ -296,7 +308,9 @@ export class WalletService {
     if (!registryParentAllowed(limits, parent)) throw new WalletError("registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call sign_agent_link again");
     if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent. Use prepare_agent_link and the Portal approval flow");
     assertRegistryApproved(this.ctx.config, s.envelope);
-    const registry = (await Journal.open(s)).data.records.filter(r => isRegistryIntent(r.intent) && !terminal(r.status));
+    // Settle requests that already landed, so a confirmed link is not reported as still unresolved.
+    const journal = await Journal.open(s); await this.reconcile(journal);
+    const registry = journal.data.records.filter(r => isRegistryIntent(r.intent) && !terminal(r.status));
     // A link or unlink that may still land would change this agent's registry nonce, voiding any consent signed now.
     const pending = registry.find(r => ownsNonce(r.status));
     // A signed request, or one the network may have dropped, settles only when it is sent again or replaced.
@@ -444,18 +458,20 @@ export class WalletService {
       const state = await this.chain.state(s.envelope);
       // Native gas clears the nonce when the token balance or paymaster cannot.
       const gasToken = nativeGas ? "native" : r.intent.gasToken;
-      const built = await this.replacementStep(gasToken, () => this.chain.buildReplacement(s.envelope, r, state, gasToken));
+      const built = await this.replacementStep(r.requestId, gasToken, () => this.chain.buildReplacement(s.envelope, r, state, gasToken));
       const wire = userOpToJson(built.op);
       const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s, gasToken), wire, { nonce: BigInt(r.nonce!), deployed: state.deployed, hash: built.userOpHash });
-      await this.replacementStep(gasToken, () => this.chain.simulate(validated));
+      await this.replacementStep(r.requestId, gasToken, () => this.chain.simulate(validated));
       r.replacement = { operation: wire, userOpHash: validated.hash, maxGasCost: validated.gasCost.toString(), ...(gasToken !== "native" ? { gasToken, gasCharge: validated.gasCharge.toString() } : {}), signed: false, expiresAt: Date.now() + 300_000 };
       r.sequence = ++journal.data.sequence; await journal.save();
       return { wallet: publicWallet(s.envelope), records: [structuredClone(r)] };
     });
   }
   /** A stuck nonce is urgent: say what to do next rather than suggesting storage damage. */
-  private async replacementStep<T>(gasToken: string, step: () => Promise<T> | T): Promise<T> {
+  private async replacementStep<T>(id: string, gasToken: string, step: () => Promise<T> | T): Promise<T> {
     try { return await step(); } catch (error) {
+      // The paymaster's refusal suggests a new request ID, but this request still holds the nonce, so only native gas can replace it.
+      if (error instanceof WalletError && error.code === "gas_token_unavailable" && gasToken !== "native") throw new WalletError(error.code, `${error.detail.replace(/\s*Use a new request ID\b.*$/s, "")} Request ${id} still holds the account nonce, so a new request ID would be refused. To pay this replacement's gas in ${this.ctx.config.identity.nativeSymbol}, run wallet operation resolve ${id} --replace --native-gas in your local terminal.`);
       // Only gas payment problems can be cleared by paying in native gas; other errors keep their own guidance.
       if (error instanceof WalletError) throw GAS_FIXABLE_ERRORS.includes(error.code) ? new WalletError(error.code, `${error.message.slice(error.code.length + 2)}.${nativeGasHint(this.ctx.config, gasToken)}`) : error;
       if (error instanceof NetworkError) throw error;
@@ -478,7 +494,7 @@ export class WalletService {
       if (validated.gasCost.toString() !== replacement.maxGasCost) throw new WalletError("validation_failed", "Replacement gas ceiling changed");
       const gasToken = replacement.gasToken ?? "native";
       if (gasToken !== "native" && validated.gasCharge.toString() !== replacement.gasCharge) throw new WalletError("validation_failed", "Replacement token gas payment changed");
-      await this.replacementStep(gasToken, () => this.chain.simulate(validated));
+      await this.replacementStep(r.requestId, gasToken, () => this.chain.simulate(validated));
       const balances = await this.chain.balances(s.envelope, [gasToken]);
       if (BigInt(balances[gasToken] ?? "0") < validated.gasCharge) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment.${nativeGasHint(this.ctx.config, gasToken)}`);
       await this.canSubmit(s);
@@ -507,7 +523,9 @@ export class WalletService {
 const MAX_LINK_ATTEMPTS = 8;
 const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable"];
 /** Registry refusals that the same signed bytes can never get past. */
-const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed", "registry_unlink_unsupported"];
+const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed", "registry_unlink_unsupported",
+  // Connections are permanent, so an agent that is already linked, or an account role that forbids the link, does not change.
+  "registry_already_linked", "registry_ineligible"];
 const PORTAL_APPROVAL_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid"];
 /** What an agent should do after the registry reverted its request; only a link's parent consent comes from a Portal approval. */
 function registryNextAction(kind: Intent["kind"], code: string) {

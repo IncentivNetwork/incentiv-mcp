@@ -197,9 +197,10 @@ export interface PaymasterConfig {
 
 const pmConfigCache = new WeakMap<Ctx["config"], { at: number; cfg: PaymasterConfig }>();
 
-export async function getPaymasterConfig(ctx: Ctx): Promise<PaymasterConfig> {
+/** The paymaster's settings, read again once older than `maxAgeMs`. */
+export async function getPaymasterConfig(ctx: Ctx, maxAgeMs = 300_000): Promise<PaymasterConfig> {
   const cached = pmConfigCache.get(ctx.config);
-  if (cached && Date.now() - cached.at < 300_000) return cached.cfg;
+  if (cached && Date.now() - cached.at < maxAgeMs) return cached.cfg;
   const pm = ctx.config.manifest.contracts.unifiedTokenPaymaster.address;
   const read = <T,>(functionName: string) =>
     ctx.client.readContract({ address: pm, abi: paymasterAbi, functionName: functionName as never }) as Promise<T>;
@@ -361,7 +362,8 @@ export async function buildUserOpUnsigned(ctx: Ctx, opts: BuildOptions): Promise
   ]);
 
   const useGasToken = opts.gasToken && opts.gasToken.address !== NATIVE;
-  const pmCfg = useGasToken ? await getPaymasterConfig(ctx) : undefined;
+  // Read fresh: the token payment is exactly the paymaster's minimum, so a stale overheadGas would underpay.
+  const pmCfg = useGasToken ? await getPaymasterConfig(ctx, 0) : undefined;
 
   const makeCallData = (gasPayment?: { token: Address; amount: bigint }): Hex => {
     const calls = gasPayment

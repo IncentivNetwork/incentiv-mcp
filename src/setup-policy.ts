@@ -1,4 +1,5 @@
 import { formatUnits, getAddress, isAddress, parseUnits, toFunctionSelector } from "viem";
+import { registryCapability } from "./agent-registry.js";
 import type { Config } from "./config.js";
 import type { TokenInfo } from "./context.js";
 import { WalletError } from "./wallet/errors.js";
@@ -70,7 +71,21 @@ export async function promptAgentRegistry(config: Config, ask: Ask, tell: Tell):
   });
   const registry = config.manifest.agentRegistry.proxy.address.toLowerCase();
   tell(`Registry link permission will be added for ${registry}. Gas budgets still apply.`);
-  return { agentRegistry: { parents, allowUnlink: false }, targets: { [registry]: [toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)")] } };
+  return { agentRegistry: { parents, allowUnlink: false }, targets: { [registry]: [LINK_SELECTOR] } };
+}
+
+const LINK_SELECTOR = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)");
+/** Whether `limits` let this agent send link() to the manifest's current registry proxy. */
+export function hasLinkPermission(config: Config, limits: Limits): boolean {
+  const registry = config.manifest.agentRegistry?.proxy.address.toLowerCase();
+  const key = registry && Object.keys(limits.targets).find(target => target.toLowerCase() === registry);
+  return !!key && limits.targets[key].some(selector => selector.toLowerCase() === LINK_SELECTOR);
+}
+/** `limits` with link() allowed on the manifest's current registry proxy, keeping every other limit and selector. */
+export function withLinkPermission(config: Config, limits: Limits): Limits {
+  const registry = registryCapability(config).proxy.address.toLowerCase();
+  const key = Object.keys(limits.targets).find(target => target.toLowerCase() === registry) ?? registry;
+  return limitsSchema.parse({ ...limits, targets: { ...limits.targets, [key]: [...(limits.targets[key] ?? []), LINK_SELECTOR] } });
 }
 
 /**

@@ -190,10 +190,13 @@ export async function assertAgentSignature(client: PublicClient, agent: Address,
   if (!await acceptsSignature(client, agent, digest, signature, blockNumber)) throw new WalletError("registry_agent_signature_invalid", "This agent account did not accept its own link signature");
 }
 // Only inspect the log interval belonging to this operation within an EntryPoint bundle.
-export function hasRegistryEvent(cfg: Config, intent: Intent, agent: string, logs: { address: string; data: Hex; topics: readonly Hex[] }[]) {
+/**
+ * Whether `logs` hold the registry event for this intent, emitted by `proxy`: the registry the operation called, which
+ * may differ from the current manifest's after a release moves it.
+ */
+export function hasRegistryEvent(cfg: Config, intent: Intent, agent: string, logs: { address: string; data: Hex; topics: readonly Hex[] }[], proxy: string | undefined = cfg.manifest.agentRegistry?.proxy.address) {
   const event = intent.kind === "link_agent" ? "AgentLinked" : "AgentUnlinked";
   // A receipt may be reconciled under a manifest without the registry; report the event as missing rather than blocking the wallet.
-  const proxy = cfg.manifest.agentRegistry?.proxy.address;
   return !!proxy && logs.some(log => {
     if (!sameAddress(log.address, proxy)) return false;
     try {

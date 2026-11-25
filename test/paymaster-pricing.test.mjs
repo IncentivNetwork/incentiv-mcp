@@ -13,9 +13,9 @@ const schedule = g => g <= 200_000n ? 26_000n : 26_000n + ((g - 200_000n) * 38_0
 
 /** A chain whose paymaster prices by its USDC schedule and whose pools quote 1 USDC unit = 10^9 WCENT wei and 1 OTHER wei = 2 WCENT wei. */
 function fakeCtx({ overhead = 50_000n, pool = 2n, allowed = true, quoteError } = {}) {
-  const calls = [];
+  const calls = [], setOverhead = value => { overhead = value; };
   const config = structuredClone(MAINNET);
-  return { calls, config, client: { readContract: async ({ address, functionName, args }) => {
+  return { calls, config, setOverhead, client: { readContract: async ({ address, functionName, args }) => {
     calls.push([functionName, args]);
     if (address === PAYMASTER) return { usdcToken: () => USDC, usdcPoolFee: () => 500, overheadGas: () => overhead, maxVerificationGas: () => 2_000_000n, requiredPaymentUsdc: () => schedule(args[0]), allowedPaymentToken: () => allowed }[functionName]();
     const q = args[0];
@@ -84,4 +84,17 @@ test("a token-paid operation pays the schedule for its own limits, whatever the 
     paid.push(transfer.args[1]);
   }
   assert.equal(new Set(paid).size, 1, "the USDC price does not move with the base fee");
+});
+
+test("an operation to sign prices gas with the paymaster's current overhead, not a cached one", async t => {
+  const fetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = fetch; });
+  globalThis.fetch = async () => Response.json({ result: { callGasLimit: "0x30d40", verificationGasLimit: "0x7a120", preVerificationGas: "0x15f90" } });
+  const ctx = fakeCtx();
+  assert.equal((await getPaymasterConfig(ctx)).overheadGas, 50_000n);
+  // The owner raises overheadGas while the earlier read is still cached.
+  ctx.setOverhead(400_000n);
+  const fees = { maxFeePerGas: 2n * 10n ** 9n, maxPriorityFeePerGas: 10n ** 9n, baseFeePerGas: 10n ** 9n };
+  const built = await buildUserOpUnsigned(ctx, { account: "0x214324E3412eD8864Da4EfB2c2D34c3281dbEe7A", calls: [{ to: "0x0000000000000000000000000000000000000001", value: 0n, data: "0x" }], gasToken: token(USDC, "USDC", 6), state: { deployed: true, nonce: 0n, fees } });
+  assert.equal(built.gasToken.requiredUsdc, schedule(built.op.preVerificationGas + built.op.callGasLimit + 400_000n));
 });

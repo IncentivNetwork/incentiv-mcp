@@ -14,7 +14,7 @@ import { authorize, limitsSchema } from "./wallet/policy.js";
 import { digest } from "./wallet/journal.js";
 import { backupWallet } from "./wallet/backup.js";
 import { confirmedSecret, requireTerminal, secretPrompt, textPrompt } from "./wallet/cli.js";
-import { answer, policySummary, promptAgentRegistry, promptPolicy, withoutUnlink, yesNo, type Ask, type Tell } from "./setup-policy.js";
+import { answer, hasLinkPermission, policySummary, promptAgentRegistry, promptPolicy, withLinkPermission, withoutUnlink, yesNo, type Ask, type Tell } from "./setup-policy.js";
 import { connectClient, connectionFor, type SetupClient } from "./setup-client.js";
 
 export interface SetupIO {
@@ -69,6 +69,11 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
         const registry = await promptAgentRegistry(config, ask, tell);
         if (registry.agentRegistry) limits = limitsSchema.parse({ ...limits, agentRegistry: registry.agentRegistry, targets: { ...limits.targets, ...registry.targets } });
       } else tell("To connect this agent to Portal accounts, run wallet capabilities approve, then rerun setup.");
+    } else if (config.manifest.agentRegistry && limits.agentRegistry && !hasLinkPermission(config, limits)) {
+      // The approved registry moved to a new proxy: the kept parents stay, but link() is allowed only on the old address.
+      if (review.wallet.manifest_id !== config.manifest.manifestId) tell("To connect this agent to Portal accounts, run wallet capabilities approve, then rerun setup.");
+      else if (await yesNo(ask, tell, `The Agent Registry is now at ${config.manifest.agentRegistry.proxy.address.toLowerCase()}, and the kept permissions do not allow sending a link there. Add that link permission, keeping the allowed Portal accounts (${limits.agentRegistry.parents.join(", ")}) and every other limit? Connections are permanent.`, true)) limits = withLinkPermission(config, limits);
+      else tell("Kept without the new registry's link permission: each link_agent request will need terminal approval.");
     }
     tokens = await Promise.all(Object.keys(limits.tokens).map(token => service.chain.token(token)));
   } else {

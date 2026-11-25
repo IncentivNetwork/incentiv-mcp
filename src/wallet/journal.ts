@@ -63,7 +63,8 @@ export const digest = (value: unknown) => keccak256(toHex(canonicalJson(value)))
 const transitions: Record<OperationRecord["status"], string[]> = {
   preparing: ["approval_required", "signed", "failed", "cancelled"],
   approval_required: ["preparing", "expired", "cancelled"], signed: ["submitting", "superseding"],
-  submitting: ["submitted", "submission_unknown"],
+  // Back to signed only when the last check before the broadcast refused, so nothing was sent.
+  submitting: ["submitted", "submission_unknown", "signed"],
   submitted: ["confirmed", "reverted", "submission_unknown", "superseding"],
   submission_unknown: ["submitting", "submitted", "confirmed", "reverted", "superseding"],
   superseding: ["confirmed", "reverted", "superseded"],

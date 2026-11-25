@@ -197,6 +197,26 @@ test("keeping a policy from an earlier build drops its unlink permission before 
   assert.deepEqual(saved.targets[registry], [link]);
 });
 
+test("keeping permissions after the registry moves offers its link permission, keeping parents and limits", async t => {
+  const registry = MAINNET.manifest.agentRegistry.proxy.address.toLowerCase(), link = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)");
+  const earlier = "0x00000000000000000000000000000000000000aa", portal = "0x0000000000000000000000000000000000000002";
+  for (const accept of [true, false]) {
+    const old = await fixture(t), f = await fixture(t, { root: old.root, existing: true });
+    // The policy was saved when the approved registry lived at an earlier proxy.
+    await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [portal], allowUnlink: false }, targets: { ...s.envelope.policy.limits.targets, [earlier]: [link] } } }));
+    const kept = interaction(["", "y", accept ? "y" : "n", "y", "y", "ENABLE"], join(old.parent, `moved-${accept}.json`));
+    await setupWallet(f.service, f.root, kept.io);
+    assert.ok(kept.questions.some(q => q.includes(`Agent Registry is now at ${registry}`) && q.includes(portal)));
+    assert.ok(!kept.questions.some(q => q.startsWith("Allow this agent")), "the parent list is kept, not asked again");
+    const { limits: saved } = (await f.service.review()).wallet.policy;
+    assert.deepEqual(saved.agentRegistry, { parents: [portal], allowUnlink: false });
+    assert.deepEqual(saved.tokens, limits.tokens);
+    assert.deepEqual(saved.targets[earlier], [link]);
+    if (accept) assert.deepEqual(saved.targets[registry], [link]);
+    else { assert.equal(saved.targets[registry], undefined); assert.ok(kept.output.some(line => line.includes("terminal approval"))); }
+  }
+});
+
 test("MCP-created wallet can establish disabled administration before backup, and cancellation never enables it", async t => {
   const f = await fixture(t, { existing: true });
   const before = await f.store.createOrLoad();

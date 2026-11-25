@@ -1093,3 +1093,75 @@ test("the chain signs nothing from a stale block, a blocked parent or disagreein
     : args.functionName === "agentLinkDigest" ? agentLinkDigest(MAINNET, args.args[1], args.args[0], 1n, args.args[2]) : otherRead(args);
   await assert.rejects(consentChain([deployedAgent(), other]).agentLinkConsent(consentWallet, parent), { code: "validation_failed", message: /disagrees/ });
 });
+
+test("a policy that expires during the last registry read stops the broadcast", async t => {
+  const f = await registryFixture(t), id = randomUUID(), now = Date.now;
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt: now() + 60_000 } }));
+  let checks = 0, offset = 0;
+  Date.now = () => now() + offset;
+  t.after(() => { Date.now = now; });
+  // The fourth check is the one at the broadcast boundary; the policy expires while it reads.
+  f.chain.verifyRegistry = async () => { if (++checks === 4) offset = 120_000; };
+  await assert.rejects(f.service.send("link_agent", { request_id: id, approval: f.approval }), { code: "policy_denied" });
+  assert.equal(checks, 4); assert.equal(f.submissions.length, 0);
+  assert.equal((await f.service.operation(id)).status, "signed");
+});
+
+test("a stale approval at the broadcast boundary keeps its replacement guidance and the signed state", async t => {
+  const f = await registryFixture(t), id = randomUUID();
+  let checks = 0;
+  f.chain.verifyRegistry = async () => { if (++checks === 4) throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval"); };
+  await assert.rejects(f.service.send("link_agent", { request_id: id, approval: f.approval }), error => error.code === "registry_approval_stale" && new RegExp(`wallet operation resolve ${id} --replace`).test(error.message));
+  const record = (await f.service.review(id)).records[0];
+  assert.equal(record.status, "signed"); assert.equal(record.attempts, 0); assert.equal(record.lastError, undefined);
+  assert.equal(f.submissions.length, 0);
+});
+
+test("a signed link to an agent that is already linked, or ineligible, names the replacement that frees its nonce", async t => {
+  for (const [code, message] of [["registry_already_linked", "Agent is already permanently connected to a Portal account"], ["registry_ineligible", "Account roles or allowed factories do not permit this link"]]) {
+    const f = await registryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval }, submit = f.service.submit;
+    f.service.submit = async () => {}; // The process stops between signing and submission.
+    assert.equal((await f.service.send("link_agent", args)).status, "signed");
+    f.service.submit = submit;
+    f.chain.verifyRegistry = async () => { throw new WalletError(code, message); };
+    await assert.rejects(f.service.send("link_agent", args), error => error.code === code && new RegExp(`wallet operation resolve ${id} --replace`).test(error.message));
+    assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
+  }
+});
+
+test("a replacement whose gas token the paymaster refuses points to native gas for the same request, not a new one", async t => {
+  const f = await tokenRegistryFixture(t), id = randomUUID();
+  let checks = 0;
+  f.chain.verifyRegistry = async () => { if (++checks >= 3) throw new WalletError("registry_approval_stale", "Parent nonce changed"); };
+  await assert.rejects(f.service.send("link_agent", { request_id: id, approval: f.approval, gas_token: "USDC" }), { code: "registry_approval_stale" });
+  f.chain.buildReplacement = () => { throw new WalletError("gas_token_unavailable", "The paymaster does not accept USDC for gas. Use a new request ID with gas in CENT, USDC or another token get_gas_payment_options lists"); };
+  await assert.rejects(f.service.reviewReplacement(id), error => error.code === "gas_token_unavailable" && /^gas_token_unavailable: The paymaster does not accept USDC for gas\. /.test(error.message)
+    && error.message.includes(`wallet operation resolve ${id} --replace --native-gas`) && !/Use a new request ID/.test(error.message));
+});
+
+test("a link mined against an earlier registry proxy is confirmed by that proxy's event", async t => {
+  const chain = new WalletChain(new Ctx(MAINNET)), hash = `0x${"11".repeat(32)}`, tx = `0x${"22".repeat(32)}`, blockHash = `0x${"33".repeat(32)}`, earlier = "0x00000000000000000000000000000000000000aa";
+  const operationEvent = (await import('viem')).parseAbiItem('event UserOperationEvent(bytes32 indexed userOpHash,address indexed sender,address indexed paymaster,uint256 nonce,bool success,uint256 actualGasCost,uint256 actualGasUsed)');
+  const opLog = { address: MAINNET.identity.entryPoint.address, topics: encodeEventTopics({ abi: [operationEvent], eventName: "UserOperationEvent", args: { userOpHash: hash, sender: agent, paymaster: zero } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [0n, true, 200n, 100n]) };
+  const beforeExecution = { address: MAINNET.identity.entryPoint.address, topics: encodeEventTopics({ abi: (await import("viem")).parseAbi(["event BeforeExecution()"]), eventName: "BeforeExecution" }), data: "0x" };
+  let logs;
+  chain.clients.splice(0, chain.clients.length, { getTransactionReceipt: async () => ({ status: "success", transactionHash: tx, blockNumber: 10n, blockHash, logs }), getBlock: async () => ({ hash: blockHash }), getBlockNumber: async () => 12n });
+  t.mock.method(globalThis, "fetch", async () => Response.json({ result: { receipt: { transactionHash: tx } } }));
+  const i = intent(await approval()), signedFor = { ...registryCall(MAINNET, agent, i), to: earlier };
+  const record = { userOpHash: hash, nonce: "0", operation: { sender: agent, callData: encodeExecuteBatch([signedFor]) }, intent: i };
+  logs = [beforeExecution, { ...registryLog("AgentLinked"), address: earlier }, opLog];
+  assert.equal((await chain.receipt(record)).registryError, undefined);
+  // An event from the current proxy is not this operation's.
+  logs = [beforeExecution, registryLog("AgentLinked"), opLog];
+  assert.equal((await chain.receipt(record)).registryError, "registry_event_missing");
+  assert.equal(hasRegistryEvent(MAINNET, i, agent, [{ ...registryLog("AgentLinked"), address: earlier }], earlier), true);
+});
+
+test("sign_agent_link settles a link that already landed instead of calling it unresolved", async t => {
+  const f = await signedLinkFixture(t, true, { parent }), id = randomUUID();
+  assert.equal((await f.service.send("link_agent", { request_id: id, approval: f.approval })).status, "submitted");
+  f.setReceipt({ success: true, actualGasCost: 200n, transactionHash: `0x${"11".repeat(32)}` });
+  const refused = await f.service.signAgentLink(parent);
+  assert.equal(refused.link_blocked, "registry_already_linked");
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+});
