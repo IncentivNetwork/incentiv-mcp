@@ -39,6 +39,7 @@ if (args[0] === "--help" || args[0] === "-h" || (args[0] === "setup" && args[1] 
     Add --upgrade-implementation for a backup from the previous account implementation.
   incentiv-mcp wallet policy configure       Advanced policy JSON administration
   incentiv-mcp wallet x402 clear-bindings    Clear saved unpaid x402 POST bindings (--older-than-days N, default 30)
+  incentiv-mcp wallet x402 clear-archive     Clear old archived x402 payments to free journal room (--older-than-days N, default 90)
   incentiv-mcp --version                     Show version
 
 With no command, starts the local stdio MCP server. Node.js 22.18+ required.

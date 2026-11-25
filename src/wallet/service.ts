@@ -14,7 +14,7 @@ import { Journal, digest, holdsMainNonce, intentSchema, ownsNonce, terminal, typ
 import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, x402QuoteViolations, x402Violations, type Limits, type Spend } from "./policy.js";
 import { MIN_SWAP_REMAINING_SECONDS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure } from "./chain.js";
 import { validateOperation } from "./validate.js";
-import { httpsTransport, type HttpTransport } from "../x402/http.js";
+import { httpsTransport, sentNothing, type HttpTransport } from "../x402/http.js";
 import { incentivX402, parsePaymentRequired, paymentHeader, paymentNonceKey, selectRequirements, settlement, x402Config, X402_SCHEME, type PaymentRequirements, type SettleResponse } from "../x402/protocol.js";
 import { MAX_RESPONSE_BYTES, responseContent, usdcAmount, USDC_DECIMALS, x402Request, type X402Request } from "../x402/request.js";
 
@@ -110,7 +110,7 @@ export class WalletService {
       if (r.status === "signed") {
         // No network submission was started; exact bytes remain retryable. An x402 payment that was never sent
         // is known only to this computer, so once its deadline passes the seller can no longer accept it.
-        if (r.intent.kind === "x402_payment" && r.deadline! <= Math.floor(Date.now() / 1000)) { r.lastError = "x402_payment_expired"; await journal.transition(r, "expired"); }
+        if (r.intent.kind === "x402_payment" && r.deadline! <= Math.floor(Date.now() / 1000)) await this.expireUnsentX402(journal, r);
         continue;
       }
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
@@ -455,7 +455,7 @@ export class WalletService {
     const archived = journal.data.archived?.find(a => a.requestId === requestId);
     if (archived) {
       if (archived.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
-      return { request_id: requestId, status: archived.status, archived: true, content_delivered: false, next_action: "This request ID was used for a payment that ended more than two days ago, and its record is archived, so its answer cannot be asked for again. Nothing more was paid. Buying again with a new request ID pays again." };
+      return { request_id: requestId, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, archived: true, content_delivered: false, next_action: "This request ID was used for a payment that ended more than two days ago, and its record is archived, so its answer cannot be asked for again. Nothing more was paid. Buying again with a new request ID pays again." };
     }
     const existing = journal.data.records.find(r => r.requestId === requestId);
     if (existing) {
@@ -506,19 +506,19 @@ export class WalletService {
     // Only a valid x402 challenge shows the resource did not act on the request; a plain 402 may follow a side
     // effect, so the binding stays uncertain if it is not one.
     const required = parsePaymentRequired(unpaid);
-    await bind("payment_required");
     const accepted = selectRequirements(required, cfg);
+    await bind("payment_required");
     const amount = BigInt(accepted.amount);
     if (amount > maxAmount) throw new WalletError("x402_price_above_max", `The resource asks ${formatUnits(amount, USDC_DECIMALS)} USDC, above max_amount ${formatUnits(maxAmount, USDC_DECIMALS)}; nothing was paid`);
     const payTo = getAddress(accepted.payTo).toLowerCase();
     const refused = x402Violations(limits, req.origin, payTo, accepted.amount);
     if (refused.length) throw new WalletError("policy_denied", `Local wallet policy refuses this payment: ${refused.join(", ")}; nothing was paid`);
-    // Refusals that need no built operation (the price against USDC limits and the balance) come before anything is
-    // journaled, so an agent retrying a refused purchase under new request IDs cannot fill the journal.
+    // Refusals that need no built operation (the price against USDC limits, exposure and the balance) come before
+    // anything is journaled, so an agent retrying a refused purchase under new request IDs cannot fill the journal.
     const [state, balances] = await Promise.all([this.chain.state(s.envelope), this.chain.balances(s.envelope, this.balanceTokens(limits))]);
     assertDeploysOnce(state.deployed, journal);
     const price: Spend = { [xcfg.usdc.toLowerCase()]: accepted.amount };
-    const priced = policyViolations(limits, { token: xcfg.usdc.toLowerCase(), amount: accepted.amount, swap: false, slippage: 0, spend: price, used: journal.used(), balances: {}, gasCost: 0n, fee: 0n, gasUnits: 0n, gasToken, gasCharge: 0n, calls: [], x402: { origin: req.origin, payTo } });
+    const priced = policyViolations(limits, { token: xcfg.usdc.toLowerCase(), amount: accepted.amount, swap: false, slippage: 0, spend: price, used: journal.used(), balances, gasCost: 0n, fee: 0n, gasUnits: 0n, gasToken, gasCharge: 0n, calls: [], x402: { origin: req.origin, payTo } });
     if (priced.length) throw new WalletError("policy_denied", `Local wallet policy refuses this payment: ${priced.join(", ")}; nothing was paid`);
     if (!covers(balances, journal, price)) throw new WalletError("policy_denied", "Balance cannot cover the price beside other pending operations; nothing was paid");
 
@@ -534,7 +534,7 @@ export class WalletService {
     // The payment record now binds the request ID; its probe is no longer needed.
     if (journal.data.probes) journal.data.probes = journal.data.probes.filter(p => p.requestId !== requestId);
     // Past this size, new payments wait so that transfers and recovery always have room; old ones are archived over time.
-    if (journal.bytes > X402_JOURNAL_BYTES) throw new WalletError("policy_denied", "The wallet's operation history is nearly full, so x402 payments pause until older payment records are archived and dropped (after two and 30 days); transfers still work. Nothing was paid");
+    if (journal.bytes > X402_JOURNAL_BYTES) throw new WalletError("policy_denied", "The wallet's operation history is nearly full, so x402 payments pause; transfers still work. Nothing was paid. The user can free room by clearing old archived payments with incentiv-mcp wallet x402 clear-archive in their own terminal");
     const r = await journal.create(requestId, intent);
     try {
       const key = paymentNonceKey(paymentId, validUntil);
@@ -597,7 +597,6 @@ export class WalletService {
    */
   private async redeliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request) {
     const x = r.intent.x402!;
-    if (x.compacted) return { ...x402Result(r), content_delivered: false, next_action: "This payment settled long ago and its payment details were compacted, so its answer cannot be asked for again. Nothing more was paid. Buying again with a new request ID pays again." };
     let response: Awaited<ReturnType<typeof this.http>> | undefined;
     // Neither a seller's report nor a confirmation the chain later drops is proof: while the nonce is unused, the
     // seller could still submit the payment, so sending it again would be a send under no current policy.
@@ -611,7 +610,7 @@ export class WalletService {
     }
     if (replayable(req)) {
       const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
-      response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES }).catch(() => undefined);
+      response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: PAID_REQUEST_TIMEOUT_MS }).catch(() => undefined);
       if (response && response.status >= 200 && response.status < 300) {
         r.delivered = true; r.sequence = ++journal.data.sequence; await journal.save();
         // From here the nonce is known to be used, so the payment cannot be charged again.
@@ -627,8 +626,20 @@ export class WalletService {
 
   /** The seller's deadline passed: an unsent payment expires; one the seller may hold stays reserved until resolved. */
   private async pastDeadlineX402(journal: Journal, r: OperationRecord) {
-    if (r.status === "signed") { r.lastError = "x402_payment_expired"; await journal.transition(r, "expired"); return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." }; }
+    if (r.status === "signed" && await this.expireUnsentX402(journal, r)) return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." };
     return { ...x402Result(r), next_action: X402_UNKNOWN_ACTION(r.requestId) };
+  }
+  /**
+   * Expires a signed payment past its deadline. The chain does not enforce that deadline, so this happens only while
+   * its nonce lane is unused: a used lane means the seller got it after all, and it stays reserved until its receipt
+   * is found. When the lane cannot be read, the payment stays signed and is checked again later. Returns whether it expired.
+   */
+  private async expireUnsentX402(journal: Journal, r: OperationRecord): Promise<boolean> {
+    const lane = await this.chain.stateFor(journal.session.envelope, r).catch(() => undefined);
+    if (!lane) return false;
+    if (lane.nonce === BigInt(r.nonce!)) { r.lastError = "x402_payment_expired"; await journal.transition(r, "expired"); return true; }
+    r.lastError = "submission_unknown"; await journal.transition(r, "submission_unknown");
+    return false;
   }
   /** Sends the signed payment with the request, and records what the seller answered. */
   private async deliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request, limits: Limits) {
@@ -651,7 +662,7 @@ export class WalletService {
     if (x.validUntil <= Math.floor(Date.now() / 1000)) { await unsent(); return this.pastDeadlineX402(journal, r); }
     const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
     let response;
-    try { response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES }); }
+    try { response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: PAID_REQUEST_TIMEOUT_MS }); }
     catch (error) {
       // Some failures prove no request was written: the name did not resolve (or resolved somewhere private), the
       // connection was refused or unreachable, or TLS verification failed before any data was sent.
@@ -714,8 +725,8 @@ export class WalletService {
     return this.store.session(async s => {
       const journal = await Journal.open(s); await this.reconcile(journal);
       const r = journal.data.records.find(r => r.requestId === id.toLowerCase() || r.userOpHash === id.toLowerCase());
-      const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === id.toLowerCase());
-      if (archived) return { request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status, last_error: archived.lastError, archived: true };
+      const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === id.toLowerCase() || a.userOpHash === id.toLowerCase());
+      if (archived) return { request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archived.lastError, archived: true };
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
       return result(r);
     });
@@ -806,6 +817,28 @@ export class WalletService {
       journal.data.probes = (journal.data.probes ?? []).filter(p => !cleared.has(p.requestId));
       journal.data.sequence++; await journal.save();
       return { cleared: ids.length, remaining: journal.data.probes.length };
+    });
+  }
+
+  /** Archived x402 payments ended at or before `cutoff`, for the user to review before clearing them. */
+  async x402Archive(cutoff: number) {
+    return this.store.session(async s => {
+      const journal = await Journal.open(s); await this.reconcile(journal);
+      const archive = journal.data.archived ?? [], clearable = archive.filter(a => a.at <= cutoff);
+      return { wallet: publicWallet(s.envelope), cutoff: new Date(cutoff).toISOString(), total: archive.length, journal_bytes: journal.bytes, clearable: clearable.length, request_ids: clearable.map(a => a.requestId) };
+    });
+  }
+  /** Clears exactly the reviewed archive entries, with the administration passphrase. Their request IDs could then pay again. */
+  async clearX402Archive(cutoff: number, passphrase: Buffer, reviewedDigest: Hex) {
+    return this.store.session(async s => {
+      await authorize(s.envelope.policy, passphrase);
+      const journal = await Journal.open(s); await this.reconcile(journal);
+      const ids = (journal.data.archived ?? []).filter(a => a.at <= cutoff).map(a => a.requestId);
+      if (digest(ids) !== reviewedDigest) throw new WalletError("approval_required", "Archived payments changed; review them again");
+      const cleared = new Set(ids);
+      journal.data.archived = (journal.data.archived ?? []).filter(a => !cleared.has(a.requestId));
+      journal.data.sequence++; await journal.save();
+      return { cleared: ids.length, remaining: journal.data.archived.length, journal_bytes: journal.bytes };
     });
   }
 
@@ -909,10 +942,13 @@ export function assertNeedsApproval(r: OperationRecord) {
 /** Whether a paid request may be sent again: a GET, or a POST the caller marked with an Idempotency-Key for the seller. */
 const replayable = (req: X402Request) => req.method === "GET" || !!req.headers["idempotency-key"]?.trim();
 
+/**
+ * How long a paid request waits for its answer: longer than the stock facilitator's 60-second settle window, so a
+ * slow settlement still returns the answer instead of finishing after the wallet stopped waiting.
+ */
+const PAID_REQUEST_TIMEOUT_MS = 90_000;
 /** Terminal x402 payments older than this are archived; the daily limit only looks back one day. */
 const COMPACT_AFTER_MS = 2 * 86_400_000;
-/** An archived payment keeps its request ID bound this long; a retry after that is no longer expected. */
-const ARCHIVE_KEEP_MS = 30 * 86_400_000;
 /** New x402 payments pause above this journal size, leaving room below the 16 MiB limit for everything else. */
 const X402_JOURNAL_BYTES = 12 * 1024 * 1024;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -924,20 +960,19 @@ const REFUSED_PROBE_MS = 86_400_000;
 const MAX_PROBES = 10_000;
 /**
  * Keeps x402 volume from filling the journal. A terminal payment is replaced by a small archive entry that keeps
- * only what binds its request ID (the request digest) and its outcome: at once if it never reached a seller,
+ * what binds its request ID (the request digest), its outcome and its hashes: at once if it never reached a seller,
  * otherwise after two days, since a settled one may be asked for its answer again and its spend counts against the
- * daily limit for a day. Archive entries are dropped after 30 days, and a refused unpaid request's binding after a
- * day: the resource did not act on it.
+ * daily limit for a day. Archive entries are kept, so a request ID never pays twice, until the user clears old ones
+ * (wallet x402 clear-archive). A refused unpaid request's binding is dropped after a day: the resource did not act on it.
  */
 async function compactX402(journal: Journal, now = Date.now()) {
   let changed = false;
   const probes = journal.data.probes?.filter(p => p.outcome !== "payment_required" || p.at > now - REFUSED_PROBE_MS);
   if (probes && probes.length !== journal.data.probes!.length) { journal.data.probes = probes; changed = true; }
-  const archive = (journal.data.archived ?? []).filter(a => a.at > now - ARCHIVE_KEEP_MS);
-  if (archive.length !== (journal.data.archived?.length ?? 0)) changed = true;
+  const archive = [...journal.data.archived ?? []];
   const records = journal.data.records.filter(r => {
     if (r.intent.kind !== "x402_payment" || !terminal(r.status) || (!UNSENT_TERMINAL.includes(r.status) && r.updatedAt > now - COMPACT_AFTER_MS)) return true;
-    archive.push({ requestId: r.requestId, request: r.intent.x402!.request, status: r.status, ...(r.lastError ? { lastError: r.lastError.slice(0, 64) } : {}), at: r.updatedAt });
+    archive.push({ requestId: r.requestId, request: r.intent.x402!.request, status: r.status, ...(r.lastError ? { lastError: r.lastError.slice(0, 64) } : {}), ...(r.userOpHash ? { userOpHash: r.userOpHash } : {}), ...(r.transactionHash ? { transactionHash: r.transactionHash } : {}), at: r.updatedAt });
     return false;
   });
   if (records.length !== journal.data.records.length) changed = true;
@@ -970,10 +1005,14 @@ function sellerSettlement(settled: SettleResponse | undefined) {
   return { success: settled.success === true, ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)) } as { success: boolean; transaction?: string; network?: string; payer?: string; error_reason?: string };
 }
 
-/** Transport failures that prove no request bytes reached the seller. */
-const NEVER_SENT_CODES = ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY"];
+/**
+ * Transport failures that can only happen before any request bytes are written: name resolution, a refused
+ * connection and TLS verification. ENETUNREACH and EHOSTUNREACH are not here: an established connection can end
+ * with them after the request went out, so only the transport's own connection state (sentNothing) counts them.
+ */
+const NEVER_SENT_CODES = ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY"];
 function neverSent(error: unknown) {
-  return error instanceof WalletError || NEVER_SENT_CODES.includes((error as { code?: string } | undefined)?.code ?? "");
+  return error instanceof WalletError || sentNothing(error) || NEVER_SENT_CODES.includes((error as { code?: string } | undefined)?.code ?? "");
 }
 
 /** Policy expiry is checked again at the last moment before a payment is signed or first leaves this computer. */

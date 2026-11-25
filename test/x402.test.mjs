@@ -288,13 +288,13 @@ test("a first purchase rechecks policy expiry after simulation, before signing a
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const expiring = async () => {
     const f = await x402Fixture(t);
-    await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt: Date.now() + 150 } }));
+    await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt: Date.now() + 1500 } }));
     return f;
   };
   // Expires while the operation is simulated: nothing is signed or sent.
   const during = await expiring(), id = randomUUID();
   const simulate = during.chain.simulate.bind(during.chain);
-  during.chain.simulate = async validated => { await sleep(250); return simulate(validated); };
+  during.chain.simulate = async validated => { await sleep(2500); return simulate(validated); };
   await assert.rejects(during.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), e => e.code === "policy_denied" && /expired.*nothing was paid/.test(e.message));
   assert.equal(during.seen.payments.length, 0);
   assert.equal((await during.service.operation(id)).status, "failed");
@@ -302,7 +302,7 @@ test("a first purchase rechecks policy expiry after simulation, before signing a
   // Expires after signing, before the payment first leaves: it stays unsent and expires at its deadline.
   const after = await expiring(), other = randomUUID();
   const stateFor = after.chain.stateFor.bind(after.chain);
-  after.chain.stateFor = async (...a) => { await sleep(250); return stateFor(...a); };
+  after.chain.stateFor = async (...a) => { await sleep(2500); return stateFor(...a); };
   await assert.rejects(after.service.payX402({ url: URL_, max_amount: "0.05", request_id: other }), e => e.code === "policy_denied" && /policy_expired.*never sent/.test(e.message));
   assert.equal(after.seen.payments.length, 0);
   assert.equal((await after.service.operation(other)).status, "signed");
@@ -567,7 +567,7 @@ test("a confirmation the chain drops reopens the payment, which is not sent agai
   assert.equal((await f.used())[usdc], "80000");
 });
 
-test("ended x402 payments are archived after two days, keeping the request ID's binding for 30 days", async t => {
+test("ended x402 payments are archived after two days with their hashes, and stay bound until the user clears them", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
@@ -580,16 +580,38 @@ test("ended x402 payments are archived after two days, keeping the request ID's 
   assert.equal(shown.status, "confirmed"); assert.equal(shown.archived, true);
   const data = await journal();
   assert.equal(data.records.length, 0);
-  assert.deepEqual(Object.keys(data.archived[0]).sort(), ["at", "request", "requestId", "status"]);
+  assert.deepEqual(Object.keys(data.archived[0]).sort(), ["at", "request", "requestId", "status", "transactionHash", "userOpHash"]);
+  // The user operation hash still finds it, and the settlement transaction is still reported.
+  const byHash = await f.service.operation(data.archived[0].userOpHash);
+  assert.equal(byHash.request_id, id); assert.equal(byHash.transaction_hash, `0x${"ab".repeat(32)}`); assert.equal(byHash.archived, true);
   const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   assert.equal(retry.content_delivered, false); assert.match(retry.next_action, /archived/);
   await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.06", request_id: id }), { code: "idempotency_conflict" });
   await assert.rejects(f.service.send("transfer", args(id)), { code: "idempotency_conflict" });
   assert.equal(f.seen.payments.length, 1);
-  // After 30 days the binding is dropped.
-  await f.store.session(async s => { const j = await Journal.open(s); j.data.archived[0].at -= 30 * 86_400_000; await j.save(); });
+  // Months later the request ID is still bound, so a retry never pays twice.
+  await f.store.session(async s => { const j = await Journal.open(s); j.data.archived[0].at -= 365 * 86_400_000; await j.save(); });
+  assert.match((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).next_action, /archived/);
+  assert.equal(f.seen.payments.length, 1);
+  // Only the user frees it, with the administration passphrase, after reviewing exactly what is cleared.
+  const cutoff = Date.now() - 90 * 86_400_000, review = await f.service.x402Archive(cutoff);
+  assert.deepEqual(review.request_ids, [id]);
+  await assert.rejects(f.service.clearX402Archive(cutoff, password, digest([])), { code: "approval_required" });
+  await assert.rejects(f.service.clearX402Archive(cutoff, Buffer.from("wrong administration password"), digest(review.request_ids)));
+  assert.equal((await f.service.clearX402Archive(cutoff, password, digest(review.request_ids))).cleared, 1);
   await assert.rejects(f.service.operation(id), { code: "operation_not_found" });
   assert.equal((await journal()).archived.length, 0);
+});
+
+test("a payment the seller may still settle is never archived, however old", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  f.seen.fail = 1; // The seller does not answer: the payment may or may not settle.
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submission_unknown");
+  await f.store.session(async s => { const j = await Journal.open(s); j.data.records[0].updatedAt -= 3 * 86_400_000; await j.save(); });
+  const shown = await f.service.operation(id);
+  assert.equal(shown.status, "submission_unknown"); assert.equal(shown.archived, undefined);
+  assert.equal((await f.records()).length, 1);
+  assert.equal((await f.used())[usdc], "80000");
 });
 
 test("an unpaid POST answered by a 402 that is not an x402 challenge stays bound as uncertain", async t => {
@@ -691,7 +713,7 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   assert.equal(calls.logs.length, 0);
   ({ chain, calls } = make(true));
   assert.deepEqual(await chain.receipt({ ...record, transactionHash: wrong }), expected);
-  assert.deepEqual([...new Set(calls.logs.map(String))], ["500,1000"]); // Every RPC searches the same range. // From the head back to the block it was signed at.
+  assert.deepEqual([...new Set(calls.logs.map(String))], ["500,1000"]); // Every RPC searches forward from the block it was signed at.
   ({ chain, calls } = make(true));
   assert.deepEqual(await chain.receipt(record), expected);
   // A stale bundler hash, one that fails verification or is no longer found, falls through to the other sources.
@@ -871,4 +893,163 @@ test("discovery refuses offset with a search, and untyped answers are text only 
   // A cut inside a multi-byte character is still text.
   assert.equal(responseContent({ status: 200, headers: {}, body: Buffer.from("hé").subarray(0, 2), truncated: true }).text, "h");
   assert.throws(() => x402Request({ url: URL_, headers: { "Accept-Encoding": "gzip" } }), { code: "validation_failed" });
+});
+
+test("an error on an established connection leaves a payment uncertain; only a failure before connecting proves nothing was sent", async t => {
+  const { NOT_SENT, directAgent, httpsTransport } = await import("../src/x402/http.ts");
+  const { Socket } = await import("node:net");
+  const create = directAgent.createConnection;
+  const unreachable = connected => () => {
+    const socket = new Socket();
+    socket.connecting = true; // Writes wait for the connection, as they do on a real socket.
+    setImmediate(() => { if (connected) socket.emit("secureConnect"); socket.emit("error", Object.assign(new Error("read EHOSTUNREACH"), { code: "EHOSTUNREACH" })); socket.destroy(); });
+    return socket;
+  };
+  try {
+    for (const connected of [false, true]) {
+      directAgent.createConnection = unreachable(connected);
+      const error = await httpsTransport({ url: URL_, method: "GET", maxBytes: 1024 }).then(() => undefined, e => e);
+      assert.equal(error?.code, "EHOSTUNREACH");
+      assert.equal(error[NOT_SENT] === true, !connected);
+    }
+  } finally { directAgent.createConnection = create; }
+  // In the wallet: the same code after connecting may have delivered the payment; before connecting it did not.
+  for (const [notSent, status] of [[false, "submission_unknown"], [true, "signed"]]) {
+    const f = await x402Fixture(t), id = randomUUID(), http = f.service.http;
+    f.service.http = async req => {
+      if (!req.headers?.["payment-signature"]) return http(req);
+      const error = Object.assign(new Error("read ENETUNREACH"), { code: "ENETUNREACH" });
+      if (notSent) Object.defineProperty(error, NOT_SENT, { value: true });
+      throw error;
+    };
+    await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }).catch(() => undefined);
+    assert.equal((await f.service.operation(id)).status, status);
+  }
+});
+
+test("a signed payment past its deadline expires only while its nonce lane is unused", async t => {
+  for (const laneUsed of [false, true]) {
+    const f = await x402Fixture(t), id = randomUUID(), http = f.service.http;
+    f.service.http = async req => {
+      if (!req.headers?.["payment-signature"]) return http(req);
+      throw Object.defineProperty(new Error("connect failed"), (await import("../src/x402/http.ts")).NOT_SENT, { value: true });
+    };
+    await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), { code: "x402_request_failed" });
+    assert.equal((await f.service.operation(id)).status, "signed");
+    const deadline = (await f.records())[0].deadline;
+    if (laneUsed) await f.settle(undefined); // The seller got the payment after all and its lane is used, not yet found.
+    const now = Date.now;
+    Date.now = () => (deadline + 1) * 1000;
+    try {
+      const shown = await f.service.operation(id);
+      assert.equal(shown.status, laneUsed ? "submission_unknown" : "expired");
+      assert.equal((await f.used())[usdc], laneUsed ? "80000" : undefined);
+    } finally { Date.now = now; }
+  }
+});
+
+test("a lane read that fails keeps a past-deadline payment signed until it can be checked", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), http = f.service.http;
+  const { NOT_SENT } = await import("../src/x402/http.ts");
+  f.service.http = async req => { if (!req.headers?.["payment-signature"]) return http(req); throw Object.defineProperty(new Error("x"), NOT_SENT, { value: true }); };
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }).catch(() => undefined);
+  const deadline = (await f.records())[0].deadline, laneNonce = f.chain.laneNonce, now = Date.now;
+  f.chain.laneNonce = async () => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 503 }); };
+  Date.now = () => (deadline + 1) * 1000;
+  try {
+    assert.equal((await f.service.operation(id)).status, "signed");
+    f.chain.laneNonce = laneNonce;
+    assert.equal((await f.service.operation(id)).status, "expired");
+  } finally { Date.now = now; }
+});
+
+test("a reorg that reopens a payment signed under an earlier approved manifest keeps the journal readable", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  // A capability approval since then: the payment's manifest is an earlier approved one.
+  const earlier = `0x${"5e".repeat(32)}`;
+  await f.store.session(async s => { const j = await Journal.open(s); j.data.approvedManifestIds = [...(j.data.approvedManifestIds ?? []), earlier]; j.data.records[0].manifestId = earlier; await j.save(); });
+  f.unsettle();
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submitted");
+  assert.equal((await f.service.operation(id)).status, "submitted");
+  assert.equal((await f.used())[usdc], "80000");
+  assert.ok((await f.service.get()).pending_operations.some(o => o.request_id === id));
+});
+
+test("a payment window too short to prepare and send in is refused before anything is journaled", async t => {
+  const f = await x402Fixture(t), http = f.service.http;
+  f.service.http = async req => req.headers?.["payment-signature"] ? http(req) : { status: 402, headers: { "payment-required": encodePaymentRequiredHeader({ x402Version: 2, resource: { url: req.url }, accepts: [{ ...requirements, maxTimeoutSeconds: 5 }] }) }, body: Buffer.from("{}"), truncated: false };
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), e => e.code === "x402_unsupported" && /5 seconds/.test(e.message));
+  assert.equal((await f.records()).length, 0);
+  assert.equal(selectRequirements({ x402Version: 2, accepts: [{ ...requirements, maxTimeoutSeconds: 30 }] }, MAINNET).maxTimeoutSeconds, 30);
+});
+
+test("a token the policy does not cover refuses a payment before anything is journaled", async t => {
+  const f = await x402Fixture(t), wcent = MAINNET.manifest.contracts.wcent.address.toLowerCase(), balances = f.chain.balances;
+  f.chain.balances = async (wallet, list) => ({ ...await balances(wallet, list), [wcent]: "1" });
+  f.service.balanceTokens = () => ["native", usdc, wcent];
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), e => e.code === "policy_denied" && /exposure_limit/.test(e.message));
+  assert.equal((await f.records()).length, 0);
+});
+
+test("a malformed x402 challenge to an unpaid POST keeps the POST bound as uncertain", async t => {
+  const f = await x402Fixture(t), post = { url: URL_, method: "POST", body: "{}", max_amount: "0.05", request_id: randomUUID() };
+  let handled = 0;
+  f.service.http = async () => { handled++; return { status: 402, headers: { "payment-required": encodePaymentRequiredHeader({ x402Version: 2, resource: { url: URL_ }, accepts: [{}] }) }, body: Buffer.from("{}"), truncated: false }; };
+  await assert.rejects(f.service.payX402(post), { code: "x402_unsupported" });
+  await assert.rejects(f.service.payX402(post), { code: "x402_request_uncertain" });
+  assert.equal(handled, 1);
+});
+
+test("the receipt search reads every RPC, tries each distinct transaction, and narrows ranges an RPC refuses", async () => {
+  const event = parseAbiItem("event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)");
+  const sender = "0x30a343d137ed0492d9d7ad25fc55590d807629b3", userOpHash = `0x${"77".repeat(32)}`, nonce = (5n << 64n) | 3n;
+  const tx = `0x${"aa".repeat(32)}`, stale = `0x${"bb".repeat(32)}`, blockHash = `0x${"cc".repeat(32)}`, at = 990n;
+  const log = { address: entryPoint, topics: encodeEventTopics({ abi: [event], eventName: "UserOperationEvent", args: { userOpHash, sender, paymaster } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [nonce, true, 1234n, 1n]) };
+  const record = { requestId: randomUUID(), intent: { kind: "x402_payment" }, userOpHash, nonce: nonce.toString(), fromBlock: "500", operation: { sender, paymaster } };
+  const client = (logs, maxRange) => ({
+    ranges: [],
+    getBlockNumber: async () => 1000n,
+    getBlock: async () => ({ hash: blockHash }),
+    readContract: async () => nonce + 1n,
+    async getLogs({ fromBlock, toBlock }) {
+      this.ranges.push([fromBlock, toBlock]);
+      if (maxRange && toBlock - fromBlock > maxRange) throw new Error("query returned more than 10000 results");
+      return fromBlock <= at && at <= toBlock ? logs : [];
+    },
+    getTransactionReceipt: async ({ hash }) => { if (hash !== tx) throw new Error("transaction not found"); return { status: "success", blockHash, blockNumber: at, transactionHash: hash, logs: [log] }; },
+  });
+  const chain = (...clients) => { const c = new WalletChain(new Ctx(MAINNET)); c.clients = clients; c.bundlerHint = async () => undefined; return c; };
+  const expected = { success: true, actualGasCost: 1234n, transactionHash: tx };
+  // Only the second RPC has the log: the first one's incomplete index does not hide it.
+  const [missing, indexed] = [client([]), client([{ transactionHash: tx }])];
+  assert.deepEqual(await chain(missing, indexed).searchOperation({ ...record }), expected);
+  // One RPC's stale log comes first; the canonical one from the other is still verified.
+  assert.deepEqual(await chain(client([{ transactionHash: stale }]), client([{ transactionHash: tx }])).searchOperation({ ...record }), expected);
+  // An RPC that refuses wide ranges is asked for smaller ones.
+  const narrow = client([{ transactionHash: tx }], 100n);
+  assert.deepEqual(await chain(narrow).searchOperation({ ...record }), expected);
+  assert.ok(narrow.ranges.some(([from, to]) => to - from <= 100n && from <= at && at <= to));
+  // A log that no RPC can verify keeps the search where it was, rather than moving past it.
+  const unverified = { ...record };
+  assert.equal(await chain(client([{ transactionHash: stale }])).searchOperation(unverified), undefined);
+  assert.equal(unverified.searchedBlock, undefined);
+});
+
+test("the outbound lookup refuses a public name that resolves to a private, loopback or mixed set of addresses", async () => {
+  const dns = (await import("node:dns")).default, { syncBuiltinESMExports } = await import("node:module");
+  const { publicLookup } = await import("../src/x402/http.ts");
+  const lookup = dns.lookup;
+  const resolve = addresses => new Promise(done => publicLookup("api.example.com", { all: true }, (error, result) => done({ error, result })));
+  try {
+    for (const [answer, ok] of [[[{ address: "8.8.8.8", family: 4 }], true], [[{ address: "127.0.0.1", family: 4 }], false], [[{ address: "8.8.8.8", family: 4 }, { address: "10.0.0.1", family: 4 }], false], [[{ address: "::ffff:10.0.0.1", family: 6 }], false], [[], false]]) {
+      dns.lookup = (_host, _options, callback) => callback(null, answer);
+      syncBuiltinESMExports();
+      const { error, result } = await resolve();
+      assert.equal(!error, ok, JSON.stringify(answer));
+      if (ok) assert.deepEqual(result, answer); else assert.equal(error.code, "EX402PRIVATE");
+    }
+  } finally { dns.lookup = lookup; syncBuiltinESMExports(); }
 });

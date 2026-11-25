@@ -296,8 +296,14 @@ export class WalletChain {
       const to = from + SEARCH_CHUNK - 1n < end ? from + SEARCH_CHUNK - 1n : end;
       // Every RPC is searched: one with an incomplete log index must not move progress past the payment's block.
       const found = (await Promise.all(this.clients.map(c => logsIn(c, from, to, range => c.getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, ...range }))))).flat();
-      const hash = found.find(log => log.transactionHash)?.transactionHash;
-      if (hash) return this.verifiedReceipt(record, hash);
+      // One RPC's stale log must not hide another's canonical one, so each distinct transaction is tried. If none
+      // verifies yet, progress stays before this range and the next pass looks again.
+      const candidates = [...new Set(found.flatMap(log => log.transactionHash ? [log.transactionHash.toLowerCase() as Hex] : []))];
+      for (const hash of candidates) {
+        const receipt = await this.verifiedReceipt(record, hash).catch(() => undefined);
+        if (receipt) return receipt;
+      }
+      if (candidates.length) return;
       const covered = to < settled ? to : settled;
       if (covered >= start) record.searchedBlock = covered.toString();
     }

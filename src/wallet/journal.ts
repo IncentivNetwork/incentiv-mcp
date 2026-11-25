@@ -19,9 +19,6 @@ export const x402IntentSchema = z.strictObject({
   url: z.string().max(2048), origin: z.string().max(256), method: z.enum(["GET", "POST"]), request: hash, maxAmount: uint,
   accepted: z.string().max(8192), resource: z.string().max(8192).optional(),
   paymentId: hash, validUntil: z.number().int().positive(),
-  // Set once a terminal payment is compacted: `accepted` then holds a digest of the seller's terms, and `resource`
-  // and the signed operation are dropped, so x402 volume cannot fill the journal.
-  compacted: z.literal(true).optional(),
 });
 export const intentSchema = z.strictObject({
   intentSchemaVersion: z.literal(1), kind: z.enum(["transfer", "swap", "link_agent", "unlink_agent", "x402_payment"]),
@@ -76,8 +73,8 @@ export type OperationRecord = z.infer<typeof recordSchema>;
  */
 export const probeSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, outcome: z.enum(["sending", "payment_required", "not_required"]), at: z.number().int() });
 export type Probe = z.infer<typeof probeSchema>;
-/** x402 only: what is left of an ended payment once its record is archived, so its request ID stays bound for a while. */
-export const archivedSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, status: z.enum(statuses), lastError: z.string().max(64).optional(), at: z.number().int() });
+/** x402 only: what is left of an ended payment once its record is archived, so its request ID stays bound and its hashes findable. */
+export const archivedSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, status: z.enum(statuses), lastError: z.string().max(64).optional(), userOpHash: hash.optional(), transactionHash: hash.optional(), at: z.number().int() });
 export const journalSchema = z.strictObject({
   schemaVersion: z.literal(1), walletId: z.string().uuid(), networkId: hash, manifestId: hash,
   approvedManifestIds: z.array(hash).optional(),
@@ -97,7 +94,8 @@ const transitions: Record<OperationRecord["status"], string[]> = {
   preparing: ["approval_required", "signed", "failed", "cancelled"],
   approval_required: ["preparing", "expired", "cancelled"],
   // Only an x402 payment that never left this computer expires from signed: nobody else holds its signature.
-  signed: ["submitting", "superseding", "expired"],
+  // An x402 payment past its deadline whose nonce lane was used anyway reached the seller after all.
+  signed: ["submitting", "superseding", "expired", "submission_unknown"],
   // Back to its earlier status only when the last check before the outbound request or broadcast refused it, so it never left.
   submitting: ["submitted", "submission_unknown", "signed"],
   submitted: ["confirmed", "reverted", "submission_unknown", "superseding"],
@@ -107,7 +105,7 @@ const transitions: Record<OperationRecord["status"], string[]> = {
   confirmed: ["submitted"], reverted: [], failed: [], cancelled: [], expired: [], superseded: [],
 };
 /** The moves above that only an x402 payment may make. */
-const X402_ONLY_TRANSITIONS = ["signed>expired", "confirmed>submitted"];
+const X402_ONLY_TRANSITIONS = ["signed>expired", "signed>submission_unknown", "confirmed>submitted"];
 
 /** One atomic authenticated snapshot retains every request for the wallet lifetime.
  * ponytail: linear journal reads; segment with authenticated tombstones when history exceeds 16 MiB.
@@ -140,7 +138,9 @@ export class Journal {
     const ids = new Set();
     for (const record of data.records) {
       const manifest = record.manifestId ?? data.manifestId;
-      const compatiblePending = wallet.networkIdentity.networkId === CURRENT_ACCOUNT_NETWORK_ID && upgrade?.manifestId === wallet.approvedCapabilityManifestId && upgrade.previousManifestId === manifest;
+      // An x402 payment can hold its nonce lane again after a capability approval: a reorg can undo its confirmation.
+      // Every send checks it against the current configuration, so an earlier approved manifest is enough.
+      const compatiblePending = (wallet.networkIdentity.networkId === CURRENT_ACCOUNT_NETWORK_ID && upgrade?.manifestId === wallet.approvedCapabilityManifestId && upgrade.previousManifestId === manifest) || record.intent.kind === "x402_payment";
       if (ids.has(record.requestId) || record.intentHash !== digest(record.intent) || record.sequence > data.sequence || !journalApprovesManifest(data, manifest) || (ownsNonce(record.status) && (!record.operation || !record.userOpHash || record.nonce === undefined || (manifest !== wallet.approvedCapabilityManifestId && !compatiblePending)))) throw new WalletError("wallet_recovery_required", "Invalid journal record");
       ids.add(record.requestId);
     }

@@ -28,6 +28,13 @@ export interface HttpResponse {
 }
 export type HttpTransport = (request: HttpRequest) => Promise<HttpResponse>;
 
+/**
+ * Marks a failure that happened before the TLS session was established, so no request bytes reached the server.
+ * Errors such as ENETUNREACH can also end an established connection, so only the connection state says this.
+ */
+export const NOT_SENT = Symbol("x402.notSent");
+export const sentNothing = (error: unknown) => typeof error === "object" && error !== null && (error as { [NOT_SENT]?: boolean })[NOT_SENT] === true;
+
 const v4 = new BlockList();
 for (const [net, prefix] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4]] as const) v4.addSubnet(net, prefix, "ipv4");
 // IPv6 is allowed only in global unicast (2000::/3), less documentation, 6to4 and Teredo, which embed other addresses.
@@ -61,7 +68,7 @@ export function checkResourceUrl(value: string): URL {
 }
 
 /** DNS lookup that fails unless every address for the name is public. */
-const publicLookup: LookupFunction = (hostname, options, callback) => {
+export const publicLookup: LookupFunction = (hostname, options, callback) => {
   dnsLookup(hostname, { ...options, all: true }, (error, addresses) => {
     if (error) return callback(error, "", 0);
     const list = addresses as unknown as LookupAddress[];
@@ -125,9 +132,16 @@ export const httpsTransport: HttpTransport = (req) => new Promise((resolve, reje
     res.on("close", () => { if (truncated) finish(); });
     res.on("error", error => truncated ? finish() : reject(error));
   });
+  // Request bytes are written only once the TLS session is up; a failure before that sent nothing.
+  let connected = false;
+  call.on("socket", socket => socket.once("secureConnect", () => { connected = true; }));
   const deadline = setTimeout(() => call.destroy(new Error("The resource did not answer in time")), timeout);
   call.on("close", () => clearTimeout(deadline));
   call.on("timeout", () => call.destroy(new Error("The resource did not answer in time")));
-  call.on("error", error => reject((error as { code?: string }).code === "EX402PRIVATE" ? new WalletError("validation_failed", error.message) : error));
+  call.on("error", error => {
+    if ((error as { code?: string }).code === "EX402PRIVATE") return reject(new WalletError("validation_failed", error.message));
+    if (!connected) Object.defineProperty(error, NOT_SENT, { value: true });
+    reject(error);
+  });
   call.end(body);
 });

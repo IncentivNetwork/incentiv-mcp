@@ -11,6 +11,8 @@ export const X402_SCHEME = "incentiv-userop";
 export const X402_CHAIN_ID = 24101;
 /** The facilitator caps `maxTimeoutSeconds` at 300 (SPEC 2.1). */
 export const X402_MAX_TIMEOUT_SECONDS = 300;
+/** A shorter payment window could close while the payment is built, simulated and sent, after it was journaled. */
+export const X402_MIN_TIMEOUT_SECONDS = 30;
 export const DEFAULT_FACILITATOR_URL = "https://x402.incentiv.io";
 
 /** The `@incentiv/x402` contract set for this network, built from the verified local configuration. */
@@ -52,9 +54,11 @@ export function selectRequirements(required: PaymentRequired, cfg: Config): Paym
     && typeof r.asset === "string" && r.asset.toLowerCase() === usdc.toLowerCase()
     && typeof r.amount === "string" && /^[1-9][0-9]{0,30}$/.test(r.amount)
     && typeof r.payTo === "string" && /^0x[0-9a-fA-F]{40}$/.test(r.payTo)
-    && Number.isInteger(r.maxTimeoutSeconds) && r.maxTimeoutSeconds > 0 && r.maxTimeoutSeconds <= X402_MAX_TIMEOUT_SECONDS
+    && Number.isInteger(r.maxTimeoutSeconds) && r.maxTimeoutSeconds >= X402_MIN_TIMEOUT_SECONDS && r.maxTimeoutSeconds <= X402_MAX_TIMEOUT_SECONDS
     && typeof r.extra?.entryPoint === "string" && r.extra.entryPoint.toLowerCase() === entryPoint.toLowerCase());
   if (!usable) {
+    const short = required.accepts.find(r => r && r.scheme === X402_SCHEME && r.network === X402_NETWORK && Number.isInteger(r.maxTimeoutSeconds) && r.maxTimeoutSeconds < X402_MIN_TIMEOUT_SECONDS);
+    if (short) throw new WalletError("x402_unsupported", `The resource allows only ${short.maxTimeoutSeconds} seconds to pay, too short to prepare and send a payment (this wallet needs at least ${X402_MIN_TIMEOUT_SECONDS}); nothing was paid`);
     const offered = [...new Set(required.accepts.map(r => `${String(r?.scheme).slice(0, 40)} on ${String(r?.network).slice(0, 40)}`))].slice(0, 8).join(", ");
     throw new WalletError("x402_unsupported", `The resource accepts no payment this wallet can make (it needs ${X402_SCHEME} in USDC on ${X402_NETWORK}; offered: ${offered})`);
   }
