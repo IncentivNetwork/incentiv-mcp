@@ -6,7 +6,7 @@ import { formatUnits } from "viem";
 import { z } from "zod";
 import { loadConfig, parseConfig, withoutAgentRegistry, type Config } from "../config.js";
 import { Ctx } from "../context.js";
-import { WalletError } from "./keystore.js";
+import { publicWallet, WalletError } from "./keystore.js";
 import { assertNeedsApproval, WALLET_CANDIDATE_SIGNING_ENABLED, WalletService } from "./service.js";
 import { NetworkError, verifyNetwork } from "../network.js";
 import { bundlerRpc } from "../userop.js";
@@ -67,7 +67,15 @@ export async function reviewUpgrade(current: WalletStore, config: Config) {
   catch (error) {
     // Only a wallet already on the current implementation can have approved the registry.
     if ((error as { code?: string }).code !== "capability_manifest_unapproved") throw error;
-    return { target, store, review: await reviewImplementation(current, config), registryPending: false };
+    try { return { target, store, review: await reviewImplementation(current, config), registryPending: false }; }
+    catch (pending) {
+      // Registry pins approved before this release moved the registry: the wallet is already current, and only
+      // that registry's approval is pending. It still opens normally, so read its identity to say so.
+      if ((pending as { code?: string }).code !== "capability_manifest_unapproved") throw pending;
+      const wallet = await current.session(async s => publicWallet(s.envelope));
+      if (wallet.network_id !== config.identity.networkId) throw pending;
+      return { target, store, review: undefined, registryPending: true };
+    }
   }
 }
 
@@ -183,7 +191,7 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   }
   if (implementation) {
     const { target, store, review, registryPending } = await reviewUpgrade(service.store, config);
-    if (review.wallet.network_id === config.identity.networkId) {
+    if (!review || review.wallet.network_id === config.identity.networkId) {
       console.error(`This wallet already uses the current implementation. Use setup to review its policy.${registryPending ? " To use the Agent Registry, run wallet capabilities approve first." : ""}`);
       return;
     }

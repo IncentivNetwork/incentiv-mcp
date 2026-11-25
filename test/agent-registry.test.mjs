@@ -1165,3 +1165,15 @@ test("sign_agent_link settles a link that already landed instead of calling it u
   assert.equal(refused.link_blocked, "registry_already_linked");
   assert.equal((await f.service.operation(id)).status, "confirmed");
 });
+
+test("the upgrade command calls a current wallet current after the registry moves, with its approval pending", async t => {
+  const base = withoutAgentRegistry(MAINNET), f = await fixture(t, { config: base }), store = new WalletStore(MAINNET, f.deps);
+  await f.store.createOrLoad();
+  await approveCapabilities(store, base, MAINNET, password, digest(await reviewCapabilities(store, base, MAINNET)));
+  // A later release pins the registry at a new proxy.
+  const moved = structuredClone(MAINNET);
+  moved.manifest.agentRegistry.proxy.address = "0x00000000000000000000000000000000000000aa";
+  moved.manifest.manifestId = configurationId(moved.manifest, "manifestId");
+  const config = parseConfig(moved), upgrade = await reviewUpgrade(new WalletStore(config, f.deps), config);
+  assert.equal(upgrade.review, undefined); assert.equal(upgrade.registryPending, true);
+});
