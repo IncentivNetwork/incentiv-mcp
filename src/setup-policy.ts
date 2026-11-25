@@ -85,20 +85,20 @@ export function hasLinkPermission(config: Config, limits: Limits): boolean {
 export function withLinkPermission(config: Config, limits: Limits): Limits {
   const registry = registryCapability(config).proxy.address.toLowerCase();
   const key = Object.keys(limits.targets).find(target => target.toLowerCase() === registry) ?? registry;
-  return limitsSchema.parse({ ...limits, targets: { ...limits.targets, [key]: [...(limits.targets[key] ?? []), LINK_SELECTOR] } });
+  const selectors = limits.targets[key] ?? [];
+  if (selectors.some(selector => selector.toLowerCase() === LINK_SELECTOR)) return limits;
+  return limitsSchema.parse({ ...limits, targets: { ...limits.targets, [key]: [...selectors, LINK_SELECTOR] } });
 }
 
 /**
  * Connections are permanent: removes the unlink permission an earlier build's policy may hold (allowUnlink and the
  * registry's unlink() selector), so setup reviews and saves a policy without it. Returns `limits` itself when there is none.
  */
-export function withoutUnlink(config: Config, limits: Limits): Limits {
-  const registry = config.manifest.agentRegistry?.proxy.address.toLowerCase(), unlink = toFunctionSelector("unlink()");
-  const key = registry && Object.keys(limits.targets).find(target => target.toLowerCase() === registry);
-  const selectors = key ? limits.targets[key] : undefined;
-  if (!limits.agentRegistry?.allowUnlink && !selectors?.some(selector => selector.toLowerCase() === unlink)) return limits;
-  const targets = { ...limits.targets };
-  if (key) targets[key] = selectors!.filter(selector => selector.toLowerCase() !== unlink);
+export function withoutUnlink(_config: Config, limits: Limits): Limits {
+  // Every target, not only the current proxy: a registry that has since moved may still hold an earlier unlink() grant.
+  const unlink = toFunctionSelector("unlink()"), granted = (selectors: string[]) => selectors.some(selector => selector.toLowerCase() === unlink);
+  if (!limits.agentRegistry?.allowUnlink && !Object.values(limits.targets).some(granted)) return limits;
+  const targets = Object.fromEntries(Object.entries(limits.targets).map(([target, selectors]) => [target, selectors.filter(selector => selector.toLowerCase() !== unlink)]));
   return limitsSchema.parse({ ...limits, ...(limits.agentRegistry ? { agentRegistry: { ...limits.agentRegistry, allowUnlink: false } } : {}), targets });
 }
 

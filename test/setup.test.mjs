@@ -217,6 +217,18 @@ test("keeping permissions after the registry moves offers its link permission, k
   }
 });
 
+test("registry permission merges with a differently cased target, and unlink is dropped from a moved registry", async t => {
+  const { withLinkPermission, withoutUnlink } = await import("../src/setup-policy.ts");
+  const registry = MAINNET.manifest.agentRegistry.proxy.address, link = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)"), unlink = toFunctionSelector("unlink()");
+  const merged = withLinkPermission(MAINNET, { ...limits, targets: { ...limits.targets, [registry]: [] } });
+  assert.deepEqual(Object.keys(merged.targets).filter(key => key.toLowerCase() === registry.toLowerCase()), [registry]);
+  assert.deepEqual(merged.targets[registry], [link]);
+  assert.equal(withLinkPermission(MAINNET, merged), merged);
+  const earlier = "0x00000000000000000000000000000000000000aa";
+  const cleaned = withoutUnlink(MAINNET, { ...limits, agentRegistry: { parents: [], allowUnlink: true }, targets: { ...limits.targets, [earlier]: [link, unlink] } });
+  assert.deepEqual(cleaned.targets[earlier], [link]); assert.equal(cleaned.agentRegistry.allowUnlink, false);
+});
+
 test("MCP-created wallet can establish disabled administration before backup, and cancellation never enables it", async t => {
   const f = await fixture(t, { existing: true });
   const before = await f.store.createOrLoad();

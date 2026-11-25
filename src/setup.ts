@@ -67,7 +67,7 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
     if (config.manifest.agentRegistry && !limits.agentRegistry) {
       if (review.wallet.manifest_id === config.manifest.manifestId) {
         const registry = await promptAgentRegistry(config, ask, tell);
-        if (registry.agentRegistry) limits = limitsSchema.parse({ ...limits, agentRegistry: registry.agentRegistry, targets: { ...limits.targets, ...registry.targets } });
+        if (registry.agentRegistry) limits = withLinkPermission(config, limitsSchema.parse({ ...limits, agentRegistry: registry.agentRegistry }));
       } else tell("To connect this agent to Portal accounts, run wallet capabilities approve, then rerun setup.");
     } else if (config.manifest.agentRegistry && limits.agentRegistry && !hasLinkPermission(config, limits)) {
       // The approved registry moved to a new proxy: the kept parents stay, but link() is allowed only on the old address.
