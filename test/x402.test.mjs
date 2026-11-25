@@ -573,6 +573,30 @@ test("an unpaid POST is bound to its request ID before it is sent, so a retry ne
   assert.equal(priced.seen.unpaid, 2);
 });
 
+test("unpaid HTTP errors and redirects are reported as failures without repeating an unsafe POST", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  let status = 302;
+  let requests = 0;
+  f.service.http = async () => {
+    requests++;
+    return { status, headers: {}, body: Buffer.from("Resource unavailable"), truncated: false };
+  };
+  const quote = await f.service.x402Requirements({ url: URL_ });
+  assert.equal(quote.status, "request_failed");
+  assert.equal(quote.http_status, 302);
+  assert.equal(quote.payment_required, undefined);
+
+  status = 503;
+  const purchase = { url: URL_, method: "POST", body: "{}", max_amount: "0.05", request_id: id };
+  const answer = await f.service.payX402(purchase);
+  assert.equal(answer.status, "request_failed");
+  assert.equal(answer.http_status, 503);
+  assert.match(answer.next_action, /may already have acted/);
+  await assert.rejects(f.service.payX402(purchase), { code: "x402_request_uncertain" });
+  assert.equal(requests, 2);
+  assert.deepEqual(await f.records(), []);
+});
+
 test("a confirmation the chain drops reopens the payment, which is not sent again until it settles", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });

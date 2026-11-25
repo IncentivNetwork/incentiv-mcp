@@ -14,7 +14,7 @@ import { Journal, digest, holdsMainNonce, intentSchema, ownsNonce, terminal, typ
 import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, x402QuoteViolations, x402Violations, type Limits, type Spend } from "./policy.js";
 import { MIN_SWAP_REMAINING_SECONDS, REORG_MARGIN_BLOCKS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure } from "./chain.js";
 import { validateOperation } from "./validate.js";
-import { httpsTransport, sentNothing, type HttpTransport } from "../x402/http.js";
+import { httpsTransport, sentNothing, type HttpResponse, type HttpTransport } from "../x402/http.js";
 import { incentivX402, parsePaymentRequired, paymentHeader, paymentNonceKey, selectRequirements, settlement, x402Config, X402_SCHEME, type PaymentRequirements, type SettleResponse } from "../x402/protocol.js";
 import { MAX_RESPONSE_BYTES, responseContent, usdcAmount, USDC_DECIMALS, x402Request, type X402Request } from "../x402/request.js";
 
@@ -457,7 +457,8 @@ export class WalletService {
       if (x402Violations(policy.limits, req.origin, ZERO_ADDRESS, "0").includes("x402_origin_not_allowed")) throw new WalletError("policy_denied", "Local wallet policy does not allow this site for x402, so nothing was sent");
     });
     const response = await this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: 30_000 });
-    if (response.status !== 402) return { url: req.url, payment_required: false, content: responseContent(response), next_action: "This request needs no payment; its answer is in content." };
+    if (httpSucceeded(response.status)) return { url: req.url, payment_required: false, content: responseContent(response), next_action: "This request needs no payment; its answer is in content." };
+    if (response.status !== 402) return { url: req.url, ...unpaidHttpFailure(response) };
     const required = parsePaymentRequired(response);
     let accepted: PaymentRequirements | undefined, unsupported: string | undefined;
     try { accepted = selectRequirements(required, this.ctx.config); }
@@ -558,7 +559,16 @@ export class WalletService {
       const uncertain = !neverSent(error) && !replayable(req) ? " The resource may have received this POST, so this wallet does not send it again under this request ID." : "";
       throw new WalletError("x402_request_failed", `The resource could not be reached, so nothing was paid: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}.${uncertain}`);
     });
-    if (unpaid.status !== 402) { await bind("not_required"); return { request_id: requestId, status: "not_required", content: responseContent(unpaid), next_action: "No payment was needed or made." }; }
+    if (httpSucceeded(unpaid.status)) {
+      await bind("not_required");
+      return { request_id: requestId, status: "not_required", content: responseContent(unpaid), next_action: "No payment was needed or made." };
+    }
+    if (unpaid.status !== 402) {
+      // An HTTP error or redirect can follow a POST side effect. Keep its existing uncertain binding.
+      const failure = unpaidHttpFailure(unpaid);
+      const nextAction = replayable(req) ? failure.next_action : `${failure.next_action} The resource may already have acted on this POST, so the wallet keeps its request ID bound.`;
+      return { request_id: requestId, ...failure, next_action: nextAction };
+    }
     // Only a valid x402 challenge shows the resource did not act on the request; a plain 402 may follow a side
     // effect, so the binding stays uncertain if it is not one.
     const required = parsePaymentRequired(unpaid);
@@ -663,7 +673,7 @@ export class WalletService {
     if (replayable(req)) {
       const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
       response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: PAID_REQUEST_TIMEOUT_MS }).catch(() => undefined);
-      if (response && response.status >= 200 && response.status < 300) {
+      if (response && httpSucceeded(response.status)) {
         r.delivered = true; r.sequence = ++journal.data.sequence; await journal.save();
         // From here the nonce is known to be used, so the payment cannot be charged again.
         return { ...x402Result(r), content_delivered: true, content: responseContent(response), next_action: "This payment had settled without its answer; the seller has now served it. Nothing more was paid." };
@@ -726,7 +736,7 @@ export class WalletService {
       return { ...x402Result(r), next_action: `The seller did not answer, so the payment may or may not settle. ${replayable(req) ? "Retry pay_x402_resource with the same request ID while the deadline is open; " : ""}${X402_UNKNOWN_ACTION(r.requestId)}` };
     }
     const settled = sellerSettlement(settlement(response));
-    const served = response.status >= 200 && response.status < 300;
+    const served = httpSucceeded(response.status);
     // The seller's report of a successful settlement is kept whatever the HTTP status, since an upfront payment
     // can settle before a handler fails. Reconciliation verifies it on chain either way.
     const paid = settled?.success === true && response.status !== 402;
@@ -968,6 +978,17 @@ export class WalletService {
     r.sequence = ++journal.data.sequence; await journal.save();
   }
 }
+const httpSucceeded = (status: number) => status >= 200 && status < 300;
+
+function unpaidHttpFailure(response: HttpResponse) {
+  return {
+    status: "request_failed",
+    http_status: response.status,
+    content: responseContent(response),
+    next_action: `The resource returned HTTP ${response.status} before a payment was sent. Check the resource response before retrying.`,
+  } as const;
+}
+
 function rethrowX402RecheckError(error: unknown): never {
   if (isTransportFailure(error)) throw new WalletError("rpc_unavailable", "Could not recheck recent x402 settlements; retry when RPC is available");
   throw error;
