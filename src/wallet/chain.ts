@@ -293,18 +293,28 @@ export class WalletChain {
     const end = start + SEARCH_PER_PASS - 1n < head ? start + SEARCH_PER_PASS - 1n : head;
     // Progress stops short of the head, so a reorg cannot hide an event in blocks already searched.
     const settled = head > REORG_MARGIN_BLOCKS ? head - REORG_MARGIN_BLOCKS : 0n;
+    let progressBlocked = false;
     for (let from = start; from <= end; from += SEARCH_CHUNK) {
       const to = from + SEARCH_CHUNK - 1n < end ? from + SEARCH_CHUNK - 1n : end;
       // Every RPC is searched: one with an incomplete log index must not move progress past the payment's block.
       const found = (await Promise.all(this.clients.map(c => logsIn(c, from, to, range => c.getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, ...range }))))).flat();
-      // One RPC's stale log must not hide another's canonical one, so each distinct transaction is tried. If none
-      // verifies yet, progress stays before this range and the next pass looks again.
+      // Try each distinct transaction. An inconclusive log must be revisited, but it cannot hide a receipt
+      // in a later range of this pass. A log from a known orphaned block can be skipped on future passes.
       const candidates = [...new Set(found.flatMap(log => log.transactionHash ? [log.transactionHash.toLowerCase() as Hex] : []))];
       for (const hash of candidates) {
         const receipt = await this.verifiedReceipt(record, hash).catch(() => undefined);
         if (receipt) return receipt;
       }
-      if (candidates.length) return;
+      if (!progressBlocked && candidates.length) {
+        const orphaned = await Promise.all(found.map(async ({ blockNumber, blockHash, transactionHash }) => {
+          if (!transactionHash) return true;
+          if (!blockHash || blockNumber == null) return false;
+          const hashes = await Promise.all(this.clients.map(c => c.getBlock({ blockNumber }).then(b => b.hash))).catch(() => []);
+          return hashes.length > 0 && hashes.every(Boolean) && same(hashes) && hashes[0]!.toLowerCase() !== blockHash.toLowerCase();
+        }));
+        progressBlocked = !orphaned.every(Boolean);
+      }
+      if (progressBlocked) continue;
       const covered = to < settled ? to : settled;
       if (covered >= start) record.searchedBlock = covered.toString();
     }

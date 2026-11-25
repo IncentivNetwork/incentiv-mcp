@@ -1061,17 +1061,17 @@ test("the receipt search reads every RPC, tries each distinct transaction, and n
   const tx = `0x${"aa".repeat(32)}`, stale = `0x${"bb".repeat(32)}`, blockHash = `0x${"cc".repeat(32)}`, at = 990n;
   const log = { address: entryPoint, topics: encodeEventTopics({ abi: [event], eventName: "UserOperationEvent", args: { userOpHash, sender, paymaster } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [nonce, true, 1234n, 1n]) };
   const record = { requestId: randomUUID(), intent: { kind: "x402_payment" }, userOpHash, nonce: nonce.toString(), fromBlock: "500", operation: { sender, paymaster } };
-  const client = (logs, maxRange) => ({
+  const client = (logs, maxRange, block = at, head = 1000n) => ({
     ranges: [],
-    getBlockNumber: async () => 1000n,
+    getBlockNumber: async () => head,
     getBlock: async () => ({ hash: blockHash }),
     readContract: async () => nonce + 1n,
     async getLogs({ fromBlock, toBlock }) {
       this.ranges.push([fromBlock, toBlock]);
       if (maxRange && toBlock - fromBlock > maxRange) throw new Error("query returned more than 10000 results");
-      return fromBlock <= at && at <= toBlock ? logs : [];
+      return fromBlock <= block && block <= toBlock ? logs : [];
     },
-    getTransactionReceipt: async ({ hash }) => { if (hash !== tx) throw new Error("transaction not found"); return { status: "success", blockHash, blockNumber: at, transactionHash: hash, logs: [log] }; },
+    getTransactionReceipt: async ({ hash }) => { if (hash !== tx) throw new Error("transaction not found"); return { status: "success", blockHash, blockNumber: block, transactionHash: hash, logs: [log] }; },
   });
   const chain = (...clients) => { const c = new WalletChain(new Ctx(MAINNET)); c.clients = clients; c.bundlerHint = async () => undefined; return c; };
   const expected = { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: 990n };
@@ -1088,6 +1088,18 @@ test("the receipt search reads every RPC, tries each distinct transaction, and n
   const unverified = { ...record };
   assert.equal(await chain(client([{ transactionHash: stale }])).searchOperation(unverified), undefined);
   assert.equal(unverified.searchedBlock, undefined);
+  // A stale earlier chunk cannot mask a canonical receipt in a later chunk of the same pass.
+  const later = 6990n, head = 8000n;
+  const first = client([{ transactionHash: stale }], undefined, at, head);
+  const second = client([{ transactionHash: tx }], undefined, later, head);
+  first.getTransactionReceipt = second.getTransactionReceipt;
+  assert.deepEqual(await chain(first, second).searchOperation({ ...record }), { ...expected, blockNumber: later });
+
+  // Once all RPCs agree that a stale log's block was orphaned, the search can advance beyond that window.
+  const orphaned = { ...record };
+  const staleLog = { transactionHash: stale, blockNumber: at, blockHash: `0x${"dd".repeat(32)}` };
+  assert.equal(await chain(client([staleLog], undefined, at, 200_000n)).searchOperation(orphaned), undefined);
+  assert.equal(orphaned.searchedBlock, "100499");
 });
 
 test("the outbound lookup refuses a public name that resolves to a private, loopback or mixed set of addresses", async () => {
