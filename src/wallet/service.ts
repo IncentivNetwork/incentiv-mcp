@@ -106,6 +106,7 @@ export class WalletService {
     // Reconciliation runs at the start of a locked session, so an x402 payment still preparing was interrupted
     // before it was signed: nothing can send it, so it is closed.
     for (const r of journal.data.records) if (r.intent.kind === "x402_payment" && r.status === "preparing") { r.lastError = "x402_preparation_interrupted"; await journal.transition(r, "failed"); }
+    await this.recheckX402Confirmations(journal);
     for (const r of journal.data.records.filter(r => ownsNonce(r.status))) {
       if (r.status === "signed") {
         // No network submission was started; exact bytes remain retryable. An x402 payment that was never sent
@@ -463,7 +464,12 @@ export class WalletService {
     const archived = journal.data.archived?.find(a => a.requestId === requestId);
     if (archived) {
       if (archived.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
-      return { request_id: requestId, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, archived: true, content_delivered: false, next_action: "This request ID was used for a payment that ended more than two days ago, and its record is archived, so its answer cannot be asked for again. Nothing more was paid. Buying again with a new request ID pays again." };
+      const paid = archived.status === "confirmed";
+      return { request_id: requestId, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archived.lastError, archived: true, content_delivered: false,
+        next_action: paid
+          ? "This request ID paid for this request more than two days ago, and its record is archived, so its answer cannot be asked for again. Nothing more was paid. Buying again with a new request ID pays again."
+          // Any outcome other than confirmed (never sent, expired, cancelled, reverted) left the seller unpaid.
+          : `This request ID's payment ended as ${archived.status}${archived.lastError ? ` (${archived.lastError})` : ""} without paying the seller, and its record is archived. Nothing more was paid. Use a new request ID to try again.` };
     }
     const existing = journal.data.records.find(r => r.requestId === requestId);
     if (existing) {
@@ -609,11 +615,7 @@ export class WalletService {
     // Neither a seller's report nor a confirmation the chain later drops is proof: while the nonce is unused, the
     // seller could still submit the payment, so sending it again would be a send under no current policy.
     if ((await this.chain.stateFor(s.envelope, r)).nonce === BigInt(r.nonce!)) {
-      if (r.status === "confirmed") {
-        // The chain no longer shows the confirmation, so the payment is pending again and reserved until it settles.
-        delete r.consumed; delete r.consumedAt; delete r.transactionHash; r.lastError = "x402_confirmation_rolled_back";
-        await journal.transition(r, "submitted");
-      }
+      if (r.status === "confirmed") await this.reopenX402(journal, r);
       return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The chain no longer shows this payment's settlement" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid.` };
     }
     if (replayable(req)) {
@@ -632,6 +634,24 @@ export class WalletService {
     return { ...x402Result(r), content_delivered: false, ...(response ? { http_status: response.status } : {}), next_action: `This payment ${where}, and ${answer}; ${again}. Nothing more was paid. Buying again with a new request ID pays again; if the answer was lost, ask the seller to honour this payment instead.` };
   }
 
+  /**
+   * A reorg can undo a recent x402 confirmation while the seller's facilitator still holds the signed payment, which
+   * could then settle again. Recent confirmations are rechecked on every reconciliation, so neither a status nor the
+   * balance a new payment may use counts on a settlement the chain dropped. A lane that cannot be read is left as it is.
+   */
+  private async recheckX402Confirmations(journal: Journal) {
+    const since = Date.now() - X402_RECONFIRM_MS;
+    for (const r of journal.data.records) {
+      if (r.intent.kind !== "x402_payment" || r.status !== "confirmed" || (r.consumedAt ?? 0) <= since) continue;
+      const lane = await this.chain.stateFor(journal.session.envelope, r).catch(() => undefined);
+      if (lane?.nonce === BigInt(r.nonce!)) await this.reopenX402(journal, r);
+    }
+  }
+  /** The chain no longer shows the confirmation, so the payment is pending again and its spend reserved until it settles. */
+  private async reopenX402(journal: Journal, r: OperationRecord) {
+    delete r.consumed; delete r.consumedAt; delete r.transactionHash; r.lastError = "x402_confirmation_rolled_back";
+    await journal.transition(r, "submitted");
+  }
   /** The seller's deadline passed: an unsent payment expires; one the seller may hold stays reserved until resolved. */
   private async pastDeadlineX402(journal: Journal, r: OperationRecord) {
     if (r.status === "signed" && await this.expireUnsentX402(journal, r)) return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." };
@@ -959,6 +979,11 @@ const replayable = (req: X402Request) => req.method === "GET" || !!req.headers["
  * slow settlement still returns the answer instead of finishing after the wallet stopped waiting.
  */
 const PAID_REQUEST_TIMEOUT_MS = 90_000;
+/**
+ * How long after its confirmation an x402 payment is rechecked for a reorg: well past the 128 blocks the receipt
+ * search treats as reorg-prone.
+ */
+const X402_RECONFIRM_MS = 60 * 60_000;
 /** Terminal x402 payments older than this are archived; the daily limit only looks back one day. */
 const COMPACT_AFTER_MS = 2 * 86_400_000;
 /** New x402 payments pause above this journal size, leaving room below the 16 MiB limit for everything else. */
