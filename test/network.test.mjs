@@ -85,7 +85,7 @@ test("the Portal URL is an endpoint: overriding it keeps the manifest, and only 
   assert.equal(other.manifest.manifestId, MAINNET.manifest.manifestId);
   assert.deepEqual(other.manifest, MAINNET.manifest);
   for (const value of ["http://portal.incentiv.io/agents", "https://portal.incentiv.io.example.test/agents", "https://example.test/agents",
-    "https://incentiv.io.example.test/", "https://portal.incentiv.io:8443/agents", "https://user:pw@portal.incentiv.io/agents", "https://portal.incentiv.io/agents#x", "not a url"]) {
+    "https://incentiv.io.example.test/", "https://evilincentiv.io/agents", "https://portal.incentiv.io:8443/agents", "https://user:pw@portal.incentiv.io/agents", "https://portal.incentiv.io/agents#x", "not a url"]) {
     assert.throws(() => loadConfig({ INCENTIV_PORTAL_URL: value }), /endpoints\.portalUrl/, value);
   }
   // A configuration that enables the registry needs somewhere to send agent links; one without it does not.

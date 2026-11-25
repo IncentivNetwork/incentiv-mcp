@@ -179,7 +179,9 @@ export class WalletService {
       if (error.code === "registry_unavailable") throw new WalletError(error.code, `Registry request ${r.requestId} was signed, but this release does not include the Agent Registry, so it cannot be sent. Clear it with wallet operation resolve ${r.requestId} --replace in your local terminal`);
       throw error;
     }
-    await this.revalidate(s, journal, r);
+    // An RPC or bundler outage while rechecking says nothing about the signed bytes, so the same request ID stays usable.
+    const recheck = () => this.revalidate(s, journal, r).catch((error: unknown) => { throw rpcOutage(error); });
+    await recheck();
     // Reconcile happened under the same cross-process lock before this retry.
     const prior = r.status as "signed" | "submission_unknown";
     r.attempts++;
@@ -189,7 +191,7 @@ export class WalletService {
     const check = async (step: () => Promise<void>) => { try { await step(); } catch (error) { refusal = { error }; throw error; } };
     try {
       await check(() => this.canSubmit(s, r));
-      const returned = await this.chain.relay(r.operation, () => check(() => this.revalidate(s, journal, r)));
+      const returned = await this.chain.relay(r.operation, () => check(recheck));
       if (returned !== r.userOpHash) throw new Error();
     } catch {
       // The request keeps its state, and the refusal keeps its own guidance, such as how to replace bytes that can never land.
@@ -288,7 +290,7 @@ export class WalletService {
         await journal.transition(r, "signed"); // fsync completes before any submission.
       } catch (error) {
         // An RPC outage says nothing about the request, so its ID and any local approval stay usable.
-        const failure = error instanceof WalletError ? error : isTransportFailure(error) || error instanceof BundlerUnavailableError ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : undefined;
+        const mapped = rpcOutage(error), failure = mapped instanceof WalletError ? mapped : undefined;
         // Without an approval the operation may have been rebuilt, so earlier reasons may not describe it; a retry evaluates it again.
         if (r.status === "preparing" && TEMPORARY_ERRORS.includes(failure?.code ?? "")) { r.lastError = failure!.code; if (!r.approval) delete r.reasons; await journal.transition(r, "approval_required"); }
         else if (r.status === "preparing") { r.lastError = failure?.code ?? "validation_failed"; await journal.transition(r, "failed"); }
@@ -325,7 +327,13 @@ export class WalletService {
   /** The Portal URL that asks the user to approve this agent's connection for link_agent. Reads only. */
   async prepareAgentLink() {
     return this.store.session(async s => {
-      const url = this.agentLinkUrl(s), status = await this.chain.registryStatus(s.envelope);
+      const url = this.agentLinkUrl(s);
+      // A Portal approval for a wallet that cannot sign is unusable, so the user is not asked for one.
+      try { await this.enabled(s); } catch (error) {
+        if (error instanceof WalletError) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
+        throw error;
+      }
+      const status = await this.chain.registryStatus(s.envelope);
       const blocked = linkBlocker(status, status.deployed);
       return blocked ? linkRefusal(status, blocked) : { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };
     });
@@ -915,7 +923,11 @@ export class WalletService {
   }
 }
 const MAX_LINK_ATTEMPTS = 8;
-const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable"];
+/** An RPC or bundler outage says nothing about a request, so it becomes a retryable rpc_unavailable; anything else is returned as is. */
+const rpcOutage = (error: unknown) => !(error instanceof WalletError) && (isTransportFailure(error) || error instanceof BundlerUnavailableError)
+  ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : error;
+/** Refusals that say nothing about the request itself, so an unsigned request returns to approval_required and keeps its ID. */
+const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable", "registry_factory_not_allowed"];
 /** Registry refusals that the same signed bytes can never get past. */
 const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed", "registry_unlink_unsupported",
   // Connections are permanent, so an agent that is already linked, or an account role that forbids the link, does not change.
@@ -1038,5 +1050,5 @@ function result(r: OperationRecord) {
   const eventMissing = r.status === "confirmed" && r.lastError === "registry_event_missing";
   const registryError = eventMissing || (r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_")) ? r.lastError : undefined;
   const interrupted = r.status === "approval_required" && TEMPORARY_ERRORS.includes(r.lastError ?? "");
-  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `A temporary RPC failure interrupted this request. Retry with the same request ID${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
+  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `${r.lastError === "registry_factory_not_allowed" ? "The Agent Registry does not currently allow this account's factory. Retry with the same request ID once it does, while the Portal approval is still valid" : "A temporary RPC failure interrupted this request. Retry with the same request ID"}${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }

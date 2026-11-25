@@ -89,7 +89,7 @@ If the scanner is missing, throws, or fails its startup self-test (`wormhole can
 
 ## Configuration
 
-The server registers nine wallet tools and three x402 tools without touching storage until one is called. `wallet doctor` checks the network and bundler without opening a wallet. `wallet init` creates a disabled wallet, and `wallet policy configure` sets the administration password through a no-echo terminal prompt. `wallet backup --out <file>` writes an encrypted backup, and `wallet restore --in <file>` restores into an empty namespace. `wallet capabilities approve --previous <config.json>` approves new capabilities and keeps the account. See [wallet storage and CLI](https://github.com/IncentivNetwork/incentiv-mcp/blob/main/docs/wallet-storage.md).
+The server registers nine wallet tools and three x402 tools without touching storage until one is called. `wallet doctor` checks the network and bundler without opening a wallet. `wallet init` creates a disabled wallet, and `wallet policy configure` sets the administration password through a no-echo terminal prompt. `wallet backup --out <file>` writes an encrypted backup, and `wallet restore --in <file>` restores into an empty namespace. `wallet capabilities approve` approves new capabilities, such as the Agent Registry, and keeps the account; a configuration that changes anything else also needs `--previous <config.json>`. See [wallet storage and CLI](https://github.com/IncentivNetwork/incentiv-mcp/blob/main/docs/wallet-storage.md).
 
 Runtime dependencies are exact, and the full dependency graph is published in `npm-shrinkwrap.json`. Installation never runs a wallet migration.
 

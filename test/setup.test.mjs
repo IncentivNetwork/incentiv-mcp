@@ -312,3 +312,12 @@ test("keeping current permissions lets the user keep, change or turn off x402 pa
   await setupWallet(f.service, f.root, off.io);
   assert.equal((await f.service.review()).wallet.policy.limits.x402, undefined);
 });
+
+test("setup does not ask for Portal accounts on a wallet that has not approved the registry yet", async () => {
+  // The same answers as the registry case above (declining x402), without the registry prompt: nothing is left unanswered or saved.
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "n"], asked = [], told = [];
+  const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async q => { asked.push(q); assert.ok(replies.length); return replies.shift(); }, m => told.push(m), false);
+  assert.equal(policy.agentRegistry, undefined); assert.equal(replies.length, 0);
+  assert.ok(!asked.some(q => /Portal accounts/.test(q)));
+  assert.ok(told.some(m => /run wallet capabilities approve, then rerun setup/.test(m)));
+});

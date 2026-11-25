@@ -221,8 +221,9 @@ commit evidence or complete staged keystore. Legacy/MCP-created orphan bindings
 have no such proof and remain preserved. Complete staged keystores resume with
 their original keys through `create_agent_wallet`.
 
-Capability approval takes the previous complete configuration and compares it to
-the currently configured proposal. It verifies all proposed pins/handshake before
+Capability approval compares the previous complete configuration to the currently
+configured proposal. When the only change is the Agent Registry, it derives the
+previous one by removing the registry; otherwise pass it with `--previous`. It verifies all proposed pins/handshake before
 unlocking, requires the administration factor and unchanged displayed review,
 rejects pending signatures and any immutable identity change, and preserves all
 history and consumed spend. The journal records an approved manifest before the

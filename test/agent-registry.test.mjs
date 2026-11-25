@@ -62,6 +62,19 @@ test("approval handoff is strict, bounded and signs bytes with EIP-191", async (
   await verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(a), state());
 });
 
+test("deployment verification refuses each registry pin on its own", async () => {
+  const c = client(), good = c.readContract, domain = ["0x0f", "Incentiv Agent Registry", "1", 24101n, cap.proxy.address, `0x${"00".repeat(32)}`, []];
+  const withDomain = changed => client({ readContract: async args => args.functionName === "eip712Domain" ? changed : good(args) });
+  const changedCode = which => client({ getCode: async ({ address }) => {
+    const isProxy = address.toLowerCase() === cap.proxy.address.toLowerCase();
+    return (isProxy ? which === "proxy" : which === "implementation") ? "0x6000" : c.getCode({ address });
+  } });
+  for (const [label, changed] of [["proxy code", changedCode("proxy")], ["implementation code", changedCode("implementation")], ["domain chain", withDomain(domain.with(3, 1n))], ["domain contract", withDomain(domain.with(4, parent))], ["domain version", withDomain(domain.with(2, "2"))], ["domain fields", withDomain(domain.with(0, "0x1f"))]]) {
+    await assert.rejects(verifyRegistryDeployment(changed, MAINNET, 123n), /implementation|domain/, label);
+  }
+  await verifyRegistryDeployment(withDomain(domain.with(4, cap.proxy.address.toUpperCase().replace("0X", "0x"))), MAINNET, 123n);
+});
+
 test("deployment verification checks code, implementation slot and signing domain", async () => {
   await verifyRegistryDeployment(client(), MAINNET, 123n);
   await assert.rejects(verifyRegistryDeployment(client({ getStorageAt: async () => `0x${"00".repeat(32)}` }), MAINNET, 123n), /implementation/);
@@ -564,17 +577,20 @@ test("prepare_agent_link only sends the user to Portal when linking can succeed"
   const prepared = async status => { f.chain.registryStatus = async () => ({ ...linkable, ...status }); return f.service.prepareAgentLink(); };
   const ready = await prepared({});
   assert.ok(ready.portal_url); assert.equal(ready.link_blocked, undefined);
-  for (const [status, code] of [[{ parent }, "registry_already_linked"], [{ agent_is_parent: true }, "registry_ineligible"], [{ factory_allowed: false }, "registry_factory_not_allowed"], [{ deployed: true }, "registry_ineligible"]]) {
+  for (const [status, code] of [[{ parent }, "registry_already_linked"], [{ agent_is_parent: true }, "registry_ineligible"], [{ factory_allowed: false }, "registry_factory_not_allowed"], [{ deployed: true }, "registry_ineligible"], [{ deployed: true, factory_allowed: false }, "registry_factory_not_allowed"]]) {
     const blocked = await prepared(status);
     assert.equal(blocked.link_blocked, code); assert.equal(blocked.portal_url, undefined); assert.match(blocked.next_action, /Do not ask the user to sign/);
   }
 });
 
-test("the factory allowlist only applies to an agent that still has to deploy", async () => {
+test("a disallowed factory refuses an undeployed agent, and a deployed one only once the registry no longer counts it", async () => {
   const a = await approval(), good = client();
-  const c = client({ readContract: async opts => opts.functionName === "isAccountFactory" ? false : opts.functionName === "isIncentivAccount" ? true : good.readContract(opts) });
-  await verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), { ...state(), deployed: true });
-  await assert.rejects(verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), state()), { code: "registry_factory_not_allowed" });
+  const registry = eligible => client({ readContract: async opts => opts.functionName === "isAccountFactory" ? false : opts.functionName === "isIncentivAccount" && opts.args[0].toLowerCase() === agent.toLowerCase() ? eligible : good.readContract(opts) });
+  await verifyRegistryIntent(registry(true), MAINNET, { account: agent }, intent(a), { ...state(), deployed: true });
+  await assert.rejects(verifyRegistryIntent(registry(true), MAINNET, { account: agent }, intent(a), state()), { code: "registry_factory_not_allowed" });
+  // The registry counts a deployed agent through its factory, so removing that factory is the same temporary refusal, not a paid replacement.
+  await assert.rejects(verifyRegistryIntent(registry(false), MAINNET, { account: agent }, intent(a), { ...state(), deployed: true }), { code: "registry_factory_not_allowed" });
+  assert.deepEqual(linkBlocker({ parent: zero, agent_is_parent: false, agent_eligible: false, factory_allowed: true }, true)?.[0], "registry_ineligible");
 });
 
 test("the upgrade command only points a current wallet to capability approval when it is pending", async t => {
@@ -1185,7 +1201,7 @@ test("a signed link refused while the factory is disallowed keeps its request re
   f.service.submit = submit;
   const [code, message] = linkBlocker({ parent: zero, agent_is_parent: false, agent_eligible: false, factory_allowed: false }, false);
   f.chain.verifyRegistry = async () => { throw new WalletError(code, message); };
-  await assert.rejects(f.service.send("link_agent", args), error => error.code === "registry_factory_not_allowed" && /retry the same request/.test(error.message) && !/--replace/.test(error.message));
+  await assert.rejects(f.service.send("link_agent", args), error => error.code === "registry_factory_not_allowed" && /retry once it does/.test(error.message) && !/--replace/.test(error.message));
   assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
   // Once the registry allows the factory again, the same signed request goes through.
   f.chain.verifyRegistry = async () => {};
@@ -1253,4 +1269,60 @@ test("the upgrade command points to registry approval only when the configuratio
   const config = parseConfig(moved), registryFree = withoutAgentRegistry(config);
   const upgrade = await reviewUpgrade(new WalletStore(registryFree, f.deps), registryFree);
   assert.equal(upgrade.registryPending, false);
+});
+
+test("an unsigned link refused while the factory is disallowed stays open under its request ID", async t => {
+  const f = await registryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval };
+  const [code, message] = linkBlocker({ parent: zero, agent_is_parent: false, agent_eligible: false, factory_allowed: false }, false);
+  // The first check precedes the journal; the check right before signing refuses.
+  let checks = 0;
+  f.chain.verifyRegistry = async () => { if (++checks === 2) throw new WalletError(code, message); };
+  await assert.rejects(f.service.send("link_agent", args), { code });
+  const waiting = await f.service.operation(id);
+  assert.equal(waiting.status, "approval_required"); assert.equal(waiting.last_error, code);
+  assert.match(waiting.next_action, /does not currently allow this account's factory\. Retry with the same request ID once it does/);
+  // Retried while still refused (the check of an existing record), the record still stays open.
+  f.chain.verifyRegistry = async () => { throw new WalletError(code, message); };
+  await assert.rejects(f.service.send("link_agent", args), { code });
+  assert.equal((await f.service.operation(id)).status, "approval_required");
+  f.chain.verifyRegistry = async () => {};
+  assert.equal((await f.service.send("link_agent", args)).status, "submitted"); assert.equal(f.submissions.length, 1);
+});
+
+test("an RPC or bundler outage while rechecking a signed request keeps it signed and retryable", async t => {
+  const { BundlerUnavailableError } = await import("../src/userop.ts");
+  for (const [where, outage] of [["first recheck", new HttpRequestError({ url: "https://rpc.example.test", status: 503 })], ["broadcast boundary", new HttpRequestError({ url: "https://rpc.example.test", status: 503 })], ["broadcast boundary", new BundlerUnavailableError("Bundler HTTP 503")]]) {
+    const f = await registryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval }, submit = f.service.submit;
+    f.service.submit = async () => {};
+    assert.equal((await f.service.send("link_agent", args)).status, "signed");
+    f.service.submit = submit;
+    const relay = f.chain.relay, state = f.chain.state;
+    let boundary = false, failed = false;
+    f.chain.relay = (operation, before) => relay(operation, async () => { boundary = true; try { await before(); } finally { boundary = false; } });
+    f.chain.state = async (...a) => {
+      if (!failed && (where === "first recheck" || boundary)) { failed = true; throw outage; }
+      return state(...a);
+    };
+    await assert.rejects(f.service.send("link_agent", args), { code: "rpc_unavailable" }, where);
+    const record = (await f.service.review(id)).records[0];
+    assert.equal(record.status, "signed", where); assert.equal(record.attempts, 0); assert.equal(f.submissions.length, 0);
+    assert.equal((await f.service.send("link_agent", args)).status, "submitted", where); assert.equal(f.submissions.length, 1);
+  }
+});
+
+test("a TransferGate read that cannot reach the RPC is an outage, not a failed simulation", async () => {
+  const chain = new WalletChain(new Ctx(MAINNET));
+  const validated = { calls: [{ to: parent, value: 0n, data: "0x" }], hash: `0x${"11".repeat(32)}`, op: { sender: agent, nonce: 0n, callData: "0x", callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n, signature: "0x" } };
+  chain.clients.splice(0, chain.clients.length, { readContract: async () => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 503 }); } });
+  await assert.rejects(chain.simulate(validated), { code: "rpc_unavailable" });
+  chain.clients.splice(0, chain.clients.length, { readContract: async () => ({ reject: 1 }) });
+  await assert.rejects(chain.simulate(validated), { code: "simulation_failed" });
+});
+
+test("prepare_agent_link gives no Portal URL to a wallet that cannot sign the link", async t => {
+  const f = await fixture(t);
+  f.chain.registryStatus = async () => assert.fail("a refused wallet reads nothing");
+  await f.store.disable();
+  const refused = await f.service.prepareAgentLink();
+  assert.equal(refused.link_blocked, "wallet_locked"); assert.equal(refused.portal_url, undefined); assert.match(refused.next_action, /Do not ask the user to sign/);
 });
