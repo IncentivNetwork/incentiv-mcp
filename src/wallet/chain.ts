@@ -256,13 +256,16 @@ export class WalletChain {
     }
     // The seller's facilitator submits an x402 payment, possibly through another bundler, so its reported
     // transaction and, once the payment's nonce lane has moved, the EntryPoint's own events are hints too.
-    const hint = await this.bundlerHint(record.userOpHash).catch(() => undefined);
-    if (hint) return this.verifiedReceipt(record, hint);
-    if (record.transactionHash) {
-      const reported = await this.verifiedReceipt(record, record.transactionHash as Hex).catch(() => undefined);
-      if (reported) return reported;
-    }
-    return this.searchOperation(record);
+    // Each hint counts only once verified; a stale or unverifiable one (say after a reorg) falls through to the next.
+    const tried = new Set<string>();
+    const verify = async (hash: Hex | undefined) => {
+      if (!hash || tried.has(hash.toLowerCase())) return;
+      tried.add(hash.toLowerCase());
+      return this.verifiedReceipt(record, hash).catch(() => undefined);
+    };
+    return await verify(await this.bundlerHint(record.userOpHash).catch(() => undefined))
+      ?? await verify(record.transactionHash as Hex | undefined)
+      ?? this.searchOperation(record);
   }
   /**
    * Finds an operation's bundle in the EntryPoint's events, searching back from the head to the block it was

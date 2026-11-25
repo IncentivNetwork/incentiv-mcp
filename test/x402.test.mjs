@@ -151,11 +151,13 @@ test("pays a resource within policy: the signed payment is exactly the quoted on
   assert.deepEqual(await f.used(), { [usdc]: "80000" });
   // Its own nonce lane: a transfer is not blocked while the payment settles.
   assert.equal((await f.service.send("transfer", args(randomUUID()))).status, "submitted");
-  // A retry never pays twice, even before the receipt shows, and the request ID stays bound to this request.
+  // A retry never pays twice, even before the receipt shows: it offers the same signed payment again for the
+  // answer, and the request ID stays bound to this request.
   assert.equal((await f.service.operation(id)).status, "submitted");
   const again = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
-  assert.equal(again.status, "submitted"); assert.match(again.next_action, /new request ID/);
-  assert.equal(f.seen.payments.length, 1);
+  assert.equal(again.status, "submitted"); assert.equal(again.content_delivered, true);
+  assert.equal(f.seen.payments.length, 2); assert.deepEqual(f.seen.payments[1], f.seen.payments[0]);
+  assert.equal((await f.used())[usdc], "80000");
   await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.06", request_id: id }), { code: "idempotency_conflict" });
   await assert.rejects(f.service.send("transfer", args(id)), { code: "idempotency_conflict" });
   f.setReceipt({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
@@ -236,6 +238,36 @@ test("an unsettled payment is cancelled by a replacement on its own nonce lane",
   const replaced = await f.service.replace(id, password, digest(review.records[0]));
   assert.equal(replaced.status, "superseding");
   assert.equal(BigInt(f.submissions.at(-1).nonce), lane);
+  // The payment can still win its lane, so a retry says to wait rather than buy again on another lane.
+  const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(retry.status, "superseding");
+  assert.match(retry.next_action, /wait until it shows superseded.*may pay twice/);
+  assert.doesNotMatch(retry.next_action, /^Use a new request ID/);
+  assert.equal(f.seen.payments.length, 1);
+});
+
+test("a first purchase rechecks policy expiry after simulation, before signing and before first delivery", async t => {
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const expiring = async () => {
+    const f = await x402Fixture(t);
+    await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt: Date.now() + 150 } }));
+    return f;
+  };
+  // Expires while the operation is simulated: nothing is signed or sent.
+  const during = await expiring(), id = randomUUID();
+  const simulate = during.chain.simulate.bind(during.chain);
+  during.chain.simulate = async validated => { await sleep(250); return simulate(validated); };
+  await assert.rejects(during.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), e => e.code === "policy_denied" && /expired.*nothing was paid/.test(e.message));
+  assert.equal(during.seen.payments.length, 0);
+  assert.equal((await during.service.operation(id)).status, "failed");
+  assert.deepEqual(await during.used(), {});
+  // Expires after signing, before the payment first leaves: it stays unsent and expires at its deadline.
+  const after = await expiring(), other = randomUUID();
+  const stateFor = after.chain.stateFor.bind(after.chain);
+  after.chain.stateFor = async (...a) => { await sleep(250); return stateFor(...a); };
+  await assert.rejects(after.service.payX402({ url: URL_, max_amount: "0.05", request_id: other }), e => e.code === "policy_denied" && /policy_expired.*never sent/.test(e.message));
+  assert.equal(after.seen.payments.length, 0);
+  assert.equal((await after.service.operation(other)).status, "signed");
 });
 
 test("a signed payment that never left this computer is rechecked against full wallet policy before it is first sent", async t => {
@@ -272,8 +304,13 @@ test("a settled payment whose answer was lost is offered to the seller again, ne
   assert.equal(served.content_delivered, true);
   assert.deepEqual(JSON.parse(served.content.text), { tempC: 21 });
   assert.deepEqual(f.seen.payments[1], f.seen.payments[0]);
-  assert.match((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).next_action, /answer was returned/);
-  assert.equal(f.seen.payments.length, 2);
+  // The answer was handed back, but whether it reached the caller is unknown: a retry asks the seller again.
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).content_delivered, true);
+  assert.equal(f.seen.payments.length, 3); assert.deepEqual(f.seen.payments[2], f.seen.payments[0]);
+  f.seen.refuse = true;
+  const unsure = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(unsure.content_delivered, false);
+  assert.match(unsure.next_action, /cannot tell whether it reached you.*pays again/);
 
   const lost = await x402Fixture(t), other = randomUUID();
   lost.seen.fail = 1;
@@ -317,6 +354,16 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   assert.deepEqual(calls.logs, [[500n, 1000n]]); // From the head back to the block it was signed at.
   ({ chain, calls } = make(true));
   assert.deepEqual(await chain.receipt(record), expected);
+  // A stale bundler hash, one that fails verification or is no longer found, falls through to the other sources.
+  ({ chain, calls } = make(true));
+  chain.bundlerHint = async () => wrong;
+  assert.deepEqual(await chain.receipt({ ...record, transactionHash: tx }), expected);
+  assert.equal(calls.logs.length, 0);
+  ({ chain, calls } = make(true));
+  chain.bundlerHint = async () => wrong;
+  for (const client of chain.clients) { const get = client.getTransactionReceipt; client.getTransactionReceipt = async a => { if (a.hash === wrong) throw new Error("not found"); return get(a); }; }
+  assert.deepEqual(await chain.receipt(record), expected);
+  assert.deepEqual(calls.logs, [[500n, 1000n]]);
   ({ chain, calls } = make(false));
   assert.equal(await chain.receipt(record), undefined);
   assert.equal(calls.logs.length, 0);

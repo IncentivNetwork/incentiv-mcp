@@ -405,10 +405,10 @@ export class WalletService {
         // A payment that never left this computer is sent only if current wallet policy still allows it (checked in
         // deliverX402); one that did is resent unchanged while the seller can still accept it, since it may hold it.
         if (["signed", "submission_unknown"].includes(existing.status)) return this.deliverX402(s, journal, existing, req, limits);
-        if (existing.status === "submitted" || existing.status === "confirmed") {
-          if (existing.delivered) return { ...x402Result(existing), next_action: "This payment settled and its answer was returned when it was paid. To buy again, use a new request ID." };
-          return this.redeliverX402(journal, existing, req);
-        }
+        // Whether an answer handed back earlier reached the caller is unknown here, so a retry asks the seller again.
+        if (existing.status === "submitted" || existing.status === "confirmed") return this.redeliverX402(journal, existing, req);
+        // Either the payment or its cancellation will take the nonce lane; a new request ID uses another lane, so both could pay.
+        if (existing.status === "superseding") return { ...x402Result(existing), next_action: "A cancellation of this payment is pending, and the payment itself may still settle instead. Check get_agent_operation and wait until it shows superseded (cancelled, nothing paid) or confirmed (paid; retry this request ID for the answer). Buying again with a new request ID before then may pay twice." };
         return { ...x402Result(existing), next_action: "Use a new request ID to try again." };
       }
       if (!limits.x402) throw new WalletError("policy_denied", "x402 payments are off in local wallet policy; the user can enable them with incentiv-mcp setup");
@@ -453,6 +453,7 @@ export class WalletService {
         r.operation = wire; r.userOpHash = validated.hash; r.nonce = laneNonce.toString(); r.deadline = validUntil; r.reservation = validated.spend; r.fromBlock = state.block.toString();
         await this.chain.simulate(validated);
         if (validUntil <= Math.floor(Date.now() / 1000) + 5) throw new WalletError("validation_failed", "The seller's payment window closed while the payment was prepared; retry with a new request ID");
+        assertPolicyLive(limits, "it expired while the payment was prepared; nothing was paid");
         await this.canSubmit(s, r);
         r.operation.signature = await this.signRaw(s, validated.hash);
         await this.canSubmit(s, r);
@@ -463,7 +464,7 @@ export class WalletService {
         if (failure) throw failure;
         throw new WalletError("validation_failed", "Local x402 payment preparation failed");
       }
-      return this.deliverX402(s, journal, r, req);
+      return this.deliverX402(s, journal, r, req, limits);
     });
   }
 
@@ -485,8 +486,9 @@ export class WalletService {
   }
 
   /**
-   * The payment settled but its answer never reached the caller. The same payment is offered to the seller once
-   * more: its nonce is used, so it cannot be charged again, and a seller that still recognises it may serve it.
+   * The seller reported or the chain shows this payment settled, but its answer may not have reached the caller:
+   * the process can stop after the answer is recorded and before the tool returns. The same signed payment is
+   * offered to the seller once more; it owns one nonce, so it cannot be charged again, and the seller may serve it.
    */
   private async redeliverX402(journal: Journal, r: OperationRecord, req: X402Request) {
     const x = r.intent.x402!;
@@ -496,18 +498,25 @@ export class WalletService {
       r.delivered = true; r.sequence = ++journal.data.sequence; await journal.save();
       return { ...x402Result(r), content_delivered: true, content: responseContent(response), next_action: "This payment had settled without its answer; the seller has now served it. Nothing more was paid." };
     }
-    return { ...x402Result(r), content_delivered: false, ...(response ? { http_status: response.status } : {}), next_action: `This payment settled${r.transactionHash ? ` in ${r.transactionHash}` : ""}, but its answer was lost and the seller did not serve it again. Nothing more was paid. Buying again with a new request ID pays again; ask the seller to honour this payment instead.` };
+    const where = r.transactionHash ? ` in ${r.transactionHash}` : "";
+    return { ...x402Result(r), content_delivered: false, ...(response ? { http_status: response.status } : {}), next_action: r.delivered
+      ? `This payment settled${where} and its answer was handed back when it was paid, but this wallet cannot tell whether it reached you, and the seller did not serve it again. Nothing more was paid. Buying again with a new request ID pays again; if the answer was lost, ask the seller to honour this payment instead.`
+      : `This payment settled${where}, but its answer was lost and the seller did not serve it again. Nothing more was paid. Buying again with a new request ID pays again; ask the seller to honour this payment instead.` };
   }
 
   /** Sends the signed payment with the request, and records what the seller answered. */
-  private async deliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request, recheck?: Limits) {
+  private async deliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request, limits: Limits) {
     const x = r.intent.x402!;
     if (x.validUntil <= Math.floor(Date.now() / 1000)) {
       if (r.status === "signed") { r.lastError = "x402_payment_expired"; await journal.transition(r, "expired"); return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." }; }
       return { ...x402Result(r), next_action: X402_UNKNOWN_ACTION(r.requestId) };
     }
-    if (recheck && r.status === "signed") await this.recheckX402(s, journal, r, recheck);
+    // First delivery is a fresh spend on either path: policy may have expired or changed while the payment was
+    // simulated or waited unsent. A payment the seller may already hold is resent unchanged.
+    const first = r.status === "signed";
+    if (first) await this.recheckX402(s, journal, r, limits);
     await this.canSubmit(s, r);
+    if (first) assertPolicyLive(limits, "it was never sent and expires unpaid");
     r.attempts++;
     await journal.transition(r, "submitting"); // From here the seller may hold the signed payment.
     const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
@@ -716,6 +725,11 @@ const nativeGasHint = (cfg: Config, gasToken: string) => gasToken === "native" ?
 /** Every policy exception records its reasons. Without any, a retry re-evaluates the request, so there is nothing to approve. */
 export function assertNeedsApproval(r: OperationRecord) {
   if (r.status === "approval_required" && !r.reasons?.length) throw new WalletError("validation_failed", "This request does not need terminal approval; retry it with the same request ID");
+}
+
+/** Policy expiry is checked again at the last moment before a payment is signed or first leaves this computer. */
+function assertPolicyLive(limits: Limits, consequence: string) {
+  if (limits.expiresAt && Date.now() >= limits.expiresAt) throw new WalletError("policy_denied", `Local wallet policy expired; ${consequence}`);
 }
 
 const X402_UNKNOWN_ACTION = (id: string) => `Its amount stays reserved until the payment settles or is cancelled. Check get_agent_operation; to cancel it, the user runs incentiv-mcp wallet operation resolve ${id} --replace in their own terminal.`;
