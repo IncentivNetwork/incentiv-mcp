@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
-import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, erc20Abi, getAddress, parseAbiItem, recoverMessageAddress } from "viem";
+import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, erc20Abi, getAddress, HttpRequestError, parseAbiItem, recoverMessageAddress } from "viem";
 import { decodePaymentSignatureHeader, encodePaymentRequiredHeader, encodePaymentResponseHeader } from "@x402/core/http";
 import * as incentiv from "@incentiv/x402";
 import { args, fixture, limits, password, recipient } from "../scripts/wallet-pipeline-fixture.mjs";
@@ -119,7 +119,9 @@ async function x402Fixture(t, { policy = x402Policy, usdcLimits = {} } = {}) {
   const tokens = { ...limits.tokens, [usdc]: { perTransaction: "1000000", daily: "2000000", exposure: "100000000", gasPayment: "100000", ...usdcLimits } };
   await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, limits: limitsSchema.parse({ ...limits, tokens, targets: { [usdc]: ["0xa9059cbb"] }, ...(policy ? { x402: policy } : {}) }) }));
   f.chain.balances = async (_wallet, list) => Object.fromEntries(list.map(token => [token.toLowerCase(), token === "native" ? "1000000" : token.toLowerCase() === usdc ? "5000000" : "0"]));
-  f.chain.laneNonce = async (_wallet, key) => key << 64n;
+  // A lane is unused until a test settles its payment; settle() marks every payment's lane used, as a receipt does.
+  const usedLanes = new Set();
+  f.chain.laneNonce = async (_wallet, key) => (key << 64n) + (usedLanes.has(key) ? 1n : 0n);
   // The wallet builds the payment like a transfer; offline, the reference shape stands in for the bundler's estimate.
   const build = f.chain.build;
   f.chain.build = async (wallet, intent, state) => intent.kind !== "x402_payment" ? build(wallet, intent, state)
@@ -135,13 +137,18 @@ async function x402Fixture(t, { policy = x402Policy, usdcLimits = {} } = {}) {
   };
   const owner = await f.store.session(async s => s.envelope.owner);
   const used = () => f.store.session(async s => (await Journal.open(s)).used());
-  return { ...f, seen, owner, used };
+  const records = () => f.store.session(async s => (await Journal.open(s)).data.records);
+  const settle = async receipt => { f.setReceipt(receipt); for (const r of await records()) if (r.nonce) usedLanes.add(BigInt(r.nonce) >> 64n); };
+  const unsettle = () => { f.setReceipt(undefined); usedLanes.clear(); };
+  return { ...f, seen, owner, used, settle, unsettle, records };
 }
 
 test("pays a resource within policy: the signed payment is exactly the quoted one, journaled first, on its own nonce lane", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   const paid = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   assert.equal(paid.status, "submitted");
+  assert.equal(paid.seller_reported_settlement, true); assert.equal(paid.settlement_confirmed, false);
+  assert.match(paid.next_action, /pending until get_agent_operation shows it confirmed/);
   assert.deepEqual(JSON.parse(paid.content.text), { tempC: 21 });
   assert.equal(paid.content.third_party_content, true);
   assert.equal(paid.settlement.success, true);
@@ -175,7 +182,7 @@ test("pays a resource within policy: the signed payment is exactly the quoted on
   assert.equal((await f.used())[usdc], "80000");
   await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.06", request_id: id }), { code: "idempotency_conflict" });
   await assert.rejects(f.service.send("transfer", args(id)), { code: "idempotency_conflict" });
-  f.setReceipt({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
   assert.equal((await f.service.operation(id)).status, "confirmed");
   assert.equal((await f.used())[usdc], "80000");
 });
@@ -541,11 +548,79 @@ test("an unpaid POST is bound to its request ID before it is sent, so a retry ne
   assert.equal(priced.seen.unpaid, 2);
 });
 
+test("a confirmation the chain drops reopens the payment, which is not sent again until it settles", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  // A reorg drops the receipt and the nonce is unused again; meanwhile policy no longer allows x402.
+  f.unsettle();
+  await f.store.session(async s => { const { x402, ...rest } = s.envelope.policy.limits; await s.savePolicy({ ...s.envelope.policy, limits: rest }); });
+  const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(retry.status, "submitted"); assert.equal(retry.last_error, "x402_confirmation_rolled_back");
+  assert.match(retry.next_action, /no longer shows this payment's settlement/);
+  assert.equal(f.seen.payments.length, 1);
+  assert.equal((await f.used())[usdc], "80000");
+});
+
+test("terminal x402 payments are compacted after two days, keeping the request ID's binding and the daily spend", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  await f.service.operation(id);
+  const size = async () => f.store.session(async s => JSON.stringify((await Journal.open(s)).data).length);
+  const before = await size();
+  assert.equal((await f.records())[0].intent.x402.compacted, undefined); // Too recent.
+  await f.store.session(async s => { const journal = await Journal.open(s); journal.data.records[0].updatedAt -= 3 * 86_400_000; await journal.save(); });
+  await f.service.operation(id);
+  const [r] = await f.records();
+  assert.equal(r.intent.x402.compacted, true);
+  assert.match(r.intent.x402.accepted, /^0x[0-9a-f]{64}$/);
+  assert.equal(r.intent.x402.resource, undefined); assert.equal(r.operation, undefined);
+  assert.equal(r.intentHash, digest(r.intent));
+  assert.ok(await size() < before);
+  assert.equal(r.consumed[usdc], "80000");
+  const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(retry.content_delivered, false); assert.match(retry.next_action, /compacted/);
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.06", request_id: id }), { code: "idempotency_conflict" });
+  assert.equal(f.seen.payments.length, 1);
+});
+
+test("an unpaid POST answered by a 402 that is not an x402 challenge stays bound as uncertain", async t => {
+  const f = await x402Fixture(t), post = { url: URL_, method: "POST", body: "{}", max_amount: "0.05", request_id: randomUUID() };
+  let handled = 0;
+  f.service.http = async () => { handled++; return { status: 402, headers: {}, body: Buffer.from("Payment required by the application"), truncated: false }; };
+  await assert.rejects(f.service.payX402(post), { code: "x402_invalid_response" });
+  await assert.rejects(f.service.payX402(post), { code: "x402_request_uncertain" });
+  assert.equal(handled, 1);
+  // A blank Idempotency-Key does not count as one.
+  assert.throws(() => x402Request({ url: URL_, method: "POST", body: "{}", headers: { "Idempotency-Key": "   " } }), { code: "validation_failed" });
+});
+
+test("a failed search for the original payment does not hide a mined cancellation", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  f.seen.refuse = true;
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const review = await f.service.reviewReplacement(id, true);
+  await f.service.replace(id, password, digest(review.records[0]));
+  const cancel = review.records[0].replacement.userOpHash;
+  f.chain.receipt = async r => { if (r.userOpHash !== cancel) throw new Error("eth_getLogs failed"); return { success: true, actualGasCost: 5n, transactionHash: `0x${"ee".repeat(32)}` }; };
+  assert.equal((await f.service.operation(id)).status, "superseded");
+});
+
+test("an RPC failure while a payment is rechecked is reported as rpc_unavailable", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  f.seen.fail = 1;
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  f.chain.stateFor = async () => { throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 }); };
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), { code: "rpc_unavailable" });
+});
+
 test("a paid POST is never repeated to recover its answer", async t => {
   const f = await x402Fixture(t), id = randomUUID(), post = { url: URL_, method: "POST", body: '{"city":"Kyiv"}', max_amount: "0.05", request_id: id };
   const paid = await f.service.payX402(post);
   assert.equal(paid.status, "submitted");
-  f.setReceipt({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
   const retry = await f.service.payX402(post);
   assert.equal(retry.status, "confirmed");
   assert.equal(retry.content_delivered, false);
@@ -557,7 +632,7 @@ test("a settled payment whose answer was lost is offered to the seller again, ne
   const f = await x402Fixture(t), id = randomUUID();
   f.seen.fail = 1;
   assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submission_unknown");
-  f.setReceipt({ success: true, actualGasCost: 1n, transactionHash: `0x${"cd".repeat(32)}` });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"cd".repeat(32)}` });
   const served = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   assert.equal(served.status, "confirmed");
   assert.equal(served.content_delivered, true);
@@ -574,7 +649,7 @@ test("a settled payment whose answer was lost is offered to the seller again, ne
   const lost = await x402Fixture(t), other = randomUUID();
   lost.seen.fail = 1;
   await lost.service.payX402({ url: URL_, max_amount: "0.05", request_id: other });
-  lost.setReceipt({ success: true, actualGasCost: 1n, transactionHash: `0x${"cd".repeat(32)}` });
+  await lost.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"cd".repeat(32)}` });
   lost.seen.refuse = true;
   const unserved = await lost.service.payX402({ url: URL_, max_amount: "0.05", request_id: other });
   assert.equal(unserved.status, "confirmed");

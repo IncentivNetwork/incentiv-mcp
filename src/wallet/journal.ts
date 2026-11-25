@@ -19,6 +19,9 @@ export const x402IntentSchema = z.strictObject({
   url: z.string().max(2048), origin: z.string().max(256), method: z.enum(["GET", "POST"]), request: hash, maxAmount: uint,
   accepted: z.string().max(8192), resource: z.string().max(8192).optional(),
   paymentId: hash, validUntil: z.number().int().positive(),
+  // Set once a terminal payment is compacted: `accepted` then holds a digest of the seller's terms, and `resource`
+  // and the signed operation are dropped, so x402 volume cannot fill the journal.
+  compacted: z.literal(true).optional(),
 });
 export const intentSchema = z.strictObject({
   intentSchemaVersion: z.literal(1), kind: z.enum(["transfer", "swap", "link_agent", "unlink_agent", "x402_payment"]),
@@ -97,7 +100,8 @@ const transitions: Record<OperationRecord["status"], string[]> = {
   submitted: ["confirmed", "reverted", "submission_unknown", "superseding"],
   submission_unknown: ["submitting", "submitted", "confirmed", "reverted", "superseding"],
   superseding: ["confirmed", "reverted", "superseded"],
-  confirmed: [], reverted: [], failed: [], cancelled: [], expired: [], superseded: [],
+  // Only an x402 payment whose confirmation the chain no longer shows (its nonce is unused again) reopens.
+  confirmed: ["submitted"], reverted: [], failed: [], cancelled: [], expired: [], superseded: [],
 };
 
 /** One atomic authenticated snapshot retains every request for the wallet lifetime.

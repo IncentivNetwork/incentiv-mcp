@@ -103,7 +103,9 @@ export class WalletService {
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
       try {
         const searched = r.searchedBlock;
-        const receipt = await this.chain.receipt(r);
+        // A failed lookup of the original must not hide a mined cancellation: the two are looked up independently.
+        let lookupError: unknown;
+        const receipt = await this.chain.receipt(r).catch((error: unknown) => { if (error instanceof WalletError) throw error; lookupError = error; return undefined; });
         // Search progress is kept, so a payment settled long ago is reached over several reconciliations.
         if (!receipt && r.searchedBlock !== searched) { r.sequence = ++journal.data.sequence; await journal.save(); }
         if (!receipt && r.replacement?.signed) {
@@ -118,6 +120,7 @@ export class WalletService {
             await journal.transition(r, "superseded"); continue;
           }
         }
+        if (lookupError) throw lookupError;
         // For an x402 payment, submitted means the seller reported its settlement; keep that until the receipt shows.
         const settledBySeller = r.intent.kind === "x402_payment" && r.status === "submitted";
         if (!receipt) { if (r.status === "submitted" && !settledBySeller) await journal.transition(r, "submission_unknown"); continue; }
@@ -140,6 +143,7 @@ export class WalletService {
         if (r.status === "submitted" && r.intent.kind !== "x402_payment") await journal.transition(r, "submission_unknown");
       }
     }
+    await compactX402(journal);
   }
   /**
    * Connections are permanent: an unlink an earlier build signed is never sent, whatever the current policy says.
@@ -407,107 +411,117 @@ export class WalletService {
     const gasToken = ["native", cfg.identity.nativeSymbol.toLowerCase()].includes(gasRef.toLowerCase()) ? "native" : gasRef.toUpperCase() === "USDC" || gasRef.toLowerCase() === xcfg.usdc.toLowerCase() ? xcfg.usdc.toLowerCase() : undefined;
     if (!gasToken) throw new WalletError("validation_failed", "gas_token must be USDC or native for an x402 payment");
     const request = digest({ ...req, maxAmount: maxAmount.toString(), gasToken });
-    return this.store.session(async s => {
-      const limits = await this.enabled(s);
-      const journal = await Journal.open(s); await this.reconcile(journal);
-      const existing = journal.data.records.find(r => r.requestId === requestId);
-      if (existing) {
-        if (existing.intent.kind !== "x402_payment" || existing.intent.x402!.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
-        // Any send needs current wallet policy (checked in deliverX402): even after an uncertain attempt, the seller
-        // may never have received the signature. A payment the seller may hold is resent unchanged.
-        if (existing.status === "signed") return this.deliverX402(s, journal, existing, req, limits);
-        if (existing.status === "submission_unknown") {
-          // The seller may already have run a POST it received; sending it again could run it twice.
-          if (!replayable(req)) return { ...x402Result(existing), content_delivered: false, next_action: `The seller may already have received and acted on this POST, so this wallet does not send it again without an Idempotency-Key header. ${X402_UNKNOWN_ACTION(existing.requestId)}` };
-          return this.deliverX402(s, journal, existing, req, limits);
-        }
-        // Whether an answer handed back earlier reached the caller is unknown here, so a retry may ask the seller again.
-        if (existing.status === "submitted" || existing.status === "confirmed") return this.redeliverX402(s, journal, existing, req);
-        // Either the payment or its cancellation will take the nonce lane; a new request ID uses another lane, so both could pay.
-        if (existing.status === "superseding") return { ...x402Result(existing), next_action: "A cancellation of this payment is pending, and the payment itself may still settle instead. Check get_agent_operation and wait until it shows superseded (cancelled, nothing paid) or confirmed (paid; retry this request ID for the answer). Buying again with a new request ID before then may pay twice." };
-        return { ...x402Result(existing), next_action: "Use a new request ID to try again." };
+    // A chain read that fails while a payment is checked or recovered is an RPC outage, not wallet damage.
+    return this.store.session(async s => this.payX402In(s, requestId, req, request, maxAmount, gasToken).catch((error: unknown) => {
+      if (isTransportFailure(error)) throw new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry with the same request ID");
+      throw error;
+    }));
+  }
+  private async payX402In(s: WalletSession, requestId: string, req: X402Request, request: Hex, maxAmount: bigint, gasToken: string) {
+    const cfg = this.ctx.config, xcfg = x402Config(cfg);
+    const limits = await this.enabled(s);
+    const journal = await Journal.open(s); await this.reconcile(journal);
+    const existing = journal.data.records.find(r => r.requestId === requestId);
+    if (existing) {
+      if (existing.intent.kind !== "x402_payment" || existing.intent.x402!.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
+      // Any send needs current wallet policy (checked in deliverX402): even after an uncertain attempt, the seller
+      // may never have received the signature. A payment the seller may hold is resent unchanged.
+      if (existing.status === "signed") return this.deliverX402(s, journal, existing, req, limits);
+      if (existing.status === "submission_unknown") {
+        // The seller may already have run a POST it received; sending it again could run it twice.
+        if (!replayable(req)) return { ...x402Result(existing), content_delivered: false, next_action: `The seller may already have received and acted on this POST, so this wallet does not send it again without an Idempotency-Key header. ${X402_UNKNOWN_ACTION(existing.requestId)}` };
+        return this.deliverX402(s, journal, existing, req, limits);
       }
-      if (!limits.x402) throw new WalletError("policy_denied", "x402 payments are off in local wallet policy; the user can enable them with incentiv-mcp setup");
-      const early = x402Violations(limits, req.origin, "0x0000000000000000000000000000000000000000", "0").filter(r => r !== "x402_pay_to_not_allowed");
-      if (early.length) throw new WalletError("policy_denied", `Local wallet policy refuses this resource: ${early.join(", ")}`);
+      // Whether an answer handed back earlier reached the caller is unknown here, so a retry may ask the seller again.
+      if (existing.status === "submitted" || existing.status === "confirmed") return this.redeliverX402(s, journal, existing, req);
+      // Either the payment or its cancellation will take the nonce lane; a new request ID uses another lane, so both could pay.
+      if (existing.status === "superseding") return { ...x402Result(existing), next_action: "A cancellation of this payment is pending, and the payment itself may still settle instead. Check get_agent_operation and wait until it shows superseded (cancelled, nothing paid) or confirmed (paid; retry this request ID for the answer). Buying again with a new request ID before then may pay twice." };
+      return { ...x402Result(existing), next_action: "Use a new request ID to try again." };
+    }
+    if (!limits.x402) throw new WalletError("policy_denied", "x402 payments are off in local wallet policy; the user can enable them with incentiv-mcp setup");
+    const early = x402Violations(limits, req.origin, "0x0000000000000000000000000000000000000000", "0").filter(r => r !== "x402_pay_to_not_allowed");
+    if (early.length) throw new WalletError("policy_denied", `Local wallet policy refuses this resource: ${early.join(", ")}`);
 
-      // A request that cannot safely be sent twice is bound to its request ID before the unpaid request goes out:
-      // a resource that needs no payment acts on it straight away.
-      let probe = journal.data.probes?.find(p => p.requestId === requestId);
-      if (probe) {
-        if (probe.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
-        if (probe.outcome === "not_required") return { request_id: requestId, status: "not_required", content_delivered: false, next_action: "This POST was already sent under this request ID and needed no payment; its answer was returned then. This wallet does not send it again: use a new request ID to send it again." };
-        if (probe.outcome === "sending") throw new WalletError("x402_request_uncertain", "This POST may already have reached the resource under this request ID, which may have acted on it. Nothing was paid. This wallet does not send it again: use a new request ID to send it again.");
-      }
-      const bind = async (outcome: "sending" | "payment_required" | "not_required" | undefined) => {
-        if (replayable(req)) return;
-        journal.data.probes = (journal.data.probes ?? []).filter(p => p.requestId !== requestId);
-        if (outcome) { probe = { requestId, request, outcome, at: Date.now() }; journal.data.probes.push(probe); }
-        await journal.save();
-      };
-      await bind("sending");
-      const unpaid = await this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES }).catch(async (error: unknown) => {
-        // A failure that proves nothing was sent unbinds it; otherwise the resource may have acted on it.
-        if (neverSent(error)) await bind(undefined);
-        if (error instanceof WalletError) throw error;
-        const uncertain = !neverSent(error) && !replayable(req) ? " The resource may have received this POST, so this wallet does not send it again under this request ID." : "";
-        throw new WalletError("x402_request_failed", `The resource could not be reached, so nothing was paid: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}.${uncertain}`);
-      });
-      await bind(unpaid.status === 402 ? "payment_required" : "not_required");
-      if (unpaid.status !== 402) return { request_id: requestId, status: "not_required", content: responseContent(unpaid), next_action: "No payment was needed or made." };
-      const required = parsePaymentRequired(unpaid);
-      const accepted = selectRequirements(required, cfg);
-      const amount = BigInt(accepted.amount);
-      if (amount > maxAmount) throw new WalletError("x402_price_above_max", `The resource asks ${formatUnits(amount, USDC_DECIMALS)} USDC, above max_amount ${formatUnits(maxAmount, USDC_DECIMALS)}; nothing was paid`);
-      const payTo = getAddress(accepted.payTo).toLowerCase();
-      const refused = x402Violations(limits, req.origin, payTo, accepted.amount);
-      if (refused.length) throw new WalletError("policy_denied", `Local wallet policy refuses this payment: ${refused.join(", ")}; nothing was paid`);
-
-      const paymentId = `0x${randomBytes(32).toString("hex")}` as Hex;
-      const validUntil = Math.floor(Date.now() / 1000) + accepted.maxTimeoutSeconds;
-      // The seller chooses the size of its terms; terms too large to journal are its error, not this wallet's.
-      const parsed = intentSchema.safeParse({
-        intentSchemaVersion: 1, kind: "x402_payment", token: xcfg.usdc.toLowerCase(), amount: accepted.amount, gasToken, to: payTo, slippageBps: 0, feeTier: 3000,
-        x402: { url: req.url, origin: req.origin, method: req.method, request, maxAmount: maxAmount.toString(), accepted: JSON.stringify(accepted), ...(required.resource ? { resource: JSON.stringify(required.resource) } : {}), paymentId, validUntil },
-      });
-      if (!parsed.success) throw new WalletError("x402_invalid_response", "The resource's payment terms or URL are too large to record; nothing was paid");
-      const intent = parsed.data;
-      const r = await journal.create(requestId, intent);
-      try {
-        const state = await this.chain.state(s.envelope);
-        const key = paymentNonceKey(paymentId, validUntil);
-        const [balances, laneNonce, x402] = await Promise.all([this.chain.balances(s.envelope, this.balanceTokens(limits)), this.chain.laneNonce(s.envelope, key, state.block), this.x402Loader()]);
-        // Built like a transfer, so the USDC gas fee follows the pinned paymaster's fee schedule (the reference
-        // client in @incentiv/x402 0.1.1 prices it from a CENT quote instead). It then has to pass that package's
-        // own check of the SPEC 4.3 shape, and this wallet's validator.
-        const prepared = await this.chain.build(s.envelope, intent, { ...state, nonce: laneNonce }).catch((error: unknown) => {
-          if (error instanceof WalletError || isTransportFailure(error)) throw error;
-          throw new WalletError("validation_failed", `Could not prepare the payment: ${error instanceof Error ? error.message.slice(0, 300) : "unknown error"}`);
-        });
-        try { x402.checkPaysRequirements(x402.decodePaymentOp(prepared.op as Parameters<typeof x402.decodePaymentOp>[0], xcfg), accepted); }
-        catch { throw new WalletError("validation_failed", "The prepared payment does not pay exactly what the resource asked"); }
-        const wire = userOpToJson(prepared.op);
-        const validated = validateOperation(cfg, s.envelope, intent, wire, { nonce: laneNonce, deployed: state.deployed, hash: prepared.userOpHash });
-        const used = journal.used();
-        const violations = policyViolations(limits, { token: intent.token, amount: intent.amount, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken, gasCharge: validated.gasCharge, calls: validated.calls, x402: { origin: req.origin, payTo } });
-        if (violations.length) { r.reasons = violations; throw new WalletError("policy_denied", `Local wallet policy refuses this payment: ${violations.join(", ")}; nothing was paid`); }
-        for (const [token, value] of Object.entries(validated.spend)) if (BigInt(balances[token] ?? "0") < BigInt(value)) throw new WalletError("policy_denied", "Balance cannot cover the price plus the maximum gas payment; nothing was paid");
-        r.operation = wire; r.userOpHash = validated.hash; r.nonce = laneNonce.toString(); r.deadline = validUntil; r.reservation = validated.spend; r.fromBlock = state.block.toString();
-        await this.chain.simulate(validated);
-        if (validUntil <= Math.floor(Date.now() / 1000) + 5) throw new WalletError("validation_failed", "The seller's payment window closed while the payment was prepared; retry with a new request ID");
-        assertPolicyLive(limits, "it expired while the payment was prepared; nothing was paid");
-        await this.canSubmit(s, r);
-        r.operation.signature = await this.signRaw(s, validated.hash);
-        await this.canSubmit(s, r);
-        await journal.transition(r, "signed"); // fsync completes before the payment leaves this computer.
-      } catch (error) {
-        const failure = error instanceof WalletError ? error : isTransportFailure(error) ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry with a new request ID") : undefined;
-        if (r.status === "preparing") { r.lastError = failure?.code ?? "validation_failed"; await journal.transition(r, "failed"); }
-        if (failure) throw failure;
-        throw new WalletError("validation_failed", "Local x402 payment preparation failed");
-      }
-      return this.deliverX402(s, journal, r, req, limits);
+    // A request that cannot safely be sent twice is bound to its request ID before the unpaid request goes out:
+    // a resource that needs no payment acts on it straight away.
+    let probe = journal.data.probes?.find(p => p.requestId === requestId);
+    if (probe) {
+      if (probe.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
+      if (probe.outcome === "not_required") return { request_id: requestId, status: "not_required", content_delivered: false, next_action: "This POST was already sent under this request ID and needed no payment; its answer was returned then. This wallet does not send it again: use a new request ID to send it again." };
+      if (probe.outcome === "sending") throw new WalletError("x402_request_uncertain", "This POST may already have reached the resource under this request ID, which may have acted on it. Nothing was paid. This wallet does not send it again: use a new request ID to send it again.");
+    }
+    const bind = async (outcome: "sending" | "payment_required" | "not_required" | undefined) => {
+      if (replayable(req)) return;
+      journal.data.probes = (journal.data.probes ?? []).filter(p => p.requestId !== requestId);
+      if (outcome) { probe = { requestId, request, outcome, at: Date.now() }; journal.data.probes.push(probe); }
+      await journal.save();
+    };
+    await bind("sending");
+    const unpaid = await this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES }).catch(async (error: unknown) => {
+      // A failure that proves nothing was sent unbinds it; otherwise the resource may have acted on it.
+      if (neverSent(error)) await bind(undefined);
+      if (error instanceof WalletError) throw error;
+      const uncertain = !neverSent(error) && !replayable(req) ? " The resource may have received this POST, so this wallet does not send it again under this request ID." : "";
+      throw new WalletError("x402_request_failed", `The resource could not be reached, so nothing was paid: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}.${uncertain}`);
     });
+    if (unpaid.status !== 402) { await bind("not_required"); return { request_id: requestId, status: "not_required", content: responseContent(unpaid), next_action: "No payment was needed or made." }; }
+    // Only a valid x402 challenge shows the resource did not act on the request; a plain 402 may follow a side
+    // effect, so the binding stays uncertain if it is not one.
+    const required = parsePaymentRequired(unpaid);
+    await bind("payment_required");
+    const accepted = selectRequirements(required, cfg);
+    const amount = BigInt(accepted.amount);
+    if (amount > maxAmount) throw new WalletError("x402_price_above_max", `The resource asks ${formatUnits(amount, USDC_DECIMALS)} USDC, above max_amount ${formatUnits(maxAmount, USDC_DECIMALS)}; nothing was paid`);
+    const payTo = getAddress(accepted.payTo).toLowerCase();
+    const refused = x402Violations(limits, req.origin, payTo, accepted.amount);
+    if (refused.length) throw new WalletError("policy_denied", `Local wallet policy refuses this payment: ${refused.join(", ")}; nothing was paid`);
+
+    const paymentId = `0x${randomBytes(32).toString("hex")}` as Hex;
+    const validUntil = Math.floor(Date.now() / 1000) + accepted.maxTimeoutSeconds;
+    // The seller chooses the size of its terms; terms too large to journal are its error, not this wallet's.
+    const parsed = intentSchema.safeParse({
+      intentSchemaVersion: 1, kind: "x402_payment", token: xcfg.usdc.toLowerCase(), amount: accepted.amount, gasToken, to: payTo, slippageBps: 0, feeTier: 3000,
+      x402: { url: req.url, origin: req.origin, method: req.method, request, maxAmount: maxAmount.toString(), accepted: JSON.stringify(accepted), ...(required.resource ? { resource: JSON.stringify(required.resource) } : {}), paymentId, validUntil },
+    });
+    if (!parsed.success) throw new WalletError("x402_invalid_response", "The resource's payment terms or URL are too large to record; nothing was paid");
+    const intent = parsed.data;
+    // The payment record now binds the request ID; its probe is no longer needed.
+    if (journal.data.probes) journal.data.probes = journal.data.probes.filter(p => p.requestId !== requestId);
+    const r = await journal.create(requestId, intent);
+    try {
+      const state = await this.chain.state(s.envelope);
+      const key = paymentNonceKey(paymentId, validUntil);
+      const [balances, laneNonce, x402] = await Promise.all([this.chain.balances(s.envelope, this.balanceTokens(limits)), this.chain.laneNonce(s.envelope, key, state.block), this.x402Loader()]);
+      // Built like a transfer, so the USDC gas fee follows the pinned paymaster's fee schedule (the reference
+      // client in @incentiv/x402 0.1.1 prices it from a CENT quote instead). It then has to pass that package's
+      // own check of the SPEC 4.3 shape, and this wallet's validator.
+      const prepared = await this.chain.build(s.envelope, intent, { ...state, nonce: laneNonce }).catch((error: unknown) => {
+        if (error instanceof WalletError || isTransportFailure(error)) throw error;
+        throw new WalletError("validation_failed", `Could not prepare the payment: ${error instanceof Error ? error.message.slice(0, 300) : "unknown error"}`);
+      });
+      try { x402.checkPaysRequirements(x402.decodePaymentOp(prepared.op as Parameters<typeof x402.decodePaymentOp>[0], xcfg), accepted); }
+      catch { throw new WalletError("validation_failed", "The prepared payment does not pay exactly what the resource asked"); }
+      const wire = userOpToJson(prepared.op);
+      const validated = validateOperation(cfg, s.envelope, intent, wire, { nonce: laneNonce, deployed: state.deployed, hash: prepared.userOpHash });
+      const used = journal.used();
+      const violations = policyViolations(limits, { token: intent.token, amount: intent.amount, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken, gasCharge: validated.gasCharge, calls: validated.calls, x402: { origin: req.origin, payTo } });
+      if (violations.length) { r.reasons = violations; throw new WalletError("policy_denied", `Local wallet policy refuses this payment: ${violations.join(", ")}; nothing was paid`); }
+      for (const [token, value] of Object.entries(validated.spend)) if (BigInt(balances[token] ?? "0") < BigInt(value)) throw new WalletError("policy_denied", "Balance cannot cover the price plus the maximum gas payment; nothing was paid");
+      r.operation = wire; r.userOpHash = validated.hash; r.nonce = laneNonce.toString(); r.deadline = validUntil; r.reservation = validated.spend; r.fromBlock = state.block.toString();
+      await this.chain.simulate(validated);
+      if (validUntil <= Math.floor(Date.now() / 1000) + 5) throw new WalletError("validation_failed", "The seller's payment window closed while the payment was prepared; retry with a new request ID");
+      assertPolicyLive(limits, "it expired while the payment was prepared; nothing was paid");
+      await this.canSubmit(s, r);
+      r.operation.signature = await this.signRaw(s, validated.hash);
+      await this.canSubmit(s, r);
+      await journal.transition(r, "signed"); // fsync completes before the payment leaves this computer.
+    } catch (error) {
+      const failure = error instanceof WalletError ? error : isTransportFailure(error) ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry with a new request ID") : undefined;
+      if (r.status === "preparing") { r.lastError = failure?.code ?? "validation_failed"; await journal.transition(r, "failed"); }
+      if (failure) throw failure;
+      throw new WalletError("validation_failed", "Local x402 payment preparation failed");
+    }
+    return this.deliverX402(s, journal, r, req, limits);
   }
 
   /**
@@ -536,24 +550,32 @@ export class WalletService {
    */
   private async redeliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request) {
     const x = r.intent.x402!;
+    if (x.compacted) return { ...x402Result(r), content_delivered: false, next_action: "This payment settled long ago and its payment details were compacted, so its answer cannot be asked for again. Nothing more was paid. Buying again with a new request ID pays again." };
     let response: Awaited<ReturnType<typeof this.http>> | undefined;
-    // A seller's report of settlement is not proof: while the nonce is unused, the seller could still submit the
-    // payment, so sending it again would be a send under no current policy. Recovery waits for the chain.
-    if (replayable(req) && r.status === "submitted" && (await this.chain.stateFor(s.envelope, r)).nonce === BigInt(r.nonce!)) {
-      return { ...x402Result(r), content_delivered: false, next_action: "The seller reported settling this payment, but it is not on chain yet, so this wallet does not send it again. Check get_agent_operation and retry this request ID for the answer once it shows confirmed. Nothing more was paid." };
+    // Neither a seller's report nor a confirmation the chain later drops is proof: while the nonce is unused, the
+    // seller could still submit the payment, so sending it again would be a send under no current policy.
+    if ((await this.chain.stateFor(s.envelope, r)).nonce === BigInt(r.nonce!)) {
+      if (r.status === "confirmed") {
+        // The chain no longer shows the confirmation, so the payment is pending again and reserved until it settles.
+        delete r.consumed; delete r.consumedAt; delete r.transactionHash; r.lastError = "x402_confirmation_rolled_back";
+        await journal.transition(r, "submitted");
+      }
+      return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The chain no longer shows this payment's settlement" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid.` };
     }
     if (replayable(req)) {
       const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
       response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES }).catch(() => undefined);
       if (response && response.status >= 200 && response.status < 300) {
         r.delivered = true; r.sequence = ++journal.data.sequence; await journal.save();
+        // From here the nonce is known to be used, so the payment cannot be charged again.
         return { ...x402Result(r), content_delivered: true, content: responseContent(response), next_action: "This payment had settled without its answer; the seller has now served it. Nothing more was paid." };
       }
     }
-    const where = r.transactionHash ? ` in ${r.transactionHash}` : "";
+    // The lane is used, but until a receipt is verified the settlement is only what the seller reported.
+    const where = r.status === "confirmed" ? `settled${r.transactionHash ? ` in ${r.transactionHash}` : ""}` : "was reported settled by the seller and its nonce is used; get_agent_operation confirms it on chain";
     const answer = r.delivered ? "its answer was handed back when it was paid, but this wallet cannot tell whether it reached you" : "its answer was lost";
     const again = replayable(req) ? "the seller did not serve it again" : "this wallet does not resend a paid POST without an Idempotency-Key header, because the seller could run it a second time";
-    return { ...x402Result(r), content_delivered: false, ...(response ? { http_status: response.status } : {}), next_action: `This payment settled${where} and ${answer}; ${again}. Nothing more was paid. Buying again with a new request ID pays again; if the answer was lost, ask the seller to honour this payment instead.` };
+    return { ...x402Result(r), content_delivered: false, ...(response ? { http_status: response.status } : {}), next_action: `This payment ${where}, and ${answer}; ${again}. Nothing more was paid. Buying again with a new request ID pays again; if the answer was lost, ask the seller to honour this payment instead.` };
   }
 
   /** The seller's deadline passed: an unsent payment expires; one the seller may hold stays reserved until resolved. */
@@ -612,9 +634,11 @@ export class WalletService {
       ...x402Result(r), settlement: settled ? { success: settled.success, transaction: settled.transaction, network: settled.network, payer: settled.payer, error_reason: settled.errorReason } : undefined,
       ...(sellerError ? { seller_error: sellerError } : {}),
       // Content the seller served is returned even when settlement is unconfirmed: it is already here.
-      ...(served ? { content: responseContent(response), settlement_confirmed: paid } : { http_status: response.status }),
-      next_action: paid && served ? "Paid. The settlement is confirmed on chain by get_agent_operation."
-        : paid ? `The seller reported settling the payment but answered HTTP ${response.status} without its answer. ${recover} The settlement is confirmed on chain by get_agent_operation.`
+      // The seller's report is not a receipt: settlement stays pending until get_agent_operation shows confirmed.
+      seller_reported_settlement: paid, settlement_confirmed: false,
+      ...(served ? { content: responseContent(response) } : { http_status: response.status }),
+      next_action: paid && served ? "The seller reported settling the payment; it is pending until get_agent_operation shows it confirmed on chain. Check it before buying again."
+        : paid ? `The seller reported settling the payment but answered HTTP ${response.status} without its answer. ${recover} Settlement is pending until get_agent_operation shows it confirmed on chain.`
         : response.status === 402 ? `The seller refused the payment. ${X402_UNKNOWN_ACTION(r.requestId)}`
         : served ? `The seller served its answer without confirming settlement. ${X402_UNKNOWN_ACTION(r.requestId)}`
         : `The seller answered without confirming settlement. ${X402_UNKNOWN_ACTION(r.requestId)}`,
@@ -803,7 +827,29 @@ export function assertNeedsApproval(r: OperationRecord) {
 }
 
 /** Whether a paid request may be sent again: a GET, or a POST the caller marked with an Idempotency-Key for the seller. */
-const replayable = (req: X402Request) => req.method === "GET" || !!req.headers["idempotency-key"];
+const replayable = (req: X402Request) => req.method === "GET" || !!req.headers["idempotency-key"]?.trim();
+
+/** Terminal x402 payments older than this are compacted; the daily limit only looks back one day. */
+const COMPACT_AFTER_MS = 2 * 86_400_000;
+/**
+ * Keeps x402 volume from filling the journal. A terminal payment older than two days keeps what binds its
+ * request ID (the request digest), its outcome and what it consumed, but its seller terms become a digest and its
+ * signed operation is dropped, since nothing can send it again.
+ */
+async function compactX402(journal: Journal, now = Date.now()) {
+  let changed = false;
+  for (const r of journal.data.records) {
+    const x = r.intent.x402;
+    if (r.intent.kind !== "x402_payment" || !x || x.compacted || !terminal(r.status) || r.updatedAt > now - COMPACT_AFTER_MS) continue;
+    const { resource: _resource, ...kept } = x;
+    r.intent = { ...r.intent, x402: { ...kept, accepted: digest(x.accepted), compacted: true } };
+    r.intentHash = digest(r.intent);
+    delete r.operation;
+    if (r.replacement) r.replacement.operation = {};
+    changed = true;
+  }
+  if (changed) { journal.data.sequence++; await journal.save(); }
+}
 
 /** Transport failures that prove no request bytes reached the seller. */
 const NEVER_SENT_CODES = ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY"];

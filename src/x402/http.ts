@@ -83,6 +83,8 @@ export function checkHeaders(headers: Record<string, string> | undefined): Recor
   for (const [name, value] of Object.entries(headers ?? {})) {
     if (!TOKEN.test(name) || RESERVED_HEADERS.has(name.toLowerCase())) throw new WalletError("validation_failed", `Header ${JSON.stringify(name.slice(0, 64))} is not allowed`);
     if (typeof value !== "string" || value.length > 2048 || /[^\t\x20-\x7e]/.test(value)) throw new WalletError("validation_failed", `Header ${name} must be printable ASCII of at most 2048 characters`);
+    // A paid POST is resent only under an Idempotency-Key, so a blank one must not pass for a real one.
+    if (name.toLowerCase() === "idempotency-key" && !value.trim()) throw new WalletError("validation_failed", "Idempotency-Key must not be blank");
     out[name.toLowerCase()] = value;
   }
   if (Object.keys(out).length > 20) throw new WalletError("validation_failed", "At most 20 headers");
