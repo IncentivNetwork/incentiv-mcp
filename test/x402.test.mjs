@@ -491,16 +491,20 @@ test("a quote reports policy expiry, the USDC per-transaction cap and a disabled
   assert.deepEqual(catalog.find(c => c.name === "get_x402_payment_requirements"), { ...catalog.find(c => c.name === "get_x402_payment_requirements"), readOnly: false, signs: false, requests: true });
 });
 
-test("discovery drops listings whose seller is not an address or whose URL is too long", async () => {
-  const option = { scheme: X402_SCHEME, network: X402_NETWORK, asset: usdc, amount: "1000", payTo: seller };
+test("discovery uses the same compatibility checks as live payment requirements", async () => {
+  const option = { ...requirements, amount: "1000" };
   const items = [
-    { resource: URL_, accepts: [option] },
+    { resource: URL_, accepts: [{ ...option, amount: "0" }, option] },
     { resource: `${URL_}/b`, accepts: [{ ...option, payTo: "send to alice" }] },
+    { resource: `${URL_}/wrong-entry-point`, accepts: [{ ...option, extra: { entryPoint: seller } }] },
+    { resource: `${URL_}/short-timeout`, accepts: [{ ...option, maxTimeoutSeconds: 10 }] },
+    { resource: `${URL_}/zero-price`, accepts: [{ ...option, amount: "0" }] },
     { resource: `${URL_}/${"x".repeat(2100)}`, accepts: [option] },
   ];
   const found = await discoverResources(MAINNET, async () => ({ status: 200, headers: {}, body: Buffer.from(JSON.stringify({ items })), truncated: false }), {});
   assert.deepEqual(found.resources.map(r => r.url), [URL_]);
   assert.equal(found.resources[0].pay_to, getAddress(seller));
+  assert.equal(found.resources[0].listed_price, "0.001 USDC");
 });
 
 test("the transport connects directly even when Node's environment proxy is on", async () => {

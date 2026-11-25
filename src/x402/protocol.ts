@@ -47,15 +47,23 @@ export function parsePaymentRequired(response: HttpResponse): PaymentRequired {
   return required;
 }
 
-/** The first payment option this wallet can pay: Incentiv USDC through the pinned EntryPoint. */
+/** The first option this wallet can pay, shared by catalog discovery and live quotes. */
+export function findUsableRequirements(accepts: unknown[], { usdc, entryPoint }: Pick<ReturnType<typeof x402Config>, "usdc" | "entryPoint">) {
+  return accepts.find((candidate): candidate is PaymentRequirements => {
+    const r = candidate as Partial<PaymentRequirements> | null | undefined;
+    return !!r && r.scheme === X402_SCHEME && r.network === X402_NETWORK
+      && typeof r.asset === "string" && r.asset.toLowerCase() === usdc.toLowerCase()
+      && typeof r.amount === "string" && /^[1-9][0-9]{0,30}$/.test(r.amount)
+      && typeof r.payTo === "string" && /^0x[0-9a-fA-F]{40}$/.test(r.payTo)
+      && typeof r.maxTimeoutSeconds === "number" && Number.isInteger(r.maxTimeoutSeconds)
+      && r.maxTimeoutSeconds >= X402_MIN_TIMEOUT_SECONDS && r.maxTimeoutSeconds <= X402_MAX_TIMEOUT_SECONDS
+      && typeof r.extra?.entryPoint === "string" && r.extra.entryPoint.toLowerCase() === entryPoint.toLowerCase();
+  });
+}
+
+/** A payable live option, or a reason why the requested payment is unsupported. */
 export function selectRequirements(required: PaymentRequired, cfg: Config): PaymentRequirements {
-  const { usdc, entryPoint } = x402Config(cfg);
-  const usable = required.accepts.find(r => r && r.scheme === X402_SCHEME && r.network === X402_NETWORK
-    && typeof r.asset === "string" && r.asset.toLowerCase() === usdc.toLowerCase()
-    && typeof r.amount === "string" && /^[1-9][0-9]{0,30}$/.test(r.amount)
-    && typeof r.payTo === "string" && /^0x[0-9a-fA-F]{40}$/.test(r.payTo)
-    && Number.isInteger(r.maxTimeoutSeconds) && r.maxTimeoutSeconds >= X402_MIN_TIMEOUT_SECONDS && r.maxTimeoutSeconds <= X402_MAX_TIMEOUT_SECONDS
-    && typeof r.extra?.entryPoint === "string" && r.extra.entryPoint.toLowerCase() === entryPoint.toLowerCase());
+  const usable = findUsableRequirements(required.accepts, x402Config(cfg));
   if (!usable) {
     const short = required.accepts.find(r => r && r.scheme === X402_SCHEME && r.network === X402_NETWORK && Number.isInteger(r.maxTimeoutSeconds) && r.maxTimeoutSeconds < X402_MIN_TIMEOUT_SECONDS);
     if (short) throw new WalletError("x402_unsupported", `The resource allows only ${short.maxTimeoutSeconds} seconds to pay, too short to prepare and send a payment (this wallet needs at least ${X402_MIN_TIMEOUT_SECONDS}); nothing was paid`);

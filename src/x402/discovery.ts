@@ -1,8 +1,8 @@
-import { formatUnits, getAddress, isAddress } from "viem";
+import { formatUnits, getAddress } from "viem";
 import type { Config } from "../config.js";
 import { WalletError } from "../wallet/errors.js";
 import { checkResourceUrl, type HttpTransport } from "./http.js";
-import { DEFAULT_FACILITATOR_URL, X402_NETWORK, X402_SCHEME, x402Config } from "./protocol.js";
+import { DEFAULT_FACILITATOR_URL, findUsableRequirements, X402_NETWORK, X402_SCHEME, x402Config } from "./protocol.js";
 import { USDC_DECIMALS } from "./request.js";
 
 export const FACILITATOR_ENV = "INCENTIV_X402_FACILITATOR_URL";
@@ -25,7 +25,7 @@ const text = (value: unknown, max: number) => typeof value === "string" ? value.
  * Listings are not verified: they come from whoever paid for them, and the live 402 decides the price.
  */
 export async function discoverResources(cfg: Config, http: HttpTransport, args: { query?: string; limit?: number; offset?: number }) {
-  const { usdc } = x402Config(cfg);
+  const network = x402Config(cfg);
   const base = facilitatorUrl();
   const limit = Math.min(Math.max(Math.trunc(args.limit ?? 20), 1), 50);
   const query = args.query?.trim();
@@ -46,13 +46,12 @@ export async function discoverResources(cfg: Config, http: HttpTransport, args: 
     const entry = raw as Record<string, unknown>;
     if (typeof entry?.resource !== "string" || entry.resource.length > 2048) continue;
     try { checkResourceUrl(entry.resource); } catch { continue; }
-    const accepts = (Array.isArray(entry.accepts) ? entry.accepts : []) as Record<string, unknown>[];
-    const option = accepts.find(a => a?.scheme === X402_SCHEME && a?.network === X402_NETWORK && typeof a?.asset === "string" && a.asset.toLowerCase() === usdc.toLowerCase() && typeof a?.amount === "string" && /^[0-9]{1,30}$/.test(a.amount) && typeof a?.payTo === "string" && isAddress(a.payTo, { strict: false }));
+    const option = findUsableRequirements(Array.isArray(entry.accepts) ? entry.accepts : [], network);
     if (!option) continue;
     resources.push({
       url: entry.resource,
-      listed_price: `${formatUnits(BigInt(option.amount as string), USDC_DECIMALS)} USDC`,
-      pay_to: getAddress(option.payTo as string),
+      listed_price: `${formatUnits(BigInt(option.amount), USDC_DECIMALS)} USDC`,
+      pay_to: getAddress(option.payTo),
       service_name: text(entry.serviceName, 100),
       description: text(entry.description, 500),
       mime_type: text(entry.mimeType, 100),
