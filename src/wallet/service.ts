@@ -98,32 +98,35 @@ export class WalletService {
     // Policy and approval expiry may pass during the reads above, so they are checked again with nothing awaited before the broadcast.
     permitted();
   }
-  private async reconcileX402Confirmations(journal: Journal): Promise<void> {
-    const confirmed = journal.data.records.filter(r => r.intent.kind === "x402_payment" && r.status === "confirmed" && r.nonce !== undefined);
-    if (!confirmed.length) return;
+  private async reconcileX402Settlements(journal: Journal): Promise<void> {
+    const settled = journal.data.records.filter(r => r.intent.kind === "x402_payment"
+      && r.nonce !== undefined && (r.status === "confirmed" || r.status === "reverted" || r.status === "superseded"));
+    if (!settled.length) return;
     const wallet = journal.session.envelope;
     const { block } = await this.chain.state(wallet).catch(rethrowX402RecheckError);
-    for (const r of confirmed) {
-      if (r.confirmedBlock !== undefined && block >= BigInt(r.confirmedBlock) + REORG_MARGIN_BLOCKS) continue;
+    for (const r of settled) {
+      if (r.settledBlock !== undefined && block >= BigInt(r.settledBlock) + REORG_MARGIN_BLOCKS) continue;
       const nonce = BigInt(r.nonce!);
       const current = await this.chain.laneNonce(wallet, nonce >> 64n, block).catch(rethrowX402RecheckError);
-      if (current === nonce) await this.reopenX402Confirmation(journal, r);
+      if (current === nonce) await this.reopenX402Settlement(journal, r);
     }
   }
 
-  private async reopenX402Confirmation(journal: Journal, r: OperationRecord): Promise<void> {
+  private async reopenX402Settlement(journal: Journal, r: OperationRecord): Promise<void> {
     delete r.consumed;
     delete r.consumedAt;
     delete r.transactionHash;
-    delete r.confirmedBlock;
+    delete r.settledBlock;
     delete r.searchedBlock;
     if (r.replacement) delete r.replacement.searchedBlock;
-    r.lastError = "x402_confirmation_rolled_back";
-    await journal.transition(r, r.replacement?.signed ? "superseding" : "submitted");
+    const confirmed = r.status === "confirmed";
+    r.lastError = confirmed ? "x402_confirmation_rolled_back" : "x402_settlement_rolled_back";
+    const status = r.replacement?.signed ? "superseding" : confirmed ? "submitted" : "submission_unknown";
+    await journal.transition(r, status);
   }
 
   private async reconcile(journal: Journal): Promise<void> {
-    await this.reconcileX402Confirmations(journal);
+    await this.reconcileX402Settlements(journal);
     // Connections are permanent: an unlink an earlier build left awaiting approval can never be approved, so it is cancelled.
     for (const r of journal.data.records) if (r.intent.kind === "unlink_agent" && (r.status === "preparing" || r.status === "approval_required")) {
       delete r.approval; r.lastError = "registry_unlink_unsupported"; await journal.transition(r, "cancelled");
@@ -154,6 +157,7 @@ export class WalletService {
           if (replaced) {
             const gasToken = r.replacement!.gasToken ?? "native";
             r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: r.replacement!.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
+            if (replaced.blockNumber !== undefined) r.settledBlock = replaced.blockNumber.toString();
             // A mined replacement consumes the nonce even if its execution reverted.
             await journal.transition(r, "superseded"); continue;
           }
@@ -175,7 +179,7 @@ export class WalletService {
         addSpend(spend, r.intent.gasToken, gas);
         if (receipt.registryError) r.lastError = receipt.registryError;
         r.consumed = spend; r.consumedAt = Date.now(); r.transactionHash = receipt.transactionHash;
-        if (receipt.success && receipt.blockNumber !== undefined) r.confirmedBlock = receipt.blockNumber.toString();
+        if (receipt.blockNumber !== undefined) r.settledBlock = receipt.blockNumber.toString();
         await journal.transition(r, receipt.success ? "confirmed" : "reverted");
       } catch (error) {
         if (error instanceof WalletError) throw error;
@@ -640,7 +644,7 @@ export class WalletService {
     // Neither a seller's report nor a confirmation the chain later drops is proof: while the nonce is unused, the
     // seller could still submit the payment, so sending it again would be a send under no current policy.
     if ((await this.chain.stateFor(s.envelope, r)).nonce === BigInt(r.nonce!)) {
-      if (r.status === "confirmed") await this.reopenX402Confirmation(journal, r);
+      if (r.status === "confirmed") await this.reopenX402Settlement(journal, r);
       return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The chain no longer shows this payment's settlement" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid.` };
     }
     if (replayable(req)) {
@@ -950,7 +954,7 @@ export class WalletService {
   }
 }
 function rethrowX402RecheckError(error: unknown): never {
-  if (isTransportFailure(error)) throw new WalletError("rpc_unavailable", "Could not recheck recent x402 confirmations; retry when RPC is available");
+  if (isTransportFailure(error)) throw new WalletError("rpc_unavailable", "Could not recheck recent x402 settlements; retry when RPC is available");
   throw error;
 }
 

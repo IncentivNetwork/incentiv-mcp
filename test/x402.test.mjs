@@ -589,6 +589,32 @@ test("ordinary reconciliation restores a rolled-back payment's reservation befor
   assert.equal(f.seen.payments.length, 1);
 });
 
+test("a rolled-back x402 cancellation restores the original and replacement reservations", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const review = await f.service.reviewReplacement(id, true);
+  await f.service.replace(id, password, digest(review.records[0]));
+  const { userOpHash } = review.records[0].replacement;
+  const nonce = BigInt(review.records[0].nonce);
+  const laneNonce = f.chain.laneNonce;
+  f.chain.laneNonce = async (...args) => (await laneNonce(...args)) + 1n;
+  f.chain.receipt = async r => r.userOpHash === userOpHash
+    ? { success: true, actualGasCost: 5n, transactionHash: `0x${"ee".repeat(32)}`, blockNumber: 1n }
+    : undefined;
+  assert.equal((await f.service.operation(id)).status, "superseded");
+
+  f.chain.laneNonce = laneNonce;
+  f.chain.receipt = async () => undefined;
+  assert.equal(await f.chain.laneNonce(undefined, nonce >> 64n, 1n), nonce);
+  const reopened = await f.service.operation(id);
+  assert.equal(reopened.status, "superseding");
+  assert.equal(reopened.last_error, "x402_settlement_rolled_back");
+  const wallet = await f.service.get();
+  assert.equal(wallet.pending_reservations[usdc], "80000");
+  assert.ok(BigInt(wallet.pending_reservations.native) > 0n);
+  assert.equal(f.seen.payments.length, 1);
+});
+
 test("ended x402 payments are archived after two days with their hashes, and stay bound until the user clears them", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
