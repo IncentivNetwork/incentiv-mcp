@@ -942,7 +942,9 @@ export class WalletService {
       if (gasToken !== "native" && validated.gasCharge.toString() !== replacement.gasCharge) throw new WalletError("validation_failed", "Replacement token gas payment changed");
       await this.replacementStep(r.requestId, gasToken, () => this.chain.simulate(validated));
       const balances = await this.chain.balances(s.envelope, [gasToken]);
-      if (BigInt(balances[gasToken] ?? "0") < validated.gasCharge) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment.${nativeGasHint(this.ctx.config, gasToken)}`);
+      // The original and replacement share one nonce. Other lanes may still settle independently.
+      const replacementSpend = { [gasToken]: validated.gasCharge.toString() };
+      if (!covers(balances, journal, replacementSpend, r)) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment beside other pending operations.${nativeGasHint(this.ctx.config, gasToken)}`);
       await this.canSubmit(s);
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");
       replacement.operation.signature = await this.signRaw(s, validated.hash);

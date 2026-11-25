@@ -285,6 +285,26 @@ test("an unsettled payment is cancelled by a replacement on its own nonce lane",
   assert.equal(await f.store.session(async s => (await Journal.open(s)).data.records.find(r => r.requestId === id).replacement.searchedBlock), String(BigInt(signedAt) + 2000n));
 });
 
+test("a replacement cannot use gas already reserved on another x402 lane", async t => {
+  const f = await x402Fixture(t), first = randomUUID(), second = randomUUID(), state = f.chain.state;
+  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true });
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: first, gas_token: "native" });
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: second });
+  const review = await f.service.reviewReplacement(second, true);
+  const originalGas = (await f.records()).find(r => r.requestId === first).reservation.native;
+  const replacementGas = review.records[0].replacement.maxGasCost;
+  let nativeBalance = replacementGas;
+  const balances = f.chain.balances;
+  f.chain.balances = async (...args) => ({ ...await balances(...args), native: nativeBalance });
+  await assert.rejects(f.service.replace(second, password, digest(review.records[0])), error =>
+    error.code === "policy_denied" && /replacement gas payment beside other pending operations/.test(error.detail));
+  assert.equal(f.submissions.length, 0);
+
+  nativeBalance = (BigInt(replacementGas) + BigInt(originalGas)).toString();
+  assert.equal((await f.service.replace(second, password, digest(review.records[0]))).status, "superseding");
+  assert.equal(f.submissions.length, 1);
+});
+
 test("a first purchase rechecks policy expiry after simulation, before signing and before first delivery", async t => {
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const expiring = async () => {
