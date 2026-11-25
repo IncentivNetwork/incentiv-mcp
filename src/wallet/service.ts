@@ -634,7 +634,7 @@ export class WalletService {
       if (failure) throw failure;
       throw new WalletError("validation_failed", "Local x402 payment preparation failed");
     }
-    return this.deliverX402(s, journal, r, req, limits);
+    return this.deliverX402(s, journal, r, req, limits, true);
   }
 
   /**
@@ -642,7 +642,7 @@ export class WalletService {
    * every send must still pass current wallet policy, balance and its nonce lane, as it did when signed. Its own
    * reservation is excluded from what is already used. A refusal sends nothing and keeps the record as it was.
    */
-  private async recheckX402(s: WalletSession, journal: Journal, r: OperationRecord, limits: Limits, consequence: string): Promise<void> {
+  private async recheckX402(s: WalletSession, journal: Journal, r: OperationRecord, limits: Limits, consequence: string, freshlySimulated: boolean): Promise<void> {
     const state = await this.chain.stateFor(s.envelope, r);
     if (state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "This payment's nonce lane has moved; check get_agent_operation");
     const validated = validateOperation(this.ctx.config, s.envelope, r.intent, { ...r.operation!, signature: "0x" }, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash! });
@@ -652,6 +652,12 @@ export class WalletService {
     const violations = policyViolations(limits, { token: r.intent.token, amount: r.intent.amount, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls, x402: { origin: r.intent.x402!.origin, payTo: r.intent.to! } });
     if (violations.length) throw new WalletError("policy_denied", `Local wallet policy no longer allows this payment: ${violations.join(", ")}; ${consequence}`);
     if (!covers(balances, journal, validated.spend, r)) throw new WalletError("policy_denied", `Balance no longer covers this payment beside other pending operations; ${consequence}`);
+    if (state.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", `The signed gas fee no longer covers the current base fee; ${consequence}`);
+    // A persisted payment may have been simulated against older TransferGate rules or paymaster terms.
+    if (!freshlySimulated) await this.chain.simulate(validated).catch((error: unknown) => {
+      if (error instanceof WalletError && error.code === "simulation_failed") throw new WalletError(error.code, `${error.detail}; ${consequence}`);
+      throw rpcOutage(error);
+    });
   }
 
   /**
@@ -704,14 +710,14 @@ export class WalletService {
     return false;
   }
   /** Sends the signed payment with the request, and records what the seller answered. */
-  private async deliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request, limits: Limits) {
+  private async deliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request, limits: Limits, freshlySimulated = false) {
     const x = r.intent.x402!;
     if (x.validUntil <= Math.floor(Date.now() / 1000)) return this.pastDeadlineX402(journal, r);
     // Every send is checked against current policy: a first send is a fresh spend, and after an uncertain attempt
     // (say the process stopped before the request started) the seller may still never have received it.
     const before = r.status, first = before === "signed";
     const consequence = first ? "it was never sent and expires unpaid" : `it was not sent again. The seller may already hold it, so it stays reserved; ${X402_UNKNOWN_ACTION(r.requestId)}`;
-    await this.recheckX402(s, journal, r, limits, consequence);
+    await this.recheckX402(s, journal, r, limits, consequence, freshlySimulated);
     await this.canSubmit(s, r);
     assertPolicyLive(limits, consequence);
     r.attempts++;

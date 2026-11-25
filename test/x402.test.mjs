@@ -240,6 +240,29 @@ test("an unanswered or refused payment stays reserved, is resent byte for byte, 
   assert.match(answer.next_action, /wallet operation resolve .* --replace/);
 });
 
+test("a retry keeps the signed payment reserved when current gas or simulation blocks delivery", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state, simulate = f.chain.simulate;
+  const purchase = { url: URL_, max_amount: "0.05", request_id: id };
+  f.seen.fail = 1;
+  await f.service.payX402(purchase);
+
+  f.chain.state = async (...args) => {
+    const original = await state(...args);
+    return { ...original, fees: { ...original.fees, baseFeePerGas: 2n } };
+  };
+  await assert.rejects(f.service.payX402(purchase), error => error.code === "validation_failed" && /current base fee/.test(error.detail));
+  f.chain.state = state;
+  f.chain.simulate = async () => { throw new WalletError("simulation_failed", "TransferGate refused the operation"); };
+  await assert.rejects(f.service.payX402(purchase), error => error.code === "simulation_failed" && /stays reserved/.test(error.detail));
+  assert.equal((await f.service.operation(id)).status, "submission_unknown");
+  assert.deepEqual(await f.used(), { [usdc]: "80000" });
+  assert.equal(f.seen.payments.length, 1);
+
+  f.chain.simulate = simulate;
+  assert.equal((await f.service.payX402(purchase)).status, "submitted");
+  assert.deepEqual(f.seen.payments[1], f.seen.payments[0]);
+});
+
 test("a payment that never left this computer expires at its deadline and releases its reservation", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   f.seen.fail = 1;
