@@ -6,7 +6,7 @@ import { z } from "zod";
 import { type Config } from "../config.js";
 import { Ctx } from "../context.js";
 import { NetworkError } from "../network.js";
-import { userOpToJson } from "../userop.js";
+import { BundlerUnavailableError, userOpToJson } from "../userop.js";
 import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
 import { Journal, digest, intentSchema, ownsNonce, terminal, type Intent, type OperationRecord } from "./journal.js";
@@ -82,9 +82,13 @@ export class WalletService {
       throw new WalletError(error.code, `${error.detail}. Signed request ${r.requestId} cannot be sent but still holds the account nonce, so first clear it with wallet operation resolve ${r.requestId} --replace in your local terminal${r.intent.kind === "link_agent" ? ", then use a fresh Portal approval with a new request ID" : ""}`);
     });
     if (r.intent.kind === "swap") await this.chain.verifySwap(s.envelope, r.intent, limits, state);
-    await this.chain.simulate(validated);
+    await this.chain.simulate(validated).catch((error: unknown) => {
+      // The same bytes may never pass again, for example once the paymaster stops accepting their gas payment, yet they still hold the nonce.
+      if (!(error instanceof WalletError) || error.code !== "simulation_failed") throw error;
+      throw new WalletError(error.code, `${error.detail}. Signed request ${r.requestId} still holds the account nonce. If retrying later does not help, clear it with wallet operation resolve ${r.requestId} --replace${r.intent.gasToken === "native" ? "" : " --native-gas"} in your local terminal`);
+    });
     await this.canSubmit(s, r);
-    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", "Operation deadline is too close; reconcile or review a same-nonce replacement");
+    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", `Operation deadline is too close; reconcile, or review a same-nonce replacement with wallet operation resolve ${r.requestId} --replace in your local terminal`);
     // Policy and approval expiry may pass during the reads above, so they are checked again with nothing awaited before the broadcast.
     permitted();
   }
@@ -138,7 +142,7 @@ export class WalletService {
   private async submit(s: WalletSession, journal: Journal, r: OperationRecord): Promise<void> {
     await this.canSubmit(s, r);
     if (!r.operation || !r.userOpHash) throw new WalletError("wallet_recovery_required", "Signed operation is missing");
-    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", "Signed operation deadline expired; review a same-nonce replacement with wallet operation resolve --replace");
+    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", `Signed operation deadline expired; review a same-nonce replacement with wallet operation resolve ${r.requestId} --replace in your local terminal`);
     this.refuseUnlink(r);
     // A registry request signed under pins this release no longer approves, or before a release without the registry,
     // cannot be sent; approving new pins waits for its nonce, so only a same-nonce replacement clears it.
@@ -255,7 +259,7 @@ export class WalletService {
         await journal.transition(r, "signed"); // fsync completes before any submission.
       } catch (error) {
         // An RPC outage says nothing about the request, so its ID and any local approval stay usable.
-        const failure = error instanceof WalletError ? error : isTransportFailure(error) ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : undefined;
+        const failure = error instanceof WalletError ? error : isTransportFailure(error) || error instanceof BundlerUnavailableError ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : undefined;
         // Without an approval the operation may have been rebuilt, so earlier reasons may not describe it; a retry evaluates it again.
         if (r.status === "preparing" && TEMPORARY_ERRORS.includes(failure?.code ?? "")) { r.lastError = failure!.code; if (!r.approval) delete r.reasons; await journal.transition(r, "approval_required"); }
         else if (r.status === "preparing") { r.lastError = failure?.code ?? "validation_failed"; await journal.transition(r, "failed"); }

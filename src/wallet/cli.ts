@@ -74,7 +74,7 @@ export async function reviewUpgrade(current: WalletStore, config: Config) {
       if ((pending as { code?: string }).code !== "capability_manifest_unapproved") throw pending;
       const wallet = await current.session(async s => publicWallet(s.envelope));
       if (wallet.network_id !== config.identity.networkId) throw pending;
-      return { target, store, review: undefined, registryPending: true };
+      return { target, store, review: undefined, registryPending: !!config.manifest.agentRegistry };
     }
   }
 }

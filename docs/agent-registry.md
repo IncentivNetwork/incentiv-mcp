@@ -29,7 +29,7 @@ For an agent that is not deployed yet, `sign_agent_link` signs nothing and retur
 4. Copy the approval JSON into `link_agent` with a new `request_id` UUID, optional `gas_token` and `wait_for_confirmation`. This still requires authenticated local policy.
 5. Reuse the same UUID only for identical retries. `get_agent_operation` reconciles the request; `get_agent_registry_status` reads the current relationship. Historical completion and the current relationship can differ if the link was removed outside MCP and Portal.
 
-The agent can be undeployed: factory deployment occurs before its first `link` executes. The parent must already be deployed. The local wallet checks account derivation, ownership and the allowed factory. Both sides must satisfy the registry roles and current limit.
+The agent can be undeployed: factory deployment occurs before its first `link` executes. The parent must already be deployed. The local wallet checks account derivation, ownership and the allowed factory. A factory the registry does not allow yet is refused with `registry_factory_not_allowed`; that can change, so the same request ID can be retried later. Both sides must satisfy the registry roles and current limit.
 
 ## Local permissions
 

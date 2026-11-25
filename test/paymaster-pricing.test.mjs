@@ -98,3 +98,11 @@ test("an operation to sign prices gas with the paymaster's current overhead, not
   const built = await buildUserOpUnsigned(ctx, { account: "0x214324E3412eD8864Da4EfB2c2D34c3281dbEe7A", calls: [{ to: "0x0000000000000000000000000000000000000001", value: 0n, data: "0x" }], gasToken: token(USDC, "USDC", 6), state: { deployed: true, nonce: 0n, fees } });
   assert.equal(built.gasToken.requiredUsdc, schedule(built.op.preVerificationGas + built.op.callGasLimit + 400_000n));
 });
+
+test("an unlisted token is refused before any quote, so a quote outage cannot make it retryable", async () => {
+  const outage = new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 });
+  const ctx = fakeCtx({ allowed: false }), cfg = await getPaymasterConfig(ctx), read = ctx.client.readContract;
+  ctx.client.readContract = async opts => { if (opts.functionName.startsWith("quote")) throw outage; return read(opts); };
+  await assert.rejects(computeGasTokenAmount(ctx, cfg, token(OTHER, "MEME", 18), 36_666n), error => error.code === "gas_token_unavailable" && /does not accept MEME/.test(error.message));
+  assert.ok(!ctx.calls.some(([fn]) => fn.startsWith("quote")));
+});

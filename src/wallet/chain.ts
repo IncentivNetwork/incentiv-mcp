@@ -3,7 +3,7 @@ import { createPublicClient, decodeEventLog, decodeFunctionData, encodeFunctionD
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
 import { accountAbi, accountFactoryAbi, dexFactoryAbi, dexPoolAbi, entryPointAbi, erc20Abi, quoterAbi, swapRouterAbi, transferGateAbi } from "../abi.js";
-import { broadcastUserOp, buildUserOpUnsigned, bundlerRpc, userOpFromJson as userOpFromWire, userOpToJson, type UserOp } from "../userop.js";
+import { BundlerUnavailableError, broadcastUserOp, buildUserOpUnsigned, bundlerRpc, userOpFromJson as userOpFromWire, userOpToJson, type UserOp } from "../userop.js";
 import { buildSwapCalls, planRoute, quoteRoute } from "../swap.js";
 import { WalletError, type WalletEnvelope } from "./keystore.js";
 import { type Intent, type OperationRecord } from "./journal.js";
@@ -213,7 +213,11 @@ export class WalletChain {
       op.signature = await privateKeyToAccount(generatePrivateKey()).signMessage({ message: { raw: validated.hash } });
       const estimate = await bundlerRpc(this.ctx, "eth_estimateUserOperationGas", [userOpToJson(op), this.ctx.config.identity.entryPoint.address]) as Record<string, string>;
       for (const key of ["callGasLimit", "verificationGasLimit", "preVerificationGas"] as const) if (BigInt(estimate[key]) > op[key] || BigInt(estimate[key]) <= 0n) throw new Error();
-    } catch { throw new WalletError("simulation_failed", "The exact validated operation failed simulation or exceeds its gas allocation"); }
+    } catch (error) {
+      // An outage says nothing about the operation, so the same request stays retryable; only a rejection fails it.
+      if (error instanceof BundlerUnavailableError || isTransportFailure(error)) throw new WalletError("rpc_unavailable", "Could not reach the RPC or bundler to simulate the operation; retry this request");
+      throw new WalletError("simulation_failed", "The exact validated operation failed simulation or exceeds its gas allocation");
+    }
   }
   async buildReplacement(wallet: WalletEnvelope, original: OperationRecord, state: ChainState, gasToken = original.intent.gasToken) {
     const old = userOpFromWire(original.operation!);

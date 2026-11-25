@@ -151,15 +151,23 @@ function opToWire(op: UserOp): Record<string, string> {
   return wire;
 }
 
+/** The bundler could not be reached or answered with a server error, so the call says nothing about the operation itself. */
+export class BundlerUnavailableError extends Error {}
+
 export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): Promise<unknown> {
-  const res = await fetch(ctx.config.endpoints.bundlerUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-    signal: AbortSignal.timeout(30_000),
-  });
+  let res: Response;
+  try {
+    res = await fetch(ctx.config.endpoints.bundlerUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (error) { throw new BundlerUnavailableError(`Bundler unreachable: ${(error as Error).message}`); }
+  if (res.status === 429 || res.status >= 500) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
   if (!res.ok) throw new Error(`Bundler HTTP ${res.status}`);
-  const body = (await res.json()) as { result?: unknown; error?: { code: number; message: string; data?: unknown } };
+  let body: { result?: unknown; error?: { code: number; message: string; data?: unknown } };
+  try { body = await res.json() as typeof body; } catch (error) { throw new BundlerUnavailableError(`Bundler answer unreadable: ${(error as Error).message}`); }
   if (body.error) {
     const data = body.error.data ? ` ${JSON.stringify(body.error.data)}` : "";
     throw new Error(`Bundler error ${body.error.code}: ${body.error.message}${data}`);
@@ -275,14 +283,15 @@ export async function computeGasTokenAmount(
   if (token.address.toLowerCase() === cfg.usdcToken.toLowerCase()) return requiredUsdc;
   const otherGas = `Use a new request ID with gas in ${ctx.config.identity.nativeSymbol} or USDC`;
   const listedGas = `Use a new request ID with gas in ${ctx.config.identity.nativeSymbol}, USDC or another token get_gas_payment_options lists`;
+  const isWcent = token.address.toLowerCase() === ctx.config.manifest.contracts.wcent.address.toLowerCase();
+  // Beyond USDC and WCENT, the paymaster accepts only tokens on its allowlist, whatever their pools quote. Checked before
+  // any quote, so an unlisted token is refused for good rather than made retryable by a failing quote.
+  if (!isWcent && !await ctx.client.readContract({ address: ctx.config.manifest.contracts.unifiedTokenPaymaster.address, abi: paymasterAbi, functionName: "allowedPaymentToken", args: [token.address] })) throw gasTokenUnavailable(`The paymaster does not accept ${token.symbol} for gas. ${listedGas}`);
   if (cfg.usdcToken === "0x0000000000000000000000000000000000000000" || cfg.usdcPoolFee === 0) throw gasTokenUnavailable(`The paymaster's USDC route is not configured, so it accepts only USDC for gas. ${otherGas}`);
   const requiredCent = await quoted(() => quoteExactInputToWcent(ctx, cfg.usdcToken, cfg.usdcPoolFee, requiredUsdc), `Could not price gas in ${token.symbol}: the paymaster's USDC-to-WCENT quote failed. ${otherGas}`);
   if (requiredCent === 0n) throw gasTokenUnavailable(`Could not price gas in ${token.symbol}: the paymaster's USDC quote returned zero. ${otherGas}`);
   const target = (requiredCent * QUOTE_MARGIN_PERCENT) / 100n;
-  if (token.address.toLowerCase() === ctx.config.manifest.contracts.wcent.address.toLowerCase()) return target;
-  // Beyond USDC and WCENT, the paymaster accepts only tokens on its allowlist, whatever their pools quote.
-  const allowed = await ctx.client.readContract({ address: ctx.config.manifest.contracts.unifiedTokenPaymaster.address, abi: paymasterAbi, functionName: "allowedPaymentToken", args: [token.address] });
-  if (!allowed) throw gasTokenUnavailable(`The paymaster does not accept ${token.symbol} for gas. ${listedGas}`);
+  if (isWcent) return target;
   const noPool = `Could not price gas in ${token.symbol}: no ${token.symbol}/WCENT pool at the paymaster's ${DEFAULT_POOL_FEE / 10_000}% fee quotes it. ${listedGas}`;
   const tokenIn = token.address;
   let amount = await quoted(() => quoteExactOutputToWcent(ctx, tokenIn, DEFAULT_POOL_FEE, target), noPool);

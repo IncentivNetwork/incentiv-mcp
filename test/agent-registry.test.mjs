@@ -74,7 +74,7 @@ test("deployment verification checks code, implementation slot and signing domai
 test("preflight permits first-operation deployment but rejects stale approvals, roles and limits", async () => {
   const a = await approval();
   await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(a), { ...state(), deployed: true }), { code: "registry_ineligible" });
-  for (const [functionName, answer, expected] of [["nonces", 1n, "registry_approval_stale"], ["agentCount", 5n, "registry_limit_reached"], ["isAccountFactory", false, "registry_ineligible"], ["parentOf", parent, "registry_already_linked"], ["isValidSignature", "0xffffffff", "registry_approval_invalid"]]) {
+  for (const [functionName, answer, expected] of [["nonces", 1n, "registry_approval_stale"], ["agentCount", 5n, "registry_limit_reached"], ["isAccountFactory", false, "registry_factory_not_allowed"], ["parentOf", parent, "registry_already_linked"], ["isValidSignature", "0xffffffff", "registry_approval_invalid"]]) {
     const c = client(), good = c.readContract;
     // agentCount is per address: a full parent, not an agent that is itself a parent.
     c.readContract = args => args.functionName === functionName && (functionName !== "agentCount" || args.args[0].toLowerCase() === parent.toLowerCase()) ? Promise.resolve(answer) : good(args);
@@ -564,7 +564,7 @@ test("prepare_agent_link only sends the user to Portal when linking can succeed"
   const prepared = async status => { f.chain.registryStatus = async () => ({ ...linkable, ...status }); return f.service.prepareAgentLink(); };
   const ready = await prepared({});
   assert.ok(ready.portal_url); assert.equal(ready.link_blocked, undefined);
-  for (const [status, code] of [[{ parent }, "registry_already_linked"], [{ agent_is_parent: true }, "registry_ineligible"], [{ factory_allowed: false }, "registry_ineligible"], [{ deployed: true }, "registry_ineligible"]]) {
+  for (const [status, code] of [[{ parent }, "registry_already_linked"], [{ agent_is_parent: true }, "registry_ineligible"], [{ factory_allowed: false }, "registry_factory_not_allowed"], [{ deployed: true }, "registry_ineligible"]]) {
     const blocked = await prepared(status);
     assert.equal(blocked.link_blocked, code); assert.equal(blocked.portal_url, undefined); assert.match(blocked.next_action, /Do not ask the user to sign/);
   }
@@ -574,7 +574,7 @@ test("the factory allowlist only applies to an agent that still has to deploy", 
   const a = await approval(), good = client();
   const c = client({ readContract: async opts => opts.functionName === "isAccountFactory" ? false : opts.functionName === "isIncentivAccount" ? true : good.readContract(opts) });
   await verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), { ...state(), deployed: true });
-  await assert.rejects(verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), state()), { code: "registry_ineligible" });
+  await assert.rejects(verifyRegistryIntent(c, MAINNET, { account: agent }, intent(a), state()), { code: "registry_factory_not_allowed" });
 });
 
 test("the upgrade command only points a current wallet to capability approval when it is pending", async t => {
@@ -1176,4 +1176,81 @@ test("the upgrade command calls a current wallet current after the registry move
   moved.manifest.manifestId = configurationId(moved.manifest, "manifestId");
   const config = parseConfig(moved), upgrade = await reviewUpgrade(new WalletStore(config, f.deps), config);
   assert.equal(upgrade.review, undefined); assert.equal(upgrade.registryPending, true);
+});
+
+test("a signed link refused while the factory is disallowed keeps its request retryable instead of advising a paid replacement", async t => {
+  const f = await registryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval }, submit = f.service.submit;
+  f.service.submit = async () => {}; // The process stops between signing and submission.
+  assert.equal((await f.service.send("link_agent", args)).status, "signed");
+  f.service.submit = submit;
+  const [code, message] = linkBlocker({ parent: zero, agent_is_parent: false, agent_eligible: false, factory_allowed: false }, false);
+  f.chain.verifyRegistry = async () => { throw new WalletError(code, message); };
+  await assert.rejects(f.service.send("link_agent", args), error => error.code === "registry_factory_not_allowed" && /retry the same request/.test(error.message) && !/--replace/.test(error.message));
+  assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
+  // Once the registry allows the factory again, the same signed request goes through.
+  f.chain.verifyRegistry = async () => {};
+  assert.equal((await f.service.send("link_agent", args)).status, "submitted"); assert.equal(f.submissions.length, 1);
+});
+
+test("an expired signed link names its own request ID in the replacement command", async t => {
+  const f = await registryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval }, submit = f.service.submit;
+  f.service.submit = async () => {};
+  assert.equal((await f.service.send("link_agent", args)).status, "signed");
+  f.service.submit = submit;
+  const deadline = (await f.service.review(id)).records[0].deadline, now = Date.now;
+  Date.now = () => deadline * 1000 + 1000;
+  try {
+    await assert.rejects(f.service.send("link_agent", args), error => error.code === "operation_pending" && new RegExp(`wallet operation resolve ${id} --replace`).test(error.message));
+  } finally { Date.now = now; }
+  assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
+});
+
+test("a signed token-paid request that no longer simulates points to a native-gas replacement", async t => {
+  const f = await tokenRegistryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval, gas_token: "USDC" }, submit = f.service.submit;
+  f.service.submit = async () => {};
+  assert.equal((await f.service.send("link_agent", args)).status, "signed");
+  f.service.submit = submit;
+  const simulate = f.chain.simulate;
+  // The paymaster's schedule moved after signing, so the same bytes no longer pass simulation.
+  f.chain.simulate = async () => { throw new WalletError("simulation_failed", "The exact validated operation failed simulation or exceeds its gas allocation"); };
+  await assert.rejects(f.service.send("link_agent", args), error => error.code === "simulation_failed" && new RegExp(`wallet operation resolve ${id} --replace --native-gas`).test(error.message));
+  assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
+  f.chain.simulate = simulate;
+});
+
+test("a bundler outage during simulation keeps the request retryable, while a bundler rejection fails it", async () => {
+  const chain = new WalletChain(new Ctx(MAINNET)), fetch = globalThis.fetch;
+  const validated = { calls: [], hash: `0x${"11".repeat(32)}`, op: { sender: agent, nonce: 0n, callData: "0x", callGasLimit: 100_000n, verificationGasLimit: 100_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n, signature: "0x" } };
+  try {
+    for (const answer of [() => { throw new TypeError("fetch failed"); }, () => new Response("busy", { status: 503 }), () => new Response("slow down", { status: 429 }), () => new Response("<html>", { status: 200 })]) {
+      globalThis.fetch = async () => answer();
+      await assert.rejects(chain.simulate(validated), { code: "rpc_unavailable" });
+    }
+    globalThis.fetch = async () => Response.json({ jsonrpc: "2.0", id: 1, error: { code: -32500, message: "AA23 reverted" } });
+    await assert.rejects(chain.simulate(validated), { code: "simulation_failed" });
+    globalThis.fetch = async () => new Response("bad request", { status: 400 });
+    await assert.rejects(chain.simulate(validated), { code: "simulation_failed" });
+  } finally { globalThis.fetch = fetch; }
+});
+
+test("a build interrupted by a bundler outage keeps its request ID usable", async t => {
+  const f = await registryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval }, build = f.chain.build;
+  const { BundlerUnavailableError } = await import("../src/userop.ts");
+  f.chain.build = async () => { throw new BundlerUnavailableError("Bundler HTTP 503"); };
+  await assert.rejects(f.service.send("link_agent", args), { code: "rpc_unavailable" });
+  assert.equal((await f.service.operation(id)).status, "approval_required");
+  f.chain.build = build;
+  assert.equal((await f.service.send("link_agent", args)).status, "submitted");
+});
+
+test("the upgrade command points to registry approval only when the configuration includes the registry", async t => {
+  const base = withoutAgentRegistry(MAINNET), f = await fixture(t, { config: base }), store = new WalletStore(MAINNET, f.deps);
+  await f.store.createOrLoad();
+  await approveCapabilities(store, base, MAINNET, password, digest(await reviewCapabilities(store, base, MAINNET)));
+  const moved = structuredClone(MAINNET);
+  moved.manifest.agentRegistry.proxy.address = "0x00000000000000000000000000000000000000aa";
+  moved.manifest.manifestId = configurationId(moved.manifest, "manifestId");
+  const config = parseConfig(moved), registryFree = withoutAgentRegistry(config);
+  const upgrade = await reviewUpgrade(new WalletStore(registryFree, f.deps), registryFree);
+  assert.equal(upgrade.registryPending, false);
 });
