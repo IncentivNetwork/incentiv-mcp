@@ -62,9 +62,9 @@ export function registerX402Tools(server: McpServer, wallet: WalletService, scre
       // Seller-written text: the refusal reason and the settlement's error reason, which _meta repeats.
       const settlement = typeof answer.settlement?.error_reason === "string" ? screening.fields(answer.settlement, ["error_reason"]) : answer.settlement;
       const screened = { ...("seller_error" in answer ? screening.fields(answer, ["seller_error"]) : answer), ...(settlement ? { settlement } : {}) };
-      // _meta carries the x402 SettleResponse that x402 MCP clients read, and only for a settlement the seller reported.
+      // Match the wallet result: an HTTP 402 refusal must not also advertise a successful settlement in MCP metadata.
       const s = settlement as { success?: boolean; transaction?: string; network?: string; payer?: string; error_reason?: string } | undefined;
-      const settleResponse = s?.success ? { success: true, ...(s.transaction ? { transaction: s.transaction } : {}), ...(s.network ? { network: s.network } : {}), ...(s.payer ? { payer: s.payer } : {}), ...(s.error_reason ? { errorReason: s.error_reason } : {}) } : undefined;
+      const settleResponse = answer.seller_reported_settlement === true && s?.success ? { success: true, ...(s.transaction ? { transaction: s.transaction } : {}), ...(s.network ? { network: s.network } : {}), ...(s.payer ? { payer: s.payer } : {}), ...(s.error_reason ? { errorReason: s.error_reason } : {}) } : undefined;
       return { result: screened, ...(settleResponse ? { meta: { [PAYMENT_RESPONSE_META_KEY]: settleResponse } } : {}) };
     });
   return catalog;

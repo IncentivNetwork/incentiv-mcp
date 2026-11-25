@@ -852,6 +852,22 @@ test("seller-written settlement text is cut short, malformed values are dropped,
   assert.equal(direct.settlement.transaction, undefined); assert.equal(direct.settlement.network, undefined); assert.equal(direct.settlement.payer, undefined);
 });
 
+test("a seller's HTTP payment refusal cannot report success in MCP metadata", async t => {
+  const f = await x402Fixture(t), http = f.service.http;
+  const transaction = `0x${"ee".repeat(32)}`;
+  f.service.http = async req => req.headers?.["payment-signature"]
+    ? { status: 402, headers: { "payment-response": encodePaymentResponseHeader({ success: true, transaction, network: X402_NETWORK }) }, body: Buffer.from("{}"), truncated: false }
+    : http(req);
+  const tools = {};
+  registerX402Tools({ registerTool: (name, _config, handler) => { tools[name] = handler; } }, f.service);
+  const answer = await tools.pay_x402_resource({ url: URL_, max_amount: "0.05", request_id: randomUUID() });
+  const result = JSON.parse(answer.content[0].text);
+  assert.equal(result.status, "submission_unknown");
+  assert.equal(result.seller_reported_settlement, false);
+  assert.equal(result.transaction_hash, transaction);
+  assert.equal(answer._meta, undefined);
+});
+
 test("refused requests do not accumulate in the journal, and bindings that are kept for good are capped", async t => {
   // A price above the USDC daily limit is refused before a payment record exists.
   const daily = await x402Fixture(t, { usdcLimits: { perTransaction: "40000", daily: "40000" } });
