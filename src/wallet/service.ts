@@ -537,24 +537,35 @@ export class WalletService {
 
     // A request that cannot safely be sent twice is bound to its request ID before the unpaid request goes out:
     // a resource that needs no payment acts on it straight away.
-    let probe = journal.data.probes?.find(p => p.requestId === requestId);
+    const probe = journal.data.probes?.find(p => p.requestId === requestId);
     if (probe) {
       if (probe.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
       if (probe.outcome === "not_required") return { request_id: requestId, status: "not_required", content_delivered: false, next_action: "This POST was already sent under this request ID and needed no payment; its answer was returned then. This wallet does not send it again: use a new request ID to send it again." };
       if (probe.outcome === "sending") throw new WalletError("x402_request_uncertain", "This POST may already have reached the resource under this request ID, which may have acted on it. Nothing was paid. This wallet does not send it again: use a new request ID to send it again.");
     }
-    const bind = async (outcome: "sending" | "payment_required" | "not_required" | undefined) => {
+    const bind = async (outcome: "sending" | "payment_required" | "not_required" | undefined, at = Date.now()) => {
       if (replayable(req)) return;
       journal.data.probes = (journal.data.probes ?? []).filter(p => p.requestId !== requestId);
       // A binding that may guard an acted-on POST is never dropped, so their number is capped instead.
       if (outcome === "sending" && journal.data.probes.length >= MAX_PROBES) throw new WalletError("policy_denied", `This wallet already keeps ${MAX_PROBES} unpaid POST requests bound to their request IDs, so it sends no more without an Idempotency-Key header the seller honours; nothing was sent or paid. The user can clear old bindings with incentiv-mcp wallet x402 clear-bindings in their own terminal`);
-      if (outcome) { probe = { requestId, request, outcome, at: Date.now() }; journal.data.probes.push(probe); }
+      if (outcome) journal.data.probes.push({ requestId, request, outcome, at });
       await journal.save();
     };
+    assertPolicyLive(limits, "nothing was sent or paid");
     await bind("sending");
+    const restoreProbe = () => bind(probe?.outcome, probe?.at);
+    // An unpaid request can still have side effects. Check again after the durable POST binding.
+    try {
+      await s.assertOwned();
+      await this.enabled(s);
+      assertPolicyLive(limits, "nothing was sent or paid");
+    } catch (error) {
+      await restoreProbe();
+      throw error;
+    }
     const unpaid = await this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES }).catch(async (error: unknown) => {
-      // A failure that proves nothing was sent unbinds it; otherwise the resource may have acted on it.
-      if (neverSent(error)) await bind(undefined);
+      // If nothing was sent, restore the earlier binding. Otherwise the resource may have acted on the request.
+      if (neverSent(error)) await restoreProbe();
       if (error instanceof WalletError) throw error;
       const uncertain = !neverSent(error) && !replayable(req) ? " The resource may have received this POST, so this wallet does not send it again under this request ID." : "";
       throw new WalletError("x402_request_failed", `The resource could not be reached, so nothing was paid: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}.${uncertain}`);

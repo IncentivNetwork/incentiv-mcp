@@ -600,6 +600,29 @@ test("an unpaid POST is bound to its request ID before it is sent, so a retry ne
   assert.equal(priced.seen.unpaid, 2);
 });
 
+test("an unpaid purchase does not send a POST after expiry or disable", async t => {
+  const purchase = id => ({ url: URL_, method: "POST", body: "{}", max_amount: "0.05", request_id: id });
+  const expired = await x402Fixture(t);
+  await expired.store.session(async s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt: 1 } }));
+  await assert.rejects(expired.service.payX402(purchase(randomUUID())), error =>
+    error.code === "policy_denied" && /expired.*nothing was sent or paid/.test(error.detail));
+  assert.equal(expired.seen.unpaid, 0);
+
+  const disabled = await x402Fixture(t), id = randomUUID();
+  let disabledAtBind = false;
+  disabled.deps.checkpoint = async point => {
+    if (!disabledAtBind && /^journal_\d+_empty$/.test(point)) {
+      disabledAtBind = true;
+      await disabled.store.disable();
+    }
+  };
+  await assert.rejects(disabled.service.payX402(purchase(id)), { code: "wallet_locked" });
+  assert.equal(disabledAtBind, true);
+  assert.equal(disabled.seen.unpaid, 0);
+  const probes = await disabled.store.session(async s => (await Journal.open(s)).data.probes);
+  assert.deepEqual(probes, []);
+});
+
 test("unpaid HTTP errors and redirects are reported as failures without repeating an unsafe POST", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   let status = 302;
