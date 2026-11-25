@@ -64,9 +64,11 @@ test("the final relay callback prevents a policy change during connection from b
     await f.store.disable();
     return relay(wire, beforeSubmit);
   };
-  assert.equal((await f.service.send("transfer", args(id))).status, "submission_unknown");
+  // Nothing was sent, so the refusal reaches the caller and the request stays signed rather than possibly in flight.
+  await assert.rejects(f.service.send("transfer", args(id)), { code: "wallet_locked" });
   assert.equal(f.submissions.length, 0);
   const record = (await f.service.review(id)).records[0];
+  assert.equal(record.status, "signed"); assert.equal(record.attempts, 0); assert.equal(record.lastError, undefined);
   assert.notEqual(record.operation.signature, "0x");
   assert.deepEqual(record.reservation, { native: "1300" });
 });
@@ -104,10 +106,12 @@ test("in-policy swaps sign automatically and recheck the route before signing an
       await s.savePolicy({ ...s.envelope.policy, limits: { ...limits, swaps: true, tokens: { ...limits.tokens, [input.address]: limits.tokens.native }, targets, maxBatchCalls: 4, trustedRpcOrigins: ["https://rpc.incentiv.io"] } });
     });
     const request = { request_id: id, token_in: "USDC", token_out: "CENT", amount_in: "0.000000000000001", minimum_out: "0.000000000000000995" };
-    if (failAt === 2) await assert.rejects(f.service.send("swap", request));
-    else assert.equal((await f.service.send("swap", request)).status, failAt ? "submission_unknown" : "submitted");
+    if (failAt) await assert.rejects(f.service.send("swap", request));
+    else assert.equal((await f.service.send("swap", request)).status, "submitted");
     assert.equal(f.submissions.length, failAt ? 0 : 1);
     const record = (await f.service.review(id)).records[0];
+    // A route refused at the broadcast boundary sent nothing, so the signed bytes stay signed.
+    if (failAt === 4) assert.equal(record.status, "signed");
     assert.equal(record.approval, undefined, "policy-authorized swaps need no per-operation approval");
     if (!failAt) {
       f.setReceipt({ success: true, actualGasCost: 200n, transactionHash: `0x${"55".repeat(32)}` });

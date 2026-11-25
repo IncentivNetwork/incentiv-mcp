@@ -98,7 +98,7 @@ const transitions: Record<OperationRecord["status"], string[]> = {
   approval_required: ["preparing", "expired", "cancelled"],
   // Only an x402 payment that never left this computer expires from signed: nobody else holds its signature.
   signed: ["submitting", "superseding", "expired"],
-  // Back to its earlier status only when the last check before the outbound request refused it, so it never left.
+  // Back to its earlier status only when the last check before the outbound request or broadcast refused it, so it never left.
   submitting: ["submitted", "submission_unknown", "signed"],
   submitted: ["confirmed", "reverted", "submission_unknown", "superseding"],
   submission_unknown: ["submitting", "submitted", "confirmed", "reverted", "superseding"],
@@ -107,7 +107,7 @@ const transitions: Record<OperationRecord["status"], string[]> = {
   confirmed: ["submitted"], reverted: [], failed: [], cancelled: [], expired: [], superseded: [],
 };
 /** The moves above that only an x402 payment may make. */
-const X402_ONLY_TRANSITIONS = ["signed>expired", "submitting>signed", "confirmed>submitted"];
+const X402_ONLY_TRANSITIONS = ["signed>expired", "confirmed>submitted"];
 
 /** One atomic authenticated snapshot retains every request for the wallet lifetime.
  * ponytail: linear journal reads; segment with authenticated tombstones when history exceeds 16 MiB.
