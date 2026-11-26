@@ -661,7 +661,7 @@ export class WalletService {
     // anything is journaled, so an agent retrying a refused purchase under new request IDs cannot fill the journal.
     // The unpaid request can take a while; a settlement rolled back meanwhile must hold its reservation again
     // before the balance is counted, or the restored funds would pay twice.
-    const state = await this.chain.state(s.envelope).catch(rethrowX402RecheckError);
+    const state = await this.chain.state(s.envelope).catch(rethrowSnapshotError);
     const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state);
     assertDeploysOnce(state.deployed, journal);
     const price: Spend = { [xcfg.usdc.toLowerCase()]: accepted.amount };
@@ -703,7 +703,7 @@ export class WalletService {
       if (!covers(balances, journal, validated.spend)) throw new WalletError("policy_denied", "Balance cannot cover the price plus the maximum gas payment beside other pending operations; nothing was paid");
       r.operation = wire; r.userOpHash = validated.hash; r.nonce = laneNonce.toString(); r.deadline = validUntil; r.reservation = validated.spend; r.fromBlock = state.block.toString();
       await this.chain.simulate(validated);
-      await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
+      await this.chain.assertCanonicalSnapshot(state).catch(rethrowSnapshotError);
       if (validUntil <= Math.floor(Date.now() / 1000) + 5) throw new WalletError("validation_failed", "The seller's payment window closed while the payment was prepared; retry with a new request ID");
       assertPolicyLive(limits, "it expired while the payment was prepared; nothing was paid");
       await this.canSubmit(s, r);
@@ -761,7 +761,7 @@ export class WalletService {
     const state = await this.chain.stateFor(s.envelope, r);
     if (state.nonce === BigInt(r.nonce!)) {
       if (r.status === "confirmed") {
-        await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
+        await this.chain.assertCanonicalSnapshot(state).catch(rethrowSnapshotError);
         await this.reopenX402Settlement(journal, r);
       }
       return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The RPC no longer shows this payment's settlement: the chain reorganized, or the RPC is behind" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid. ${X402_UNKNOWN_ACTION(r.requestId)}` };
@@ -769,7 +769,7 @@ export class WalletService {
     if (replayable(req)) {
       // Asking again sends a request from this computer, so it needs current policy like any other x402 request.
       // The payment itself has settled, so a refusal only withholds the answer.
-      await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
+      await this.chain.assertCanonicalSnapshot(state).catch(rethrowSnapshotError);
       await s.assertOwned(); await this.enabled(s);
       const refused = !limits.x402 ? "x402 payments are now off in local wallet policy"
         : x402Violations(limits, req.origin, ZERO_ADDRESS, "0").includes("x402_origin_not_allowed") ? "local wallet policy no longer allows this site"
@@ -835,7 +835,7 @@ export class WalletService {
     // restores the previous delivery state because this attempt never left the wallet.
     const unsent = async () => { r.attempts--; await journal.transition(r, before); };
     try {
-      await this.chain.assertCanonicalSnapshot(snapshot).catch(rethrowX402RecheckError);
+      await this.chain.assertCanonicalSnapshot(snapshot).catch(rethrowSnapshotError);
       await this.canSubmit(s, r);
       assertPolicyLive(limits, consequence);
     }

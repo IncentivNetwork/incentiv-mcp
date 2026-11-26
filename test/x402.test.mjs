@@ -2145,7 +2145,7 @@ test("a reorg during the pre-send write preserves both first-send and uncertain 
         native = firstGas + 1n;
       }
     };
-    await assert.rejects(f.service.payX402(purchase), { code: "rpc_unavailable" });
+    await assert.rejects(f.service.payX402(purchase), error => error.code === "rpc_unavailable" && /Chain state changed or RPC is unavailable/.test(error.detail));
     assert.equal(reorged, true);
     assert.equal(f.seen.payments.length, sent);
     const record = (await f.records()).find(r => r.requestId === second);
@@ -2282,6 +2282,8 @@ test("a body that stalls after the headers keeps the settlement header and is ma
   const connect = directAgent.createConnection;
   t.after(() => { directAgent.createConnection = connect; });
   for (const framing of ["Content-Length: 100", "Transfer-Encoding: chunked"]) {
+    let headersIn;
+    const parsed = new Promise(resolve => { headersIn = resolve; });
     directAgent.createConnection = () => {
       const socket = new Duplex({
         read() {},
@@ -2289,16 +2291,24 @@ test("a body that stalls after the headers keeps the settlement header and is ma
           callback();
           // The headers and part of the body arrive; the rest never does and the socket stays open.
           const partial = framing.startsWith("Content") ? "partial" : "7\r\npartial\r\n";
-          setImmediate(() => socket.push(Buffer.from(`HTTP/1.1 200 OK\r\n${framing}\r\nPayment-Response: ${header}\r\n\r\n${partial}`)));
+          setImmediate(() => { socket.push(Buffer.from(`HTTP/1.1 200 OK\r\n${framing}\r\nPayment-Response: ${header}\r\n\r\n${partial}`)); headersIn(); });
         },
       });
       socket.setTimeout = () => socket;
       return socket;
     };
-    const observed = await httpsTransport({ url: URL_, method: "GET", maxBytes: 1024, timeoutMs: 200 });
-    assert.equal(observed.incomplete, true, framing);
-    assert.equal(observed.headers["payment-response"], header, framing);
-    assert.equal(observed.body.toString(), "partial", framing);
+    // The request deadline fires only once the headers are in, however slow the runner is.
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      const pending = httpsTransport({ url: URL_, method: "GET", maxBytes: 1024, timeoutMs: 60_000 });
+      await parsed;
+      await new Promise(resolve => setImmediate(resolve));
+      t.mock.timers.tick(60_000);
+      const observed = await pending;
+      assert.equal(observed.incomplete, true, framing);
+      assert.equal(observed.headers["payment-response"], header, framing);
+      assert.equal(observed.body.toString(), "partial", framing);
+    } finally { t.mock.timers.reset(); }
   }
 });
 
@@ -2397,7 +2407,9 @@ test("a payment and a redelivery refuse a snapshot that changes before they act"
   // Before signing: the block the payment was built at leaves the chain during simulation.
   const sign = await x402Fixture(t), signing = pinned(sign);
   sign.chain.simulate = async () => signing.change();
-  await assert.rejects(sign.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), { code: "rpc_unavailable" });
+  const snapshotChanged = error => error.code === "rpc_unavailable" && /Chain state changed or RPC is unavailable/.test(error.detail);
+  // The payment closes its record on any outage while it is prepared, with its own message.
+  await assert.rejects(sign.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), error => error.code === "rpc_unavailable" && !/x402 settlements/.test(error.detail));
   assert.equal(sign.seen.payments.length, 0);
   assert.deepEqual((await sign.records()).map(r => r.status), ["failed"]);
 
@@ -2415,10 +2427,49 @@ test("a payment and a redelivery refuse a snapshot that changes before they act"
       snapshot.change();
       return { ...read, nonce: BigInt(record.nonce) + (laneUsed ? 1n : 0n) };
     };
-    await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), { code: "rpc_unavailable" }, `lane used: ${laneUsed}`);
+    await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), snapshotChanged, `lane used: ${laneUsed}`);
     snapshot.restore();
     // Neither reopened nor asked the seller again.
     assert.equal((await f.records())[0].status, "confirmed");
     assert.equal(f.seen.payments.length, paid);
   }
+});
+
+test("a payment on a wallet without x402 settlements reports a chain outage, not an x402 recheck", async t => {
+  const f = await x402Fixture(t);
+  f.chain.state = async () => { throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 }); };
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), error => {
+    assert.equal(error.code, "rpc_unavailable");
+    assert.match(error.detail, /Chain state changed or RPC is unavailable/);
+    return true;
+  });
+  assert.equal(f.seen.payments.length, 0);
+});
+
+test("past the unresolved-log cap the receipt search cursors wait, so the next pass still tries every log", async () => {
+  const { MAX_RETRY_LOGS } = await import("../src/wallet/chain.ts");
+  const chain = new WalletChain(new Ctx(MAINNET));
+  const head = 20_000n, at = 600n;
+  const hash = (n, width = 64) => `0x${n.toString(16).padStart(width, "0")}`;
+  const blockHash = hash(0xbbn);
+  // One more log than can be kept for retry, all in one range; only the last is the real receipt.
+  const txs = Array.from({ length: MAX_RETRY_LOGS + 1 }, (_, i) => hash(BigInt(i + 1)));
+  const record = { intent: { kind: "x402_payment" }, userOpHash: hash(0x99n), nonce: "0", fromBlock: "500", operation: { sender: seller } };
+  chain.clients = [{
+    getBlockNumber: async () => head,
+    readContract: async () => 1n,
+    getBlock: async () => ({ hash: blockHash }),
+    getLogs: async ({ fromBlock, toBlock }) => fromBlock <= at && at <= toBlock ? txs.map(transactionHash => ({ transactionHash, blockNumber: at, blockHash })) : [],
+  }];
+  let verifiable = false;
+  const receipt = { success: true, blockNumber: at, blockHash, transactionHash: txs.at(-1) };
+  chain.verifiedReceipt = async (_record, candidate) => verifiable && candidate === txs.at(-1) ? receipt : undefined;
+  assert.equal(await chain.searchOperation(record), undefined);
+  assert.equal(record.retryLogs.length, MAX_RETRY_LOGS);
+  assert.ok(!record.retryLogs.some(log => log.transactionHash === txs.at(-1)));
+  // Neither cursor passed the range holding the log that could not be kept.
+  assert.equal(record.searchedBlock, undefined);
+  assert.equal(record.discoveredBlock, undefined);
+  verifiable = true;
+  assert.deepEqual(await chain.searchOperation(record), receipt);
 });
