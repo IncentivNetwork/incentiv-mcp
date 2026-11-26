@@ -224,7 +224,7 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   }
   const id = approve ? args[1].toLowerCase() : resolveOperation ? args[2].toLowerCase() : undefined;
   const review = resolveOperation && replacing ? await service.reviewReplacement(id!, nativeGas) : await service.review(id);
-  if (replacing) console.error("The displayed replacement sends zero value to this account at the SAME nonce and uses the displayed gas token and payment (native gas up to maxGasCost, or gasToken/gasCharge for token gas). Either the original or replacement can win; no reservation is released until a receipt is verified.");
+  if (replacing) console.error("The displayed replacement sends zero value to this account at the SAME nonce and uses the displayed gas token and payment (native gas up to maxGasCost, or gasToken/gasCharge for token gas). Either the original or replacement can win, as can an earlier signed token-paid replacement this one follows; no reservation is released until a receipt is verified.");
   console.error(JSON.stringify(review, null, 2));
   if (approve && review.records[0]) assertNeedsApproval(review.records[0]);
   if (review.wallet.storage === "file") console.error("File-key mode does not protect against a shell-capable agent running as this OS user.");

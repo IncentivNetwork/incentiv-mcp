@@ -9,7 +9,7 @@ import { NetworkError } from "../network.js";
 import { BundlerUnavailableError, userOpToJson } from "../userop.js";
 import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
-import { Journal, digest, intentSchema, ownsNonce, terminal, type Intent, type OperationRecord } from "./journal.js";
+import { Journal, digest, intentSchema, ownsNonce, signedReplacements, terminal, type Intent, type OperationRecord } from "./journal.js";
 import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, type Limits, type Spend } from "./policy.js";
 import { MIN_SWAP_REMAINING_SECONDS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure } from "./chain.js";
 import { validateOperation } from "./validate.js";
@@ -102,24 +102,26 @@ export class WalletService {
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
       try {
         const receipt = await this.chain.receipt(r);
-        if (!receipt && r.replacement?.signed) {
-          const replaced = await this.chain.receipt({ ...r, operation: r.replacement.operation, userOpHash: r.replacement.userOpHash });
-          if (replaced) {
-            const gasToken = r.replacement!.gasToken ?? "native";
-            r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: r.replacement!.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
-            // A mined replacement consumes the nonce even if its execution reverted.
-            await journal.transition(r, "superseded"); continue;
-          }
+        let superseded = false;
+        // Each signed replacement is looked up, including a token-paid one a native replacement was reviewed over.
+        for (const candidate of receipt ? [] : signedReplacements(r)) {
+          const replaced = await this.chain.receipt({ ...r, operation: candidate.operation, userOpHash: candidate.userOpHash, replacement: candidate });
+          if (!replaced) continue;
+          const gasToken = candidate.gasToken ?? "native";
+          r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: candidate.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
+          // A mined replacement consumes the nonce even if its execution reverted.
+          await journal.transition(r, "superseded"); superseded = true; break;
         }
+        if (superseded) continue;
         if (!receipt) { if (r.status === "submitted") await journal.transition(r, "submission_unknown"); continue; }
         const spend: Spend = {};
         if (receipt.success) addSpend(spend, r.intent.token, BigInt(r.intent.amount));
         // Token-paymaster refunds are not inferred from an untrusted relay. Retain the
         // full authorized token payment conservatively, including reverted operations.
         const input = r.intent.token === r.intent.gasToken ? BigInt(r.intent.amount) : 0n;
-        // If the original wins, release the unused replacement's gas reservation.
-        const replacementGas = r.replacement?.signed && (r.replacement.gasToken ?? "native") === r.intent.gasToken
-          ? BigInt(r.replacement.gasCharge ?? r.replacement.maxGasCost) : 0n;
+        // If the original wins, release the unused replacements' gas reservations.
+        const replacementGas = signedReplacements(r).filter(x => (x.gasToken ?? "native") === r.intent.gasToken)
+          .reduce((sum, x) => sum + BigInt(x.gasCharge ?? x.maxGasCost), 0n);
         const gas = r.intent.gasToken === "native" ? receipt.actualGasCost : BigInt(r.reservation[r.intent.gasToken] ?? "0") - input - replacementGas;
         if (gas < 0n) throw new WalletError("wallet_recovery_required", "Invalid persisted gas reservation");
         addSpend(spend, r.intent.gasToken, gas);
@@ -466,7 +468,11 @@ export class WalletService {
       await this.enabled(s);
       const journal = await Journal.open(s); await this.reconcile(journal);
       const r = journal.data.records.find(r => r.requestId === id);
-      if (!r || !ownsNonce(r.status) || r.replacement?.signed) throw new WalletError("operation_pending", "Replacement requires an unresolved original operation without a signed replacement");
+      // A signed token-paid replacement can become unsendable: the bundler refuses the same bytes once the paymaster's
+      // terms move. It may still land, so it is kept, but a native replacement may be reviewed over it, once.
+      const overToken = !!r?.replacement?.signed && r.replacement.gasToken !== undefined && !r.priorReplacement;
+      if (!r || !ownsNonce(r.status) || (r.replacement?.signed && !(overToken && nativeGas))) throw new WalletError("operation_pending", `Replacement requires an unresolved original operation without a signed replacement${overToken ? `; a signed replacement that pays gas in a token can be replaced once more with wallet operation resolve ${id} --replace --native-gas` : ""}`);
+      if (r.priorReplacement && !nativeGas) throw new WalletError("operation_pending", `Request ${id} already has a signed token-paid replacement, so only a native one can follow it: run wallet operation resolve ${id} --replace --native-gas`);
       const state = await this.chain.state(s.envelope);
       // Native gas clears the nonce when the token balance or paymaster cannot.
       const gasToken = nativeGas ? "native" : r.intent.gasToken;
@@ -474,6 +480,7 @@ export class WalletService {
       const wire = userOpToJson(built.op);
       const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s, gasToken), wire, { nonce: BigInt(r.nonce!), deployed: state.deployed, hash: built.userOpHash });
       await this.replacementStep(r.requestId, gasToken, () => this.chain.simulate(validated));
+      if (overToken) r.priorReplacement = r.replacement;
       r.replacement = { operation: wire, userOpHash: validated.hash, maxGasCost: validated.gasCost.toString(), ...(gasToken !== "native" ? { gasToken, gasCharge: validated.gasCharge.toString() } : {}), signed: false, expiresAt: Date.now() + 300_000 };
       r.sequence = ++journal.data.sequence; await journal.save();
       return { wallet: publicWallet(s.envelope), records: [structuredClone(r)] };
@@ -513,20 +520,23 @@ export class WalletService {
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");
       replacement.operation.signature = await this.signRaw(s, validated.hash);
       replacement.signed = true;
-      // Keep the original reservation as well: either signed operation might win.
+      // Keep the original reservation, and an earlier replacement's, as well: any signed operation might win.
       addSpend(r.reservation, gasToken, validated.gasCharge);
-      await journal.transition(r, "superseding");
+      if (r.status === "superseding") { r.sequence = ++journal.data.sequence; await journal.save(); }
+      else await journal.transition(r, "superseding");
       await this.submitReplacement(s, journal, r);
       return result(r);
     });
   }
   private async submitReplacement(s: WalletSession, journal: Journal, r: OperationRecord) {
     await this.canSubmit(s);
-    if (!r.replacement?.signed || r.status !== "superseding") throw new WalletError("wallet_recovery_required", "Missing signed replacement");
+    // The latest signed replacement; while a native one reviewed over a token-paid one is unsigned, that earlier one.
+    const signed = r.replacement?.signed ? r.replacement : r.priorReplacement;
+    if (!signed || r.status !== "superseding") throw new WalletError("wallet_recovery_required", "Missing signed replacement");
     r.attempts++; r.sequence = ++journal.data.sequence; await journal.save();
     try {
-      const hash = await this.chain.relay(r.replacement.operation, () => this.canSubmit(s));
-      if (hash !== r.replacement.userOpHash) throw new Error();
+      const hash = await this.chain.relay(signed.operation, () => this.canSubmit(s));
+      if (hash !== signed.userOpHash) throw new Error();
       delete r.lastError;
     } catch { r.lastError = "submission_unknown"; }
     r.sequence = ++journal.data.sequence; await journal.save();
@@ -569,5 +579,5 @@ function result(r: OperationRecord) {
   const eventMissing = r.status === "confirmed" && r.lastError === "registry_event_missing";
   const registryError = eventMissing || (r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_")) ? r.lastError : undefined;
   const interrupted = r.status === "approval_required" && TEMPORARY_ERRORS.includes(r.lastError ?? "");
-  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `${r.lastError === "registry_factory_not_allowed" ? "The Agent Registry does not currently allow this account's factory. Retry with the same request ID once it does, while the Portal approval is still valid" : "A temporary RPC failure interrupted this request. Retry with the same request ID"}${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
+  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `${r.lastError === "registry_factory_not_allowed" ? "The Agent Registry does not currently allow this account's factory. Retry with the same request ID once it does, while the Portal approval is still valid" : "A temporary RPC failure interrupted this request. Retry with the same request ID"}${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, prior_replacement_user_op_hash: r.priorReplacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }
