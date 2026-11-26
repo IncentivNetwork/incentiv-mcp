@@ -1094,6 +1094,8 @@ test("the chain reads status and digest at one block, with a deadline capped by 
 
 test("the chain signs nothing from a stale block, a blocked parent or disagreeing RPCs", async () => {
   await assert.rejects(consentChain([deployedAgent()], Math.floor(Date.now() / 1000) - 600).agentLinkConsent(consentWallet, parent), { code: "registry_rpc_unavailable" });
+  // A block from the future would stretch the consent deadline past AGENT_LINK_REQUEST_SECONDS.
+  await assert.rejects(consentChain([deployedAgent()], Math.floor(Date.now() / 1000) + 3600).agentLinkConsent(consentWallet, parent), { code: "registry_rpc_unavailable" });
   const full = consentChain([deployedAgent()]), c = full.clients[0], good = c.readContract;
   c.readContract = args => args.functionName === "agentCount" && args.args[0].toLowerCase() === parent.toLowerCase() ? Promise.resolve(5n) : good(args);
   // A blocked link reads no digest, so a digest read that would fail cannot hide the registry's reason.
