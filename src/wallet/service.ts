@@ -1158,7 +1158,6 @@ function rethrowX402RecheckError(error: unknown): never {
 }
 
 const MAX_LINK_ATTEMPTS = 8;
-/** An RPC or bundler outage says nothing about a request, so it becomes a retryable rpc_unavailable; anything else is returned as is. */
 /** A chain read for an ordinary spend that failed, or whose block was replaced; retrying reads a new snapshot. */
 function rethrowSnapshotError(error: unknown): never {
   if (!rpcFault(error)) throw error;
@@ -1175,6 +1174,7 @@ async function pooled(tasks: (() => Promise<void>)[], limit: number): Promise<vo
   }));
   if (failure) throw failure.error;
 }
+/** An RPC or bundler outage says nothing about a request, so it becomes a retryable rpc_unavailable; anything else is returned as is. */
 const rpcOutage = (error: unknown) => !(error instanceof WalletError) && (isTransportFailure(error) || error instanceof BundlerUnavailableError)
   ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : error;
 /** Refusals that say nothing about the request itself, so an unsigned request returns to approval_required and keeps its ID. */

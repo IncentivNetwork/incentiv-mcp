@@ -2274,3 +2274,151 @@ test("receipt verification rejects an older fork without releasing the payment r
   assert.equal((await f.service.operation(id)).status, "confirmed");
   assert.equal((await f.records())[0].settledBlockHash, newHash);
 });
+
+test("a body that stalls after the headers keeps the settlement header and is marked incomplete", async t => {
+  const { Duplex } = await import("node:stream");
+  const { directAgent, httpsTransport } = await import("../src/x402/http.ts");
+  const header = encodePaymentResponseHeader({ success: true, transaction: `0x${"ef".repeat(32)}`, network: X402_NETWORK });
+  const connect = directAgent.createConnection;
+  t.after(() => { directAgent.createConnection = connect; });
+  for (const framing of ["Content-Length: 100", "Transfer-Encoding: chunked"]) {
+    directAgent.createConnection = () => {
+      const socket = new Duplex({
+        read() {},
+        write(_chunk, _encoding, callback) {
+          callback();
+          // The headers and part of the body arrive; the rest never does and the socket stays open.
+          const partial = framing.startsWith("Content") ? "partial" : "7\r\npartial\r\n";
+          setImmediate(() => socket.push(Buffer.from(`HTTP/1.1 200 OK\r\n${framing}\r\nPayment-Response: ${header}\r\n\r\n${partial}`)));
+        },
+      });
+      socket.setTimeout = () => socket;
+      return socket;
+    };
+    const observed = await httpsTransport({ url: URL_, method: "GET", maxBytes: 1024, timeoutMs: 200 });
+    assert.equal(observed.incomplete, true, framing);
+    assert.equal(observed.headers["payment-response"], header, framing);
+    assert.equal(observed.body.toString(), "partial", framing);
+  }
+});
+
+test("an interrupted 2xx is never taken as an answer: not for an unpaid request, a quote or a redelivery", async t => {
+  const interrupted = { status: 200, headers: { "content-type": "application/json" }, body: Buffer.from('{"temp'), truncated: true, incomplete: true };
+  const f = await x402Fixture(t);
+  f.service.http = async () => interrupted;
+  const unpaid = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() });
+  assert.equal(unpaid.status, "request_failed");
+  assert.match(unpaid.next_action, /interrupted before a payment was sent/);
+  const quote = await f.service.x402Requirements({ url: URL_ });
+  assert.equal(quote.status, "request_failed");
+  assert.notEqual(quote.payment_required, false);
+
+  const lost = await x402Fixture(t), id = randomUUID(), seller = lost.service.http;
+  lost.seen.fail = 1;
+  assert.equal((await lost.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submission_unknown");
+  await lost.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  assert.equal((await lost.service.operation(id)).status, "confirmed");
+  lost.service.http = async req => req.headers?.["payment-signature"] ? interrupted : seller(req);
+  const redelivered = await lost.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(redelivered.content_delivered, false);
+  assert.equal(redelivered.http_status, 200);
+  assert.equal((await lost.records())[0].delivered, undefined);
+});
+
+test("a paid request waits longer than the facilitator's 60-second settle window", async t => {
+  const f = await x402Fixture(t), seller = f.service.http, timeouts = [];
+  f.service.http = async req => { if (req.headers?.["payment-signature"]) timeouts.push(req.timeoutMs); return seller(req); };
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() })).status, "submitted");
+  assert.equal(timeouts.length, 1);
+  assert.ok(timeouts[0] > 60_000, `paid request timeout ${timeouts[0]}`);
+});
+
+test("a transfer resend rechecks x402 settlements at its own snapshot and refuses a snapshot that changes", async t => {
+  for (const change of ["none", "simulation"]) {
+    const f = await x402Fixture(t), payment = randomUUID(), transfer = randomUUID(), state = f.chain.state;
+    const oldHash = `0x${"77".repeat(32)}`, newHash = `0x${"88".repeat(32)}`;
+    let blockHash = oldHash;
+    f.chain.state = async (...params) => ({ ...(await state(...params)), deployed: true, blockHash: oldHash });
+    f.chain.canonicalBlockHash = async () => blockHash;
+    f.chain.assertCanonicalSnapshot = snapshot => WalletChain.prototype.assertCanonicalSnapshot.call(f.chain, snapshot);
+    await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: payment, gas_token: "native" });
+    await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+    assert.equal((await f.service.operation(payment)).status, "confirmed");
+    f.setReceipt(undefined);
+    const relay = f.chain.relay;
+    f.chain.relay = async (operation, beforeSubmit) => { await beforeSubmit?.(); throw new Error("socket hang up"); };
+    assert.equal((await f.service.send("transfer", args(transfer))).status, "submission_unknown", change);
+    f.chain.relay = relay;
+    const sent = f.submissions.length;
+
+    // The payment's settlement rolls back after the session-start reconcile, when the resend reads its own snapshot.
+    let laneRead = false, rolledBack = false;
+    const lane = f.chain.laneNonce, pinned = [];
+    f.chain.laneNonce = async (...params) => { laneRead = true; return lane(...params); };
+    f.chain.state = async (...params) => {
+      if (laneRead && !rolledBack) { rolledBack = true; f.unsettle(); }
+      return { ...(await state(...params)), deployed: true, blockHash: oldHash };
+    };
+    const balances = f.chain.balances;
+    f.chain.balances = async (wallet, tokens, block) => { pinned.push(block); return balances(wallet, tokens, block); };
+    // submit() revalidates twice, the second time inside the relay. Changing the block at that second simulation
+    // leaves only the snapshot check after simulation to catch it.
+    let simulations = 0;
+    if (change === "simulation") f.chain.simulate = async () => { if (++simulations === 2) blockHash = newHash; };
+
+    if (change === "none") {
+      assert.equal((await f.service.send("transfer", args(transfer))).status, "submitted");
+      assert.equal(f.submissions.length, sent + 1);
+      assert.ok(rolledBack);
+      // The resend reopened the rolled-back payment itself, before counting the balance read at its own block.
+      const [reopened] = await f.records();
+      assert.equal(reopened.status, "submitted");
+      assert.equal(reopened.lastError, "x402_confirmation_rolled_back");
+      assert.ok(pinned.length > 0 && pinned.every(block => block === 1n), String(pinned));
+    } else {
+      await assert.rejects(f.service.send("transfer", args(transfer)), { code: "rpc_unavailable" });
+      assert.equal(f.submissions.length, sent);
+      assert.equal((await f.records())[1].status, "submission_unknown");
+    }
+  }
+});
+
+test("a payment and a redelivery refuse a snapshot that changes before they act", async t => {
+  const oldHash = `0x${"77".repeat(32)}`, newHash = `0x${"88".repeat(32)}`;
+  const pinned = f => {
+    let blockHash = oldHash;
+    const state = f.chain.state;
+    f.chain.state = async (...params) => ({ ...(await state(...params)), deployed: true, blockHash: oldHash });
+    f.chain.canonicalBlockHash = async () => blockHash;
+    f.chain.assertCanonicalSnapshot = snapshot => WalletChain.prototype.assertCanonicalSnapshot.call(f.chain, snapshot);
+    return { change: () => { blockHash = newHash; }, restore: () => { blockHash = oldHash; } };
+  };
+
+  // Before signing: the block the payment was built at leaves the chain during simulation.
+  const sign = await x402Fixture(t), signing = pinned(sign);
+  sign.chain.simulate = async () => signing.change();
+  await assert.rejects(sign.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), { code: "rpc_unavailable" });
+  assert.equal(sign.seen.payments.length, 0);
+  assert.deepEqual((await sign.records()).map(r => r.status), ["failed"]);
+
+  for (const laneUsed of [false, true]) {
+    const f = await x402Fixture(t), id = randomUUID(), snapshot = pinned(f);
+    f.seen.fail = 1;
+    assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submission_unknown");
+    await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+    assert.equal((await f.service.operation(id)).status, "confirmed");
+    const [record] = await f.records(), paid = f.seen.payments.length;
+    // Only the redelivery's own lane read sees the snapshot that then leaves the chain.
+    const stateFor = f.chain.stateFor;
+    f.chain.stateFor = async (wallet, r) => {
+      const read = await stateFor.call(f.chain, wallet, r);
+      snapshot.change();
+      return { ...read, nonce: BigInt(record.nonce) + (laneUsed ? 1n : 0n) };
+    };
+    await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), { code: "rpc_unavailable" }, `lane used: ${laneUsed}`);
+    snapshot.restore();
+    // Neither reopened nor asked the seller again.
+    assert.equal((await f.records())[0].status, "confirmed");
+    assert.equal(f.seen.payments.length, paid);
+  }
+});
