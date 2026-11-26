@@ -150,7 +150,8 @@ export class WalletService {
     delete r.settledBlock;
     delete r.settlementFinal;
     delete r.searchedBlock;
-    if (r.replacement) delete r.replacement.searchedBlock;
+    delete r.discoveredBlock;
+    if (r.replacement) { delete r.replacement.searchedBlock; delete r.replacement.discoveredBlock; }
     const confirmed = r.status === "confirmed";
     r.lastError = confirmed ? "x402_confirmation_rolled_back" : "x402_settlement_rolled_back";
     const status = r.replacement?.signed ? "superseding" : confirmed ? "submitted" : "submission_unknown";
@@ -171,22 +172,28 @@ export class WalletService {
       if (r.status === "signed" || !ownsNonce(r.status)) continue;
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
       try {
-        const searched = r.searchedBlock;
+        const searched = [r.searchedBlock, r.discoveredBlock].join();
         // A failed lookup of the original must not hide a mined cancellation: the two are looked up independently.
         let lookupError: unknown;
         const receipt = await this.chain.receipt(r).catch((error: unknown) => { if (error instanceof WalletError) throw error; lookupError = error; return undefined; });
         // Search progress is kept, so a payment settled long ago is reached over several reconciliations.
-        if (!receipt && r.searchedBlock !== searched) { r.sequence = ++journal.data.sequence; await journal.save(); }
+        if (!receipt && [r.searchedBlock, r.discoveredBlock].join() !== searched) { r.sequence = ++journal.data.sequence; await journal.save(); }
         if (!receipt && r.replacement?.signed) {
           // The replacement has its own search start and progress: the payment's say nothing about it.
-          const lookup = { ...r, operation: r.replacement.operation, userOpHash: r.replacement.userOpHash, transactionHash: undefined, fromBlock: r.replacement.fromBlock ?? r.fromBlock, searchedBlock: r.replacement.searchedBlock };
+          const lookup = { ...r, operation: r.replacement.operation, userOpHash: r.replacement.userOpHash, transactionHash: undefined, fromBlock: r.replacement.fromBlock ?? r.fromBlock, searchedBlock: r.replacement.searchedBlock, discoveredBlock: r.replacement.discoveredBlock };
           const replaced = await this.chain.receipt(lookup);
-          if (!replaced && lookup.searchedBlock !== r.replacement.searchedBlock) { r.replacement.searchedBlock = lookup.searchedBlock; r.sequence = ++journal.data.sequence; await journal.save(); }
+          if (!replaced && (lookup.searchedBlock !== r.replacement.searchedBlock || lookup.discoveredBlock !== r.replacement.discoveredBlock)) {
+            r.replacement.searchedBlock = lookup.searchedBlock; r.replacement.discoveredBlock = lookup.discoveredBlock;
+            if (lookup.discoveredBlock === undefined) delete r.replacement.discoveredBlock;
+            r.sequence = ++journal.data.sequence; await journal.save();
+          }
           if (replaced) {
             const gasToken = r.replacement!.gasToken ?? "native";
-            r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: r.replacement!.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
+            const blockHash = replaced.blockHash?.toLowerCase() as Hex | undefined;
+            r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: r.replacement!.gasCharge! };
+            r.consumedAt = sameSettlement(r, blockHash) ? r.consumedAt : Date.now(); r.transactionHash = replaced.transactionHash;
             if (replaced.blockNumber !== undefined) r.settledBlock = replaced.blockNumber.toString();
-            if (replaced.blockHash) r.settledBlockHash = replaced.blockHash.toLowerCase() as Hex; else delete r.settledBlockHash;
+            if (blockHash) r.settledBlockHash = blockHash; else delete r.settledBlockHash;
             // A mined replacement consumes the nonce even if its execution reverted.
             await journal.transition(r, "superseded"); continue;
           }
@@ -208,10 +215,7 @@ export class WalletService {
         addSpend(spend, r.intent.gasToken, gas);
         if (receipt.registryError) r.lastError = receipt.registryError;
         const blockHash = receipt.blockHash?.toLowerCase() as Hex | undefined;
-        // A payment reopened while an RPC lagged that confirms again in the same block is the same settlement, so its
-        // spend keeps its original time instead of counting against the daily limit for another day.
-        const sameSettlement = r.consumedAt !== undefined && blockHash !== undefined && blockHash === r.settledBlockHash;
-        r.consumed = spend; r.consumedAt = sameSettlement ? r.consumedAt : Date.now(); r.transactionHash = receipt.transactionHash;
+        r.consumed = spend; r.consumedAt = sameSettlement(r, blockHash) ? r.consumedAt : Date.now(); r.transactionHash = receipt.transactionHash;
         if (receipt.blockNumber !== undefined) r.settledBlock = receipt.blockNumber.toString();
         if (blockHash) r.settledBlockHash = blockHash; else delete r.settledBlockHash;
         await journal.transition(r, receipt.success ? "confirmed" : "reverted");
@@ -569,7 +573,8 @@ export class WalletService {
     // a resource that needs no payment acts on it straight away.
     const probe = journal.data.probes?.find(p => p.requestId === requestId);
     if (probe) {
-      if (probe.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
+      // A valid 402 shows the resource did not act on the POST, so that binding may change, say to a higher max_amount, as a GET's can.
+      if (probe.request !== request && probe.outcome !== "payment_required") throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
       if (probe.outcome === "not_required") return { request_id: requestId, status: "not_required", content_delivered: false, next_action: "This POST was already sent under this request ID and needed no payment; its answer was returned then. This wallet does not send it again: use a new request ID to send it again." };
       if (probe.outcome === "sending") throw new WalletError("x402_request_uncertain", "This POST may already have reached the resource under this request ID, which may have acted on it. Nothing was paid. This wallet does not send it again: use a new request ID to send it again.");
     }
@@ -622,6 +627,9 @@ export class WalletService {
     if (refused.length) throw new WalletError("policy_denied", `Local wallet policy refuses this payment: ${refused.join(", ")}; nothing was paid`);
     // Refusals that need no built operation (the price against USDC limits, exposure and the balance) come before
     // anything is journaled, so an agent retrying a refused purchase under new request IDs cannot fill the journal.
+    // The unpaid request can take a while; a settlement rolled back meanwhile must hold its reservation again
+    // before the balance is counted, or the restored funds would pay twice.
+    await this.reconcileX402Settlements(journal, true);
     const [state, balances] = await Promise.all([this.chain.state(s.envelope), this.chain.balances(s.envelope, this.balanceTokens(limits))]);
     assertDeploysOnce(state.deployed, journal);
     const price: Spend = { [xcfg.usdc.toLowerCase()]: accepted.amount };
@@ -691,6 +699,8 @@ export class WalletService {
     if (state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "This payment's nonce lane has moved; check get_agent_operation");
     const validated = validateOperation(this.ctx.config, s.envelope, r.intent, { ...r.operation!, signature: "0x" }, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash! });
     if (digest(validated.spend) !== digest(r.reservation)) throw new WalletError("wallet_recovery_required", "Operation reservation does not match the signed spend");
+    // As when signing: a settlement rolled back since then holds its reservation again before the balance is counted.
+    await this.reconcileX402Settlements(journal, true);
     const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
     for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
     const violations = policyViolations(limits, { token: r.intent.token, amount: r.intent.amount, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls, x402: { origin: r.intent.x402!.origin, payTo: r.intent.to! } });
@@ -1060,6 +1070,11 @@ function unpaidHttpFailure(response: HttpResponse) {
   } as const;
 }
 
+/**
+ * A payment or cancellation reopened while an RPC lagged, found again in the same block, is the same settlement: its
+ * spend keeps its original time instead of counting against the daily limit for another day.
+ */
+const sameSettlement = (r: OperationRecord, blockHash: Hex | undefined) => r.consumedAt !== undefined && blockHash !== undefined && blockHash === r.settledBlockHash;
 /** A failed read, or configured RPCs that disagree (one lagging behind, say): neither says anything about the wallet. */
 const rpcFault = (error: unknown) => !(error instanceof WalletError) || error instanceof RpcDisagreementError;
 /**

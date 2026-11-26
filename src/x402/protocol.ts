@@ -52,9 +52,9 @@ export function parsePaymentRequired(response: HttpResponse): PaymentRequired {
   return required;
 }
 
-/** The first option this wallet can pay, shared by catalog discovery and live quotes. */
+/** The cheapest option this wallet can pay, shared by catalog discovery and live quotes. */
 export function findUsableRequirements(accepts: unknown[], { usdc, entryPoint }: Pick<ReturnType<typeof x402Config>, "usdc" | "entryPoint">) {
-  return accepts.find((candidate): candidate is PaymentRequirements => {
+  const usable = accepts.filter((candidate): candidate is PaymentRequirements => {
     const r = candidate as Partial<PaymentRequirements> | null | undefined;
     return !!r && r.scheme === X402_SCHEME && r.network === X402_NETWORK
       && typeof r.asset === "string" && r.asset.toLowerCase() === usdc.toLowerCase()
@@ -64,6 +64,8 @@ export function findUsableRequirements(accepts: unknown[], { usdc, entryPoint }:
       && r.maxTimeoutSeconds >= X402_MIN_TIMEOUT_SECONDS && r.maxTimeoutSeconds <= X402_MAX_TIMEOUT_SECONDS
       && typeof r.extra?.entryPoint === "string" && r.extra.entryPoint.toLowerCase() === entryPoint.toLowerCase();
   });
+  // Every usable option is USDC on this network, so they differ only in price; the first listed wins a tie.
+  return usable.reduce<PaymentRequirements | undefined>((best, r) => !best || BigInt(r.amount) < BigInt(best.amount) ? r : best, undefined);
 }
 
 /** A payable live option, or a reason why the requested payment is unsupported. */

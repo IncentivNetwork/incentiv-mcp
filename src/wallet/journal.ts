@@ -58,12 +58,13 @@ const recordSchema = z.strictObject({
   }).optional(),
   transactionHash: hash.optional(),
   // x402 only: the block the payment was signed at, which bounds an on-chain search for it, the last block that
-  // search has covered without finding it, the block and hash it settled in, and whether the seller's answer for it was handed back.
-  fromBlock: uint.optional(), searchedBlock: uint.optional(), settledBlock: uint.optional(), settledBlockHash: hash.optional(), delivered: z.boolean().optional(),
+  // search has covered without finding it (discoveredBlock: the last block only some RPCs could search, while
+  // another RPC's log queries failed), the block and hash it settled in, and whether the seller's answer for it was handed back.
+  fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional(), settledBlock: uint.optional(), settledBlockHash: hash.optional(), delivered: z.boolean().optional(),
   // x402 only: the settlement is past the reorg margin, so reconciliation no longer rechecks it.
   settlementFinal: z.literal(true).optional(),
-  // fromBlock and searchedBlock are the replacement's own receipt search start and progress, as for the original.
-  replacement: z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int(), fromBlock: uint.optional(), searchedBlock: uint.optional() }).superRefine((replacement, ctx) => {
+  // fromBlock, searchedBlock and discoveredBlock are the replacement's own receipt search start and progress, as for the original.
+  replacement: z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int(), fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional() }).superRefine((replacement, ctx) => {
     if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
   }).optional(),
 });

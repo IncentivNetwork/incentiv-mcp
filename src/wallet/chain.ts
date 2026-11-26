@@ -298,13 +298,16 @@ export class WalletChain {
     if (!same(lanes)) throw new Error("RPC nonces disagree");
     if (lanes[0] <= nonce) return;
     const start = record.searchedBlock !== undefined ? BigInt(record.searchedBlock) + 1n : record.fromBlock !== undefined ? BigInt(record.fromBlock) : head > SEARCH_BLOCKS ? head - SEARCH_BLOCKS : 0n;
-    const end = start + SEARCH_PER_PASS - 1n < head ? start + SEARCH_PER_PASS - 1n : head;
+    // Blocks only some RPCs could search, from a pass an RPC's log queries failed: they stay to be searched again by
+    // every RPC, but discovery goes on past them, so a log outage on one RPC cannot strand a later receipt.
+    const discovered = record.discoveredBlock !== undefined ? BigInt(record.discoveredBlock) : undefined;
     // Progress stops short of the head, so a reorg cannot hide an event in blocks already searched.
     const settled = head > REORG_MARGIN_BLOCKS ? head - REORG_MARGIN_BLOCKS : 0n;
-    let progressBlocked = false;
+    let progressBlocked = false, inconclusive = false;
     let logClients = this.clients;
-    for (let from = start; from <= end; from += SEARCH_CHUNK) {
-      const to = from + SEARCH_CHUNK - 1n < end ? from + SEARCH_CHUNK - 1n : end;
+    for (let from = start, budget = SEARCH_PER_PASS; from <= head && budget > 0n;) {
+      const last = from + (budget < SEARCH_CHUNK ? budget : SEARCH_CHUNK) - 1n;
+      const to = last < head ? last : head;
       // A failed log query blocks the cursor, but other RPCs can still locate a receipt for all RPCs to verify.
       const results = await Promise.allSettled(logClients.map(c => logsIn(from, to, range =>
         c.getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, ...range }))));
@@ -322,19 +325,27 @@ export class WalletChain {
         const receipt = await this.verifiedReceipt(record, hash).catch(() => undefined);
         if (receipt) return receipt;
       }
-      if (!progressBlocked && candidates.length) {
+      if (!inconclusive && candidates.length) {
         const orphaned = await Promise.all(found.map(async ({ blockNumber, blockHash, transactionHash }) => {
           if (!transactionHash) return true;
           if (!blockHash || blockNumber == null) return false;
           const canonical = await this.canonicalBlockHash(blockNumber).catch(() => undefined);
           return canonical !== undefined && canonical.toLowerCase() !== blockHash.toLowerCase();
         }));
-        progressBlocked = !orphaned.every(Boolean);
+        inconclusive = !orphaned.every(Boolean);
       }
-      if (progressBlocked) continue;
+      budget -= to - from + 1n;
+      from = to + 1n;
+      // Neither cursor passes an inconclusive log, so the next pass reaches it again.
+      if (inconclusive) continue;
       const covered = to < settled ? to : settled;
-      if (covered >= start) record.searchedBlock = covered.toString();
+      if (covered < start) continue;
+      if (!progressBlocked) record.searchedBlock = covered.toString();
+      else if (record.discoveredBlock === undefined || covered > BigInt(record.discoveredBlock)) record.discoveredBlock = covered.toString();
+      // The RPC that failed is out of this pass, so the blocks the others already searched are skipped.
+      if (progressBlocked && discovered !== undefined && discovered >= from) from = discovered + 1n;
     }
+    if (record.discoveredBlock !== undefined && record.searchedBlock !== undefined && BigInt(record.searchedBlock) >= BigInt(record.discoveredBlock)) delete record.discoveredBlock;
   }
   /** The operation's outcome in one bundle transaction, agreed by every configured RPC; undefined until 2 blocks deep. */
   async verifiedReceipt(record: OperationRecord, transactionHash: Hex): Promise<ChainReceipt | undefined> {
