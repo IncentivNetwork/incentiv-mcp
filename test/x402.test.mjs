@@ -9,6 +9,7 @@ import { args, fixture, limits, password, recipient } from "../scripts/wallet-pi
 import { MAINNET } from "../src/config.ts";
 import { Ctx } from "../src/context.ts";
 import { WalletChain, logsIn } from "../src/wallet/chain.ts";
+import { WalletService } from "../src/wallet/service.ts";
 import { accountFactoryAbi } from "../src/abi.ts";
 import { BundlerUnavailableError, computeUserOpHash, encodeExecuteBatch, userOpFromJson } from "../src/userop.ts";
 import { Journal, digest, intentSchema } from "../src/wallet/journal.ts";
@@ -1129,29 +1130,32 @@ test("quotes send nothing while x402 is off or the site is not allowed", async t
   assert.equal((await f.service.x402Requirements({ url: URL_ })).payment_required, true);
 });
 
-test("a quote starts before releasing the authorized wallet session and does not wait under the lock", { timeout: 5000 }, async t => {
-  const f = await x402Fixture(t), session = f.store.session.bind(f.store);
-  let released = false;
-  const authorizationReleased = Promise.withResolvers();
+test("a quote starts before releasing the authorized wallet session and does not wait under the lock", async () => {
+  const events = [];
   const httpResponse = Promise.withResolvers();
-  let startedWithLock = false;
-  f.store.session = async (...args) => {
-    const result = await session(...args);
-    if (!released) {
-      released = true;
-      await f.store.disable();
-      authorizationReleased.resolve();
-    }
-    return result;
+  const session = {
+    envelope: { policy: { configured: true, enabled: true, limits: { ...limits, x402: x402Policy } } },
+    assertOwned: async () => {},
+    disabled: async () => false,
   };
-  f.service.http = () => {
-    startedWithLock = !released;
+  const store = { session: async work => {
+    events.push("session opened");
+    try { return await work(session); }
+    finally { events.push("session released"); }
+  } };
+  const http = () => {
+    events.push("request started");
     return httpResponse.promise;
   };
-  const quote = f.service.x402Requirements({ url: URL_, method: "POST", body: "{}" });
+  const service = new WalletService(new Ctx(MAINNET), store, undefined, undefined, http);
+  const quote = service.x402Requirements({ url: URL_, method: "POST", body: "{}" }).then(result => {
+    events.push("quote returned");
+    return result;
+  });
   try {
-    await authorizationReleased.promise;
-    assert.equal(startedWithLock, true);
+    // The stubs do no I/O. Let the session and request start run while holding the response back.
+    await Promise.race([quote, new Promise(resolve => setImmediate(resolve))]);
+    assert.deepEqual(events, ["session opened", "request started", "session released"]);
   } finally {
     httpResponse.resolve({ status: 200, headers: {}, body: Buffer.from("{}"), truncated: false });
   }
