@@ -44,7 +44,7 @@ export function registerX402Tools(server: McpServer, wallet: WalletService, scre
     { query: z.string().max(200).optional().describe("Search words; omit to list"), limit: z.number().int().min(1).max(50).optional(), offset: z.number().int().min(0).optional().describe("Skip this many listings; for the catalog only, not with query") },
     "read", async args => {
       const found = await discoverResources(wallet.ctx.config, wallet.http, args as { query?: string; limit?: number; offset?: number });
-      return { result: { ...found, resources: found.resources.map(r => screening.fields(r, ["service_name", "description"], "input")) } };
+      return { result: { ...found, resources: found.resources.map(r => screening.fields(r, ["service_name", "description", "mime_type", "last_updated"], ["tags", "input"])) } };
     });
 
   add("get_x402_payment_requirements",

@@ -99,26 +99,41 @@ export class WalletService {
     permitted();
   }
   private async reconcileX402Settlements(journal: Journal): Promise<void> {
-    const legacyCutoff = Date.now() - X402_RECONFIRM_MS;
-    const settled = journal.data.records.filter(r => r.intent.kind === "x402_payment"
-      && (r.settledBlock !== undefined || (r.consumedAt ?? 0) > legacyCutoff)
+    const recent = Date.now() - X402_RECONFIRM_MS;
+    // A settlement past the reorg margin is marked final once, so it no longer needs the RPC on every wallet call.
+    const settled = journal.data.records.filter(r => r.intent.kind === "x402_payment" && !r.settlementFinal
+      && (r.settledBlock !== undefined || (r.consumedAt ?? 0) > recent)
       && r.nonce !== undefined && (r.status === "confirmed" || r.status === "reverted" || r.status === "superseded"));
     if (!settled.length) return;
     const wallet = journal.session.envelope;
-    const { block } = await this.chain.state(wallet).catch(rethrowX402RecheckError);
-    const blockHashes = new Map<bigint, Hex>();
-    for (const r of settled) {
-      const settledBlock = r.settledBlock === undefined ? undefined : BigInt(r.settledBlock);
-      if (settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS) continue;
-      const nonce = BigInt(r.nonce!);
-      const current = await this.chain.laneNonce(wallet, nonce >> 64n, block).catch(rethrowX402RecheckError);
-      let orphaned = settledBlock !== undefined && block < settledBlock;
-      if (!orphaned && settledBlock !== undefined && r.settledBlockHash) {
-        const hash = blockHashes.get(settledBlock) ?? await this.chain.canonicalBlockHash(settledBlock).catch(rethrowX402RecheckError);
-        blockHashes.set(settledBlock, hash);
-        orphaned = hash.toLowerCase() !== r.settledBlockHash;
+    // Sending needs the RPC anyway, so during an outage only a settlement from the last hour holds up the call;
+    // older ones are checked again, and marked final, once the RPC answers.
+    const outage = Symbol("outage");
+    const read = <T>(value: Promise<T>) => value.catch((error: unknown): never => {
+      if (!(error instanceof WalletError) && settled.every(r => (r.consumedAt ?? 0) <= recent)) throw outage;
+      rethrowX402RecheckError(error);
+    });
+    try {
+      const { block } = await read(this.chain.state(wallet));
+      const blockHashes = new Map<bigint, Hex>();
+      for (const r of settled) {
+        const settledBlock = r.settledBlock === undefined ? undefined : BigInt(r.settledBlock);
+        if (settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS) {
+          r.settlementFinal = true; r.sequence = ++journal.data.sequence; await journal.save(); continue;
+        }
+        const nonce = BigInt(r.nonce!);
+        const current = await read(this.chain.laneNonce(wallet, nonce >> 64n, block));
+        let orphaned = settledBlock !== undefined && block < settledBlock;
+        if (!orphaned && settledBlock !== undefined && r.settledBlockHash) {
+          const hash = blockHashes.get(settledBlock) ?? await read(this.chain.canonicalBlockHash(settledBlock));
+          blockHashes.set(settledBlock, hash);
+          orphaned = hash.toLowerCase() !== r.settledBlockHash;
+        }
+        // A lagging RPC also shows the lane unused, or a head below the settlement; the payment is held either way.
+        if (current === nonce || orphaned) await this.reopenX402Settlement(journal, r);
       }
-      if (current === nonce || orphaned) await this.reopenX402Settlement(journal, r);
+    } catch (error) {
+      if (error !== outage) throw error;
     }
   }
 
@@ -128,6 +143,7 @@ export class WalletService {
     delete r.transactionHash;
     delete r.settledBlock;
     delete r.settledBlockHash;
+    delete r.settlementFinal;
     delete r.searchedBlock;
     if (r.replacement) delete r.replacement.searchedBlock;
     const confirmed = r.status === "confirmed";
@@ -453,6 +469,8 @@ export class WalletService {
     await this.store.session(async s => {
       const policy = s.envelope.policy;
       if (!policy.configured) throw new WalletError("policy_not_configured", "Run incentiv-mcp setup in your local terminal; nothing was sent");
+      if (!policy.enabled || await s.disabled()) throw new WalletError("wallet_locked", "Wallet is disabled, so it sends no x402 requests; local administration authorization is required. Nothing was sent");
+      assertPolicyLive(policy.limits, "nothing was sent");
       if (!policy.limits.x402) throw new WalletError("policy_denied", "x402 payments are off in local wallet policy, so this wallet sends no x402 requests; the user can enable them with incentiv-mcp setup");
       if (x402Violations(policy.limits, req.origin, ZERO_ADDRESS, "0").includes("x402_origin_not_allowed")) throw new WalletError("policy_denied", "Local wallet policy does not allow this site for x402, so nothing was sent");
     });
@@ -583,8 +601,8 @@ export class WalletService {
     // Only a valid x402 challenge shows the resource did not act on the request; a plain 402 may follow a side
     // effect, so the binding stays uncertain if it is not one.
     const required = parsePaymentRequired(unpaid);
-    const accepted = selectRequirements(required, cfg);
     await bind("payment_required");
+    const accepted = selectRequirements(required, cfg);
     const amount = BigInt(accepted.amount);
     if (amount > maxAmount) throw new WalletError("x402_price_above_max", `The resource asks ${formatUnits(amount, USDC_DECIMALS)} USDC, above max_amount ${formatUnits(maxAmount, USDC_DECIMALS)}; nothing was paid`);
     const payTo = getAddress(accepted.payTo).toLowerCase();
@@ -620,7 +638,7 @@ export class WalletService {
       // client in @incentiv/x402 0.1.1 prices it from a CENT quote instead). It then has to pass that package's
       // own check of the SPEC 4.3 shape, and this wallet's validator.
       const prepared = await this.chain.build(s.envelope, intent, { ...state, nonce: laneNonce }).catch((error: unknown) => {
-        if (error instanceof WalletError || isTransportFailure(error)) throw error;
+        if (error instanceof WalletError || isTransportFailure(error) || error instanceof BundlerUnavailableError) throw error;
         throw new WalletError("validation_failed", `Could not prepare the payment: ${error instanceof Error ? error.message.slice(0, 300) : "unknown error"}`);
       });
       try { x402.checkPaysRequirements(x402.decodePaymentOp(prepared.op as Parameters<typeof x402.decodePaymentOp>[0], xcfg), accepted); }
@@ -640,7 +658,10 @@ export class WalletService {
       await this.canSubmit(s, r);
       await journal.transition(r, "signed"); // fsync completes before the payment leaves this computer.
     } catch (error) {
-      const failure = error instanceof WalletError ? error : isTransportFailure(error) ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry with a new request ID") : undefined;
+      // The record is closed below, so an outage, here or in the simulation, is retried under a new request ID.
+      const mapped = rpcOutage(error);
+      const failure = mapped instanceof WalletError && mapped.code === "rpc_unavailable" ? new WalletError("rpc_unavailable", "Could not reach the RPC or bundler while preparing the payment, so nothing was paid; retry with a new request ID")
+        : mapped instanceof WalletError ? mapped : undefined;
       if (r.status === "preparing") { r.lastError = failure?.code ?? "validation_failed"; await journal.transition(r, "failed"); }
       if (failure) throw failure;
       throw new WalletError("validation_failed", "Local x402 payment preparation failed");
@@ -685,7 +706,7 @@ export class WalletService {
     // seller could still submit the payment, so sending it again would be a send under no current policy.
     if ((await this.chain.stateFor(s.envelope, r)).nonce === BigInt(r.nonce!)) {
       if (r.status === "confirmed") await this.reopenX402Settlement(journal, r);
-      return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The chain no longer shows this payment's settlement" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid.` };
+      return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The RPC no longer shows this payment's settlement: the chain reorganized, or the RPC is behind" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid.` };
     }
     if (replayable(req)) {
       const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
@@ -1006,9 +1027,13 @@ function unpaidHttpFailure(response: HttpResponse) {
   } as const;
 }
 
+/**
+ * Any failed read in the settlement recheck, including a lagging node's missing block or header, says nothing about
+ * the wallet: it becomes rpc_unavailable rather than escaping as wallet_recovery_required.
+ */
 function rethrowX402RecheckError(error: unknown): never {
-  if (isTransportFailure(error)) throw new WalletError("rpc_unavailable", "Could not recheck recent x402 settlements; retry when RPC is available");
-  throw error;
+  if (error instanceof WalletError) throw error;
+  throw new WalletError("rpc_unavailable", "Could not recheck recent x402 settlements; retry when RPC is available");
 }
 
 const MAX_LINK_ATTEMPTS = 8;

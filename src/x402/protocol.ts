@@ -1,4 +1,5 @@
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, encodePaymentSignatureHeader } from "@x402/core/http";
+import { PaymentRequiredV2Schema } from "@x402/core/schemas";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements, SettleResponse } from "@x402/core/types";
 import { encodeAbiParameters, keccak256, type Address, type Hex } from "viem";
 import type { Config } from "../config.js";
@@ -32,7 +33,10 @@ export function paymentNonceKey(paymentId: Hex, validUntil: number): bigint {
   return BigInt(keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "uint64" }], [paymentId, BigInt(validUntil)]))) >> 64n;
 }
 
-/** Reads the 402: the v2 `PAYMENT-REQUIRED` header, or a v2 body. Anything else is not an x402 v2 answer. */
+/**
+ * Reads the 402: the v2 `PAYMENT-REQUIRED` header, or a v2 body that passes `@x402/core`'s v2 schema. Anything
+ * else is not an x402 v2 answer. A valid one shows the resource asked for payment, whether or not this wallet can pay it.
+ */
 export function parsePaymentRequired(response: HttpResponse): PaymentRequired {
   const header = response.headers["payment-required"];
   let parsed: unknown;
@@ -41,7 +45,7 @@ export function parsePaymentRequired(response: HttpResponse): PaymentRequired {
     else parsed = JSON.parse(response.body.toString("utf8"));
   } catch { throw new WalletError("x402_invalid_response", "The 402 answer has no readable x402 payment requirements"); }
   const required = parsed as PaymentRequired;
-  if (!required || typeof required !== "object" || required.x402Version !== 2 || !Array.isArray(required.accepts) || !required.accepts.length) {
+  if (!required || typeof required !== "object" || required.x402Version !== 2 || !Array.isArray(required.accepts) || !required.accepts.length || !PaymentRequiredV2Schema.safeParse(required).success) {
     throw new WalletError("x402_invalid_response", "The 402 answer is not an x402 v2 payment request");
   }
   return required;

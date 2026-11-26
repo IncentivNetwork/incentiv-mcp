@@ -1,5 +1,5 @@
 import { AGENT_LINK_MIN_SECONDS, AGENT_LINK_REQUEST_SECONDS, assertAgentSignature, assertNotUnlink, assertRegistryApproved, freshBlockTime, hasRegistryEvent, linkBlocker, parentBlocker, readAgentLinkDigest, isContractRejection, isRegistryIntent, isTransportFailure, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
-import { createPublicClient, decodeEventLog, decodeFunctionData, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
+import { BaseError, TimeoutError, createPublicClient, decodeEventLog, decodeFunctionData, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
 import { accountAbi, accountFactoryAbi, dexFactoryAbi, dexPoolAbi, entryPointAbi, erc20Abi, quoterAbi, swapRouterAbi, transferGateAbi } from "../abi.js";
@@ -304,7 +304,7 @@ export class WalletChain {
     for (let from = start; from <= end; from += SEARCH_CHUNK) {
       const to = from + SEARCH_CHUNK - 1n < end ? from + SEARCH_CHUNK - 1n : end;
       // Every RPC is searched: one with an incomplete log index must not move progress past the payment's block.
-      const found = (await Promise.all(this.clients.map(c => logsIn(c, from, to, range => c.getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, ...range }))))).flat();
+      const found = (await Promise.all(this.clients.map(c => logsIn(from, to, range => c.getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, ...range }))))).flat();
       // Try each distinct transaction. An inconclusive log must be revisited, but it cannot hide a receipt
       // in a later range of this pass. A log from a known orphaned block can be skipped on future passes.
       const candidates = [...new Set(found.flatMap(log => log.transactionHash ? [log.transactionHash.toLowerCase() as Hex] : []))];
@@ -394,11 +394,14 @@ export function exactAmount(text: string, decimals: number): bigint {
   return amount;
 }
 
-/** Logs over [from, to], halving the range while an RPC refuses it as too large, down to 64 blocks. */
-async function logsIn<C, L>(_client: C, from: bigint, to: bigint, read: (range: { fromBlock: bigint; toBlock: bigint }) => Promise<L[]>): Promise<L[]> {
+/**
+ * Logs over [from, to], halving the range while an RPC refuses it as too large, down to 64 blocks. A timeout is
+ * not a size refusal: halving it would repeat the wait for every half under the wallet lock, so it is thrown.
+ */
+export async function logsIn<L>(from: bigint, to: bigint, read: (range: { fromBlock: bigint; toBlock: bigint }) => Promise<L[]>): Promise<L[]> {
   try { return await read({ fromBlock: from, toBlock: to }); } catch (error) {
-    if (to - from < 64n) throw error;
+    if (to - from < 64n || (error instanceof BaseError && error.walk(cause => cause instanceof TimeoutError))) throw error;
     const mid = from + (to - from) / 2n;
-    return [...await logsIn(_client, from, mid, read), ...await logsIn(_client, mid + 1n, to, read)];
+    return [...await logsIn(from, mid, read), ...await logsIn(mid + 1n, to, read)];
   }
 }
