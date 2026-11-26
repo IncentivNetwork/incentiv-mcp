@@ -86,29 +86,34 @@ test("a token-paid operation pays the schedule for its own limits, whatever the 
   assert.equal(new Set(paid).size, 1, "the USDC price does not move with the base fee");
 });
 
-test("unsigned token-gas estimation can use a balance that covers price and actual fee", async t => {
-  const balance = 50_000n, price = 10_000n;
+test("the shared unsigned transfer builder works with exactly price plus the scheduled fee", async t => {
+  const price = 10_000n;
   const recipient = "0x0000000000000000000000000000000000000001";
-  const estimatedFees = [];
+  let balance, estimate, estimatedFees;
   t.mock.method(globalThis, "fetch", async (_url, { body }) => {
-    const [estimate] = JSON.parse(body).params;
-    assert.equal(estimate.paymaster, undefined);
-    const [, , data] = decodeFunctionData({ abi: accountAbi, data: estimate.callData }).args;
+    const [operation] = JSON.parse(body).params;
+    assert.equal(operation.paymaster, undefined);
+    const [, , data] = decodeFunctionData({ abi: accountAbi, data: operation.callData }).args;
     const charge = decodeFunctionData({ abi: erc20Abi, data: data[0] }).args[1];
     assert.equal(decodeFunctionData({ abi: erc20Abi, data: data[1] }).args[1], price);
     estimatedFees.push(charge);
     if (charge + price > balance) return Response.json({ error: { code: -32521, message: "ERC20: transfer amount exceeds balance" } });
-    return Response.json({ result: { callGasLimit: "0x11170", verificationGasLimit: "0x493e0", preVerificationGas: "0x9c40" } });
+    return Response.json({ result: estimate });
   });
-  const built = await buildUserOpUnsigned(fakeCtx(), {
-    account: "0x214324E3412eD8864Da4EfB2c2D34c3281dbEe7A",
-    calls: [{ to: USDC, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [recipient, price] }) }],
-    gasToken: token(USDC, "USDC", 6),
-    state: { deployed: true, nonce: 0n, fees: { maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, baseFeePerGas: 1n } },
-  });
-  assert.deepEqual(estimatedFees, [26_000n, 26_000n]);
-  assert.equal(built.op.signature, "0x");
-  assert.equal(built.gasToken.tokenAmount + price, 36_000n);
+  for (const [callGasLimit, fee] of [[70_000n, 26_000n], [200_000n, schedule(332_000n)]]) {
+    estimate = { callGasLimit: `0x${callGasLimit.toString(16)}`, verificationGasLimit: "0x493e0", preVerificationGas: "0x9c40" };
+    balance = price + fee;
+    estimatedFees = [];
+    const built = await buildUserOpUnsigned(fakeCtx(), {
+      account: "0x214324E3412eD8864Da4EfB2c2D34c3281dbEe7A",
+      calls: [{ to: USDC, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [recipient, price] }) }],
+      gasToken: token(USDC, "USDC", 6),
+      state: { deployed: true, nonce: 0n, fees: { maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, baseFeePerGas: 1n } },
+    });
+    assert.deepEqual(estimatedFees, [26_000n, fee]);
+    assert.equal(built.op.signature, "0x");
+    assert.equal(built.gasToken.tokenAmount + price, balance);
+  }
 });
 
 test("an operation to sign prices gas with the paymaster's current overhead, not a cached one", async t => {

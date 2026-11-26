@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -20,6 +21,7 @@ import { WalletService } from "../dist/wallet/service.js";
 import { localWalletStore } from "../dist/wallet/store.js";
 import { walletProfile } from "../dist/wallet-profile.js";
 import { NETWORK, PRICE, SCHEME, preflightSeller, startSeller, startTunnel } from "./x402-mainnet-seller.mjs";
+import { installTestPackage } from "./install-test-package.mjs";
 
 const directory = resolve(process.env.X402_E2E_DIR ?? ".x402-mainnet-e2e");
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -55,10 +57,10 @@ async function save(name, data) {
   await syncDirectory(directory);
 }
 
-async function withBuyer(profile, work) {
+async function withBuyer(profile, work, dist = join(root, "dist")) {
   const client = new Client({ name: "incentiv-x402-mainnet-e2e", version: "1.0.0" });
   const transport = new StdioClientTransport({
-    command: process.execPath, args: [join(root, "dist/index.js"), "--wallet-profile", profile], cwd: root, stderr: "inherit",
+    command: process.execPath, args: [join(dist, "index.js"), "--wallet-profile", profile], cwd: dist, stderr: "inherit",
   });
   try {
     await client.connect(transport);
@@ -77,8 +79,8 @@ async function withBuyer(profile, work) {
   } finally { await client.close(); }
 }
 
-async function withSeller(run, work) {
-  const seller = await startSeller({ payTo: run.seller, runId: run.id });
+async function withSeller(run, work, dropFirstSettlement = false) {
+  const seller = await startSeller({ payTo: run.seller, runId: run.id, dropFirstSettlement, acceptPayments: false });
   let tunnel;
   try {
     tunnel = await startTunnel(seller.internal);
@@ -198,8 +200,73 @@ function receiptEvidence(receipt, run, userOpHash) {
   assert.equal(operations[0].success, true);
   assert.deepEqual(credits, [price]);
   const gas = payments.reduce((total, value) => total + value, 0n);
+  assert.equal(payments.length, 1, "The operation must charge the paymaster once");
   assert.ok(gas > 0n && gas <= gasCap, "The paymaster transfer must fit the approved gas cap");
-  return { blockHash: receipt.blockHash, blockNumber: receipt.blockNumber.toString(), paymasterTransferAtomic: gas.toString() };
+  return {
+    blockHash: receipt.blockHash, blockNumber: receipt.blockNumber.toString(), paymasterTransferAtomic: gas.toString(),
+    actualGasUsed: operations[0].actualGasUsed.toString(), actualGasCostWei: operations[0].actualGasCost.toString(),
+  };
+}
+
+async function configureBuyer(run, policy, enabled = true) {
+  const credentials = await nativeCredentials(walletProfile(run.buyerProfile).credentialService);
+  const passphrase = await credentials.read(adminKey);
+  assert.ok(passphrase, "The isolated test wallet's administration credential is unavailable");
+  try {
+    const service = new WalletService(new Ctx(MAINNET), localWalletStore(MAINNET, run.buyerProfile));
+    await service.configure(policy, passphrase, false, digest([]), enabled);
+  } finally { passphrase.fill(0); }
+}
+
+async function verifyFreeRefusals(run, seller, dist) {
+  const balance = await tokenBalance(run.buyer);
+  const policy = limits({ origin: seller.origin, address: run.seller }, Date.now() + 15 * 60_000);
+  const args = { url: seller.url, max_amount: PRICE, gas_token: "USDC" };
+  const cases = [
+    { name: "disabled wallet", policy, enabled: false, code: "wallet_locked" },
+    { name: "x402 disabled", policy: limits(), message: /x402 payments are off/ },
+    { name: "expired policy", policy: { ...policy, expiresAt: 1 }, message: /expired/ },
+    { name: "origin allowlist", policy: { ...policy, x402: { ...policy.x402, origins: { mode: "allowlist", origins: ["https://example.com"] } } }, message: /x402_origin_not_allowed/, quoteMessage: /does not allow this site/ },
+    { name: "seller allowlist", policy: { ...policy, x402: { ...policy.x402, payTo: { mode: "allowlist", addresses: [run.buyer] } } }, reason: "x402_pay_to_not_allowed" },
+    { name: "spend cap", policy: { ...policy, x402: { ...policy.x402, maxPerPayment: (price - 1n).toString() } }, reason: "x402_payment_limit" },
+  ];
+  await withBuyer(run.buyerProfile, async call => {
+    for (const check of cases) {
+      await configureBuyer(run, check.policy, check.enabled);
+      const before = seller.seen.unpaid;
+      const code = check.code ?? "policy_denied";
+      const { result: quote } = await call("get_x402_payment_requirements", { url: seller.url }, check.reason ? undefined : code);
+      const requestId = randomUUID();
+      const { result: refused } = await call("pay_x402_resource", { ...args, request_id: requestId }, code);
+      if (check.reason) {
+        assert.equal(quote.payable, true);
+        assert.deepEqual(quote.policy, { allowed: false, reasons: [check.reason] });
+        assert.ok(refused.message.includes(check.reason), `${check.name} must match the quoted reason`);
+      } else if (check.message) {
+        assert.match(quote.message, check.quoteMessage ?? check.message);
+        assert.match(refused.message, check.message);
+      }
+      assert.equal(seller.seen.unpaid - before, check.reason ? 2 : 0, check.name);
+      assert.equal(seller.seen.paid.length, 0, check.name);
+      assert.equal((await call("get_agent_operation", { id: requestId })).result.code, "operation_not_found");
+      assert.deepEqual((await call("get_agent_wallet")).result.pending_reservations, {});
+      console.log(`Passed: ${check.name}`);
+    }
+    await configureBuyer(run, policy);
+    const { result: quote } = await call("get_x402_payment_requirements", { url: seller.url });
+    assert.equal(quote.payment_required, true);
+    assert.equal(quote.payable, true);
+    assert.deepEqual(quote.policy, { allowed: true, reasons: [] });
+    assert.equal(quote.price.amount_atomic, price.toString());
+    assert.equal(getAddress(quote.price.pay_to), getAddress(run.seller));
+    assert.equal(quote.price.network, NETWORK);
+    assert.equal(quote.price.scheme, SCHEME);
+    await call("pay_x402_resource", { ...args, request_id: randomUUID(), max_amount: "0.009999" }, "x402_price_above_max");
+    assert.equal(seller.seen.paid.length, 0);
+    assert.deepEqual((await call("get_agent_wallet")).result.pending_reservations, {});
+    assert.equal(await tokenBalance(run.buyer), balance);
+    console.log("Passed: payable quote and caller price cap");
+  }, dist);
 }
 
 async function clearFailedAttempt(run) {
@@ -220,74 +287,66 @@ async function clearFailedAttempt(run) {
   await syncDirectory(directory);
 }
 
-async function runSuite(run, retryFailed) {
-  assert.equal(await tokenBalance(run.buyer), budget, "The test buyer must hold exactly 0.05 USDC for this run");
+async function runSuite(run, { retryFailed = false, freeOnly = false, dropResponse = false } = {}) {
+  if (!freeOnly) assert.equal(await tokenBalance(run.buyer), budget, "The test buyer must hold exactly 0.05 USDC for this run");
   await preflightSeller();
   // Reserve the suite before enabling the wallet. Only one runner may reach the funded case.
   const lock = join(directory, "running");
   await writeFile(lock, "", { flag: "wx", mode: 0o600 });
   const store = localWalletStore(MAINNET, run.buyerProfile);
-  let enabled = false;
+  let enabled = false, temp;
   try {
     if (retryFailed) await clearFailedAttempt(run);
     else assert.equal(await load("attempt.json"), undefined, "A funded attempt was already recorded. Use status.");
+    temp = await mkdtemp(join(tmpdir(), "incentiv-x402-package-"));
+    const { dist, tarballSha256 } = await installTestPackage(root, temp);
+    const service = new WalletService(new Ctx(MAINNET), store);
+    const review = await service.review();
+    assert.equal(getAddress(review.wallet.account), getAddress(run.buyer));
+    assert.equal(review.records.length, 0);
     await withSeller(run, async seller => {
-      const credentials = await nativeCredentials(walletProfile(run.buyerProfile).credentialService);
-      const passphrase = await credentials.read(adminKey);
-      assert.ok(passphrase, "The isolated test wallet's administration credential is unavailable");
-      try {
-        const service = new WalletService(new Ctx(MAINNET), store);
-        const review = await service.review();
-        assert.equal(getAddress(review.wallet.account), getAddress(run.buyer));
-        assert.equal(review.records.length, 0);
-        enabled = true; // Disable on exit even if configuration fails after saving the enabling policy.
-        await service.configure(limits({ origin: seller.origin, address: run.seller }, Date.now() + 15 * 60_000), passphrase, false, digest([]));
-      } finally { passphrase.fill(0); }
-      await withBuyer(run.buyerProfile, async call => {
-        const wallet = async () => (await call("get_agent_wallet")).result;
-        const before = await wallet();
-        assert.equal(getAddress(before.account), getAddress(run.buyer));
-        assert.equal(before.balances[usdc], budget.toString());
-        assert.deepEqual(before.pending_reservations, {});
-        const sellerBefore = await tokenBalance(run.seller);
-        const { result: quote } = await call("get_x402_payment_requirements", { url: seller.url });
-        assert.equal(quote.payment_required, true);
-        assert.equal(quote.payable, true);
-        assert.equal(quote.policy.allowed, true);
-        assert.equal(quote.price.amount_atomic, price.toString());
-        assert.equal(getAddress(quote.price.pay_to), getAddress(run.seller));
-        assert.equal(quote.price.network, NETWORK);
-        assert.equal(quote.price.scheme, SCHEME);
-
-        await call("pay_x402_resource", { url: seller.url, request_id: randomUUID(), max_amount: "0.009999", gas_token: "USDC" }, "x402_price_above_max");
-        assert.equal(seller.seen.paid.length, 0);
-        assert.deepEqual((await wallet()).pending_reservations, {});
-        assert.equal(await tokenBalance(run.buyer), budget);
-
-        const purchase = { url: seller.url, request_id: randomUUID(), max_amount: PRICE, gas_token: "USDC" };
-        const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
-        const walletSourceDirty = Boolean(execFileSync("git", ["status", "--porcelain", "--", "src"], { cwd: root, encoding: "utf8" }).trim());
-        const estimatorSha256 = createHash("sha256").update(await readFile(join(root, "dist/userop.js"))).digest("hex");
-        const build = { commit, walletSourceDirty, estimatorSha256 };
+      enabled = true; // Disable on exit even if configuration fails after writing an enabling policy.
+      await verifyFreeRefusals(run, seller, dist);
+      if (freeOnly) return;
+      const buyerBefore = await tokenBalance(run.buyer), sellerBefore = await tokenBalance(run.seller);
+      assert.equal(buyerBefore, budget);
+      const purchase = { url: seller.url, request_id: randomUUID(), max_amount: PRICE, gas_token: "USDC" };
+      const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+      const walletSourceDirty = Boolean(execFileSync("git", ["status", "--porcelain", "--", "src"], { cwd: root, encoding: "utf8" }).trim());
+      const estimatorSha256 = createHash("sha256").update(await readFile(join(dist, "userop.js"))).digest("hex");
+      const build = { commit, walletSourceDirty, estimatorSha256, tarballSha256 };
+      seller.allowPayments();
+      const firstPayment = await withBuyer(run.buyerProfile, async call => {
         await save("attempt.json", { ...build, purchase, startedAt: new Date().toISOString() });
         console.log(`Funded request ${purchase.request_id} started.`);
-        const { result: paid, meta } = await call("pay_x402_resource", purchase);
-        assert.equal(paid.status, "submitted", "The seller must report a successful settlement");
-        assert.equal(paid.seller_reported_settlement, true);
-        assert.equal(meta?.success, true);
-        assert.deepEqual(JSON.parse(paid.content.text), seller.fixture);
+        const { result: first, meta } = await call("pay_x402_resource", purchase);
         assert.equal(seller.seen.paid.length, 1);
+        if (dropResponse) {
+          assert.equal(first.status, "submission_unknown", "The first MCP process must miss the settlement response");
+          assert.equal(first.content, undefined);
+          assert.equal(meta, undefined);
+          assert.ok(seller.seen.droppedSettlement, "The seller must drop the response after settlement");
+        } else {
+          assert.equal(first.status, "submitted");
+          assert.equal(first.seller_reported_settlement, true);
+          assert.equal(meta?.success, true);
+          assert.deepEqual(JSON.parse(first.content.text), seller.fixture);
+        }
+        return { userOpHash: first.user_op_hash, transactionHash: dropResponse ? seller.seen.droppedSettlement : meta.transaction };
+      }, dist);
 
+      // A new MCP process must recover the original journal record and signed operation.
+      await withBuyer(run.buyerProfile, async call => {
         const settled = await confirm(call, purchase.request_id);
-        assert.equal(settled.user_op_hash, paid.user_op_hash);
-        assert.equal(settled.transaction_hash, meta.transaction);
+        assert.equal(settled.user_op_hash, firstPayment.userOpHash);
+        assert.equal(settled.transaction_hash, firstPayment.transactionHash);
         const receipts = await Promise.all(chain.clients.map(client => client.getTransactionReceipt({ hash: settled.transaction_hash })));
         const ledger = receipts.map(receipt => receiptEvidence(receipt, run, settled.user_op_hash));
         assert.ok(ledger.every(evidence => JSON.stringify(evidence) === JSON.stringify(ledger[0])), "Configured RPCs disagree on the settlement evidence");
-        assert.deepEqual((await wallet()).pending_reservations, {});
+        assert.deepEqual((await call("get_agent_wallet")).result.pending_reservations, {});
         const buyerAfter = await tokenBalance(run.buyer), sellerAfter = await tokenBalance(run.seller);
         assert.equal(sellerAfter - sellerBefore, price);
-        const buyerDebit = budget - buyerAfter;
+        const buyerDebit = buyerBefore - buyerAfter;
         const netGas = buyerDebit - price;
         assert.ok(netGas > 0n && netGas <= BigInt(ledger[0].paymasterTransferAtomic));
         const settlement = {
@@ -298,23 +357,29 @@ async function runSuite(run, retryFailed) {
         await save("settlement.json", settlement);
 
         const { result: replay } = await call("pay_x402_resource", purchase);
+        assert.equal(replay.status, "confirmed");
         assert.equal(replay.user_op_hash, settled.user_op_hash);
         assert.equal(seller.seen.paid.length, 2);
         assert.equal(seller.seen.paid[0], seller.seen.paid[1], "Replay must carry the identical signed payment");
+        if (replay.content_delivered) assert.deepEqual(JSON.parse(replay.content.text), seller.fixture);
         assert.equal(await tokenBalance(run.buyer), buyerAfter);
         assert.equal(await tokenBalance(run.seller), sellerAfter);
+        assert.deepEqual((await call("get_agent_wallet")).result.pending_reservations, {});
 
         const result = {
-          ...settlement, http: { unpaid: seller.seen.unpaid, paid: seller.seen.paid.length },
+          ...settlement, http: { unpaid: seller.seen.unpaid, paid: seller.seen.paid.length, droppedAfterSettlement: dropResponse },
           replayContentDelivered: replay.content_delivered, passed: true,
         };
         await save("result.json", result);
         console.log(JSON.stringify(result, null, 2));
-      });
-    });
+      }, dist);
+    }, dropResponse);
   } finally {
     try { if (enabled) await store.disable(); }
-    finally { await unlink(lock); }
+    finally {
+      try { if (temp) await rm(temp, { recursive: true, force: true }); }
+      finally { await unlink(lock); }
+    }
   }
 }
 
@@ -331,9 +396,11 @@ async function status(run) {
 
 async function main(args) {
   if (args.length === 1 && args[0] === "prepare") return prepare();
-  const retryFailed = args.length === 3 && args[2] === "--retry-failed";
-  if (!((args.length === 1 && args[0] === "status") || (args[0] === "run" && args[1] === "--approve-mainnet-spend" && (args.length === 2 || retryFailed)))) {
-    throw new Error("Use prepare, status, or run --approve-mainnet-spend [--retry-failed]. One purchase may spend up to 0.05 real USDC.");
+  const flags = args.slice(2);
+  const fundedRun = args[0] === "run" && args[1] === "--approve-mainnet-spend" &&
+    flags.length === new Set(flags).size && flags.every(flag => ["--retry-failed", "--drop-response"].includes(flag));
+  if (!fundedRun && !(args.length === 1 && ["status", "preflight"].includes(args[0]))) {
+    throw new Error("Use prepare, preflight, status, or run --approve-mainnet-spend [--retry-failed] [--drop-response]. One purchase may spend up to 0.05 real USDC.");
   }
   const run = await load("run.json");
   assert.ok(run, "Prepare the isolated mainnet test wallet first");
@@ -341,7 +408,9 @@ async function main(args) {
   assert.equal(run.chainId, MAINNET.identity.chainId);
   assert.equal(run.buyerProfile, `x402-e2e-b-${run.id}`);
   assert.equal(run.sellerProfile, `x402-e2e-s-${run.id}`);
-  return args[0] === "status" ? status(run) : runSuite(run, retryFailed);
+  return args[0] === "status" ? status(run) : runSuite(run, {
+    freeOnly: !fundedRun, retryFailed: flags.includes("--retry-failed"), dropResponse: flags.includes("--drop-response"),
+  });
 }
 
 if (process.env.INCENTIV_ALLOW_FILE_KEY === "1") {

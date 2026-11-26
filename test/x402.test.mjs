@@ -904,9 +904,13 @@ test("a settled payment whose answer was lost is offered to the seller again, ne
   const f = await x402Fixture(t), id = randomUUID();
   f.seen.fail = 1;
   assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submission_unknown");
+  assert.deepEqual(await f.used(), { [usdc]: "80000" });
   await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"cd".repeat(32)}` });
-  const served = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const restarted = new WalletService(new Ctx(MAINNET), f.store, f.chain, true);
+  restarted.http = f.service.http;
+  const served = await restarted.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   assert.equal(served.status, "confirmed");
+  assert.deepEqual((await restarted.get()).pending_reservations, {});
   assert.equal(served.content_delivered, true);
   assert.deepEqual(JSON.parse(served.content.text), { tempC: 21 });
   assert.deepEqual(f.seen.payments[1], f.seen.payments[0]);
@@ -929,6 +933,26 @@ test("a settled payment whose answer was lost is offered to the seller again, ne
   assert.equal(unserved.content, undefined);
   assert.match(unserved.next_action, /answer was lost.*pays again/);
   assert.deepEqual(lost.seen.payments[1], lost.seen.payments[0]);
+});
+
+test("x402 refuses one USDC atomic unit short before signing and accepts the exact price plus gas", async t => {
+  const f = await x402Fixture(t);
+  const total = BigInt(requirements.amount) + GAS_FEE;
+  let balance = total - 1n;
+  f.chain.balances = async (_wallet, tokens) =>
+    Object.fromEntries(tokens.map(token => [token.toLowerCase(), token.toLowerCase() === usdc ? balance.toString() : "0"]));
+  const signer = t.mock.method(f.service, "signRaw");
+  const refused = { url: URL_, max_amount: "0.05", request_id: randomUUID() };
+  await assert.rejects(f.service.payX402(refused), error => error.code === "policy_denied" && /maximum gas payment/.test(error.message));
+  assert.equal(signer.mock.callCount(), 0);
+  assert.equal(f.seen.payments.length, 0);
+  assert.deepEqual(await f.used(), {});
+
+  balance = total;
+  assert.equal((await f.service.payX402({ ...refused, request_id: randomUUID() })).status, "submitted");
+  assert.equal(signer.mock.callCount(), 1);
+  assert.equal(f.seen.payments.length, 1);
+  assert.deepEqual(await f.used(), { [usdc]: total.toString() });
 });
 
 test("an x402 receipt is found from the seller's transaction or the EntryPoint's events when the bundler does not know it", async () => {

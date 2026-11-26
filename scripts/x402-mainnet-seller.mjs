@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import express from "express";
 import { HTTPFacilitatorClient, x402ResourceServer } from "@x402/core/server";
-import { decodePaymentSignatureHeader } from "@x402/core/http";
+import { decodePaymentResponseHeader, decodePaymentSignatureHeader } from "@x402/core/http";
 import { paymentMiddleware } from "@x402/express";
 import { IncentivUserOpScheme } from "@incentiv/x402";
 
@@ -38,17 +38,33 @@ export async function preflightSeller() {
   catch { throw new Error("The automatic seller tunnel requires an OpenSSH client on PATH"); }
 }
 
-export async function startSeller({ payTo, runId, facilitator = new HTTPFacilitatorClient({ url: FACILITATOR }) }) {
+export async function startSeller({ payTo, runId, dropFirstSettlement = false, acceptPayments = true, facilitator = new HTTPFacilitatorClient({ url: FACILITATOR }) }) {
   const resource = `/e2e-${runId}`;
   const fixture = { test: "incentiv-mcp-x402-mainnet", runId };
-  const seen = { unpaid: 0, paid: [] };
+  const seen = { unpaid: 0, paid: [], droppedSettlement: undefined };
   const app = express();
   app.set("trust proxy", "loopback"); // The seller listens on loopback behind its own HTTPS tunnel.
   const server = new x402ResourceServer(facilitator).register(NETWORK, new IncentivUserOpScheme());
-  app.get(resource, (req, _res, next) => {
+  app.get(resource, (req, res, next) => {
     const signature = req.get("payment-signature");
     if (signature) seen.paid.push(paymentFingerprint(signature));
     else seen.unpaid++;
+    if (signature && !acceptPayments) return res.sendStatus(403);
+    if (signature && dropFirstSettlement && !seen.droppedSettlement) {
+      const end = res.end.bind(res);
+      res.end = (...args) => {
+        // The x402 middleware buffers this response until the facilitator settles.
+        const header = res.getHeader("payment-response");
+        if (typeof header === "string") {
+          const settlement = decodePaymentResponseHeader(header);
+          if (!seen.droppedSettlement && settlement.success && settlement.transaction) {
+            seen.droppedSettlement = settlement.transaction;
+            return res.destroy();
+          }
+        }
+        return end(...args);
+      };
+    }
     next();
   });
   app.use(paymentMiddleware({
@@ -63,6 +79,7 @@ export async function startSeller({ payTo, runId, facilitator = new HTTPFacilita
   await once(listener, "listening");
   return {
     internal: `http://127.0.0.1:${listener.address().port}`, resource, fixture, seen,
+    allowPayments: () => { acceptPayments = true; },
     close: () => new Promise((resolve, reject) => listener.close(error => error ? reject(error) : resolve())),
   };
 }

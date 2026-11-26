@@ -51,4 +51,21 @@ test("mainnet test seller challenges unpaid requests and records identical paid 
   assert.equal(refused.status, 402);
   await refused.body?.cancel();
   assert.notEqual(seller.seen.paid[2], seller.seen.paid[0]);
+
+  settles = 0;
+  const dropping = await startSeller({ payTo, runId: "drop-fixture", facilitator, dropFirstSettlement: true, acceptPayments: false });
+  t.after(dropping.close);
+  const dropUrl = dropping.internal + dropping.resource;
+  const blocked = await fetch(dropUrl, { headers: { "payment-signature": payment } });
+  assert.equal(blocked.status, 403);
+  await blocked.body?.cancel();
+  assert.equal(settles, 0);
+  dropping.allowPayments();
+  await assert.rejects(fetch(dropUrl, { headers: { "payment-signature": payment } }), error => error.cause?.code === "UND_ERR_SOCKET");
+  assert.equal(dropping.seen.droppedSettlement, transaction);
+  assert.equal(settles, 1);
+  const recovered = await fetch(dropUrl, { headers: { "payment-signature": reordered } });
+  assert.equal(recovered.status, 402);
+  await recovered.body?.cancel();
+  assert.deepEqual(dropping.seen.paid, Array(3).fill(seller.seen.paid[0]));
 });
