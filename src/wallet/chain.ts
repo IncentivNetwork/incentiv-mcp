@@ -301,10 +301,19 @@ export class WalletChain {
     // Progress stops short of the head, so a reorg cannot hide an event in blocks already searched.
     const settled = head > REORG_MARGIN_BLOCKS ? head - REORG_MARGIN_BLOCKS : 0n;
     let progressBlocked = false;
+    let logClients = this.clients;
     for (let from = start; from <= end; from += SEARCH_CHUNK) {
       const to = from + SEARCH_CHUNK - 1n < end ? from + SEARCH_CHUNK - 1n : end;
-      // Every RPC is searched: one with an incomplete log index must not move progress past the payment's block.
-      const found = (await Promise.all(this.clients.map(c => logsIn(from, to, range => c.getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, ...range }))))).flat();
+      // A failed log query blocks the cursor, but other RPCs can still locate a receipt for all RPCs to verify.
+      const results = await Promise.allSettled(logClients.map(c => logsIn(from, to, range =>
+        c.getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, ...range }))));
+      logClients = logClients.filter((_, index) => results[index].status === "fulfilled");
+      if (!logClients.length) {
+        const failure = results.find(result => result.status === "rejected");
+        throw failure?.reason ?? new Error("No RPC could search EntryPoint logs");
+      }
+      if (logClients.length !== this.clients.length) progressBlocked = true;
+      const found = results.flatMap(result => result.status === "fulfilled" ? result.value : []);
       // Try each distinct transaction. An inconclusive log must be revisited, but it cannot hide a receipt
       // in a later range of this pass. A log from a known orphaned block can be skipped on future passes.
       const candidates = [...new Set(found.flatMap(log => log.transactionHash ? [log.transactionHash.toLowerCase() as Hex] : []))];

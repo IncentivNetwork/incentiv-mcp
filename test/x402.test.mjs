@@ -1295,6 +1295,21 @@ test("the receipt search reads every RPC, tries each distinct transaction, and n
   const staleLog = { transactionHash: stale, blockNumber: at, blockHash: `0x${"dd".repeat(32)}` };
   assert.equal(await chain(client([staleLog], undefined, at, 200_000n)).searchOperation(orphaned), undefined);
   assert.equal(orphaned.searchedBlock, "100499");
+
+  // A log API outage should not block a receipt that both RPCs can verify.
+  let failedQueries = 0;
+  const degraded = client([], undefined, at, head);
+  degraded.getLogs = async () => { failedQueries++; throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 }); };
+  degraded.getTransactionReceipt = second.getTransactionReceipt;
+  assert.deepEqual(await chain(degraded, second).searchOperation({ ...record }), { ...expected, blockNumber: later });
+  assert.equal(failedQueries, 1);
+
+  // If the working RPC has no result, keep the first incomplete range for the next pass.
+  const incomplete = { ...record };
+  assert.equal(await chain(degraded, client([], undefined, later, head)).searchOperation(incomplete), undefined);
+  assert.equal(incomplete.searchedBlock, undefined);
+  assert.equal(failedQueries, 2);
+
 });
 
 test("the outbound lookup refuses a public name that resolves to a private, loopback or mixed set of addresses", async () => {
