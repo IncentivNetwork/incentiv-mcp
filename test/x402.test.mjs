@@ -9,7 +9,7 @@ import { args, fixture, limits, password, recipient } from "../scripts/wallet-pi
 import { MAINNET } from "../src/config.ts";
 import { Ctx } from "../src/context.ts";
 import { WalletChain, logsIn } from "../src/wallet/chain.ts";
-import { WalletService } from "../src/wallet/service.ts";
+import { WalletService, X402_SETTLEMENT_CONCURRENCY } from "../src/wallet/service.ts";
 import { accountFactoryAbi } from "../src/abi.ts";
 import { BundlerUnavailableError, computeUserOpHash, encodeExecuteBatch, userOpFromJson } from "../src/userop.ts";
 import { Journal, digest, intentSchema } from "../src/wallet/journal.ts";
@@ -2124,7 +2124,7 @@ test("a reorg during the pre-send write preserves both first-send and uncertain 
       const inFlight = ++concurrent;
       try {
         await new Promise(resolve => setImmediate(resolve));
-        if (inFlight > 2) throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 429 });
+        if (inFlight > X402_SETTLEMENT_CONCURRENCY) throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 429 });
         if (recovered && earlierKeys.has(key)) return (key << 64n) + 1n;
         return await laneNonce(wallet, key, block);
       } finally { concurrent--; }
@@ -2190,7 +2190,7 @@ test("settlement rechecks stay within the RPC concurrency limit and reuse shared
     peak = Math.max(peak, concurrent);
     try {
       await new Promise(resolve => setImmediate(resolve));
-      if (concurrent > 2) throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 429 });
+      if (concurrent > X402_SETTLEMENT_CONCURRENCY) throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 429 });
       return await read(...params);
     } finally { inFlight--; }
   };
@@ -2217,7 +2217,37 @@ test("settlement rechecks stay within the RPC concurrency limit and reuse shared
   assert.equal((await f.service.send("transfer", args(randomUUID()))).status, "submitted");
   assert.equal((await f.records()).filter(r => r.settlementFinal).length, 4);
   assert.equal(hashReads, 1);
-  assert.equal(peak, 2);
+  // Four lane nonces and one shared block hash: the pool fills to the limit.
+  assert.equal(peak, X402_SETTLEMENT_CONCURRENCY);
+});
+
+test("an ordinary send whose snapshot changes reports a chain error, not an x402 one", async t => {
+  const f = await x402Fixture(t);
+  f.chain.assertCanonicalSnapshot = async () => { throw new RpcDisagreementError("snapshot changed"); };
+  await assert.rejects(f.service.send("transfer", args(randomUUID())), error => {
+    assert.equal(error.code, "rpc_unavailable");
+    assert.match(error.detail, /Chain state changed or RPC is unavailable/);
+    assert.doesNotMatch(error.detail, /x402/);
+    return true;
+  });
+});
+
+test("re-relaying a cancellation after its nonce was used is not refused on the spent balance", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+  f.chain.state = async (...params) => ({ ...(await state(...params)), deployed: true });
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id, gas_token: "native" });
+  const [review] = (await f.service.reviewReplacement(id, true)).records;
+  assert.equal((await f.service.replace(id, password, digest(review))).status, "superseding");
+  const relayed = f.submissions.length, [before] = await f.records();
+  // The replacement landed and paid its gas, but its receipt is not two blocks deep yet.
+  const balances = f.chain.balances;
+  f.chain.laneNonce = async () => BigInt(before.nonce) + 1n;
+  f.chain.balances = async (...params) => ({ ...await balances(...params), native: "0" });
+  assert.equal((await f.service.resolve(id, password)).status, "superseding");
+  assert.equal(f.submissions.length, relayed);
+  const [after] = await f.records();
+  assert.equal(after.attempts, before.attempts);
+  assert.equal(after.lastError, before.lastError);
 });
 
 test("receipt verification rejects an older fork without releasing the payment reservation", async t => {

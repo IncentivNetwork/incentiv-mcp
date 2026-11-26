@@ -94,7 +94,7 @@ export class WalletService {
       if (!(error instanceof WalletError) || error.code !== "simulation_failed") throw error;
       throw new WalletError(error.code, `${error.detail}. Signed request ${r.requestId} still holds the account nonce. If retrying later does not help, clear it with wallet operation resolve ${r.requestId} --replace${r.intent.gasToken === "native" ? "" : " --native-gas"} in your local terminal`);
     });
-    await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
+    await this.chain.assertCanonicalSnapshot(state).catch(rethrowSnapshotError);
     await this.canSubmit(s, r);
     if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", `Operation deadline is too close; reconcile, or review a same-nonce replacement with wallet operation resolve ${r.requestId} --replace in your local terminal`);
     // Policy and approval expiry may pass during the reads above, so they are checked again with nothing awaited before the broadcast.
@@ -117,32 +117,30 @@ export class WalletService {
     const outage = Symbol("outage");
     const read = <T>(value: Promise<T>) => value.catch((error: unknown): never => {
       if (!forSpending && rpcFault(error) && settled.every(r => (r.consumedAt ?? 0) <= recent)) throw outage;
-      rethrowX402RecheckError(error);
+      // Every spend reads its balances here, so an x402 message only fits when x402 settlements were rechecked.
+      if (settled.length) rethrowX402RecheckError(error);
+      rethrowSnapshotError(error);
     });
     try {
       const snapshot = spend?.state ?? await read(this.chain.state(wallet));
       const { block } = snapshot;
-      // Each check issues one read at a time to each provider. A block hash is shared by settlements in that block.
-      const blockHashes = new Map<bigint, Promise<Hex>>();
-      const blockHash = (n: bigint) => { let hash = blockHashes.get(n); if (!hash) blockHashes.set(n, hash = read(this.chain.canonicalBlockHash(n))); return hash; };
-      const check = async (r: OperationRecord) => {
-        const settledBlock = r.settledBlock === undefined ? undefined : BigInt(r.settledBlock);
-        const nonce = BigInt(r.nonce!);
+      // Each settlement's lane nonce, and each settlement block's hash once, read through one bounded pool, so
+      // the recheck before every spend stays quick without exceeding X402_SETTLEMENT_CONCURRENCY reads per provider.
+      const height = (r: OperationRecord) => r.settledBlock === undefined ? undefined : BigInt(r.settledBlock);
+      const heights = [...new Set(settled.flatMap(r => { const n = height(r); return n !== undefined && n <= block && r.settledBlockHash ? [n] : []; }))];
+      const hashes = new Map<bigint, Hex>(), nonces = new Map<OperationRecord, bigint>();
+      await pooled([
+        ...heights.map(n => async () => { hashes.set(n, await read(this.chain.canonicalBlockHash(n))); }),
+        ...settled.map(r => async () => { nonces.set(r, await read(this.chain.laneNonce(wallet, BigInt(r.nonce!) >> 64n, block))); }),
+      ], X402_SETTLEMENT_CONCURRENCY);
+      const checks = settled.map(r => {
+        const settledBlock = height(r), nonce = BigInt(r.nonce!);
         const behind = settledBlock !== undefined && block < settledBlock;
-        const current = await read(this.chain.laneNonce(wallet, nonce >> 64n, block));
-        const hash = !behind && settledBlock !== undefined && r.settledBlockHash ? await blockHash(settledBlock) : undefined;
+        const hash = !behind && settledBlock !== undefined && r.settledBlockHash ? hashes.get(settledBlock) : undefined;
         const orphaned = behind || (hash !== undefined && hash.toLowerCase() !== r.settledBlockHash);
         // A lagging RPC also shows the lane unused, or a head below the settlement; the payment is held either way.
-        return { r, reopen: current === nonce || orphaned, final: settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS };
-      };
-      const checks = [];
-      for (let start = 0; start < settled.length; start += X402_SETTLEMENT_CONCURRENCY) {
-        const batch = await Promise.allSettled(settled.slice(start, start + X402_SETTLEMENT_CONCURRENCY).map(check));
-        for (const result of batch) {
-          if (result.status === "rejected") throw result.reason;
-          checks.push(result.value);
-        }
-      }
+        return { r, reopen: nonces.get(r) === nonce || orphaned, final: settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS };
+      });
       // Use the same height for balances and nonce reads. Discard the whole read if its block changed,
       // before changing any reservation or marking a settlement final.
       const balances = await (spend ? this.chain.balances(wallet, spend.tokens, block) : Promise.resolve({}))
@@ -1102,22 +1100,26 @@ export class WalletService {
     const signed = r.replacement?.signed ? r.replacement : r.priorReplacement;
     if (!signed || r.status !== "superseding") throw new WalletError("wallet_recovery_required", "Missing signed replacement");
     r.attempts++; r.sequence = ++journal.data.sequence; await journal.save();
-    let refusal: { error: unknown } | undefined;
+    let refusal: { error: unknown } | undefined, landed = false;
     try {
       const hash = await this.chain.relay(signed.operation, async () => {
         try {
-          await this.checkReplacementBalance(journal, r, signed.gasToken ?? "native", signed.gasCharge ?? signed.maxGasCost);
+          const state = await this.chain.stateFor(s.envelope, r).catch(rethrowSnapshotError);
+          // A used nonce means the original or a replacement already landed and paid its gas, so the balance
+          // no longer shows it. Relaying again does nothing; reconciliation finds which one won.
+          if (state.nonce > BigInt(r.nonce!)) { landed = true; throw new Error("Nonce already used"); }
+          await this.checkReplacementBalance(journal, r, signed.gasToken ?? "native", signed.gasCharge ?? signed.maxGasCost, state);
           await this.canSubmit(s);
         } catch (error) {
-          refusal = { error: rpcOutage(error) };
+          if (!landed) refusal = { error: rpcOutage(error) };
           throw error;
         }
       });
       if (hash !== signed.userOpHash) throw new Error();
       delete r.lastError;
     } catch {
-      if (!refusal) r.lastError = "submission_unknown";
-      else r.attempts--;
+      if (refusal || landed) r.attempts--;
+      else r.lastError = "submission_unknown";
     }
     r.sequence = ++journal.data.sequence; await journal.save();
     if (refusal) throw refusal.error;
@@ -1157,6 +1159,22 @@ function rethrowX402RecheckError(error: unknown): never {
 
 const MAX_LINK_ATTEMPTS = 8;
 /** An RPC or bundler outage says nothing about a request, so it becomes a retryable rpc_unavailable; anything else is returned as is. */
+/** A chain read for an ordinary spend that failed, or whose block was replaced; retrying reads a new snapshot. */
+function rethrowSnapshotError(error: unknown): never {
+  if (!rpcFault(error)) throw error;
+  throw new WalletError("rpc_unavailable", "Chain state changed or RPC is unavailable during the wallet check; retry this request");
+}
+/** Runs tasks with at most `limit` in flight. On a failure it starts no more, waits for those running, then throws. */
+async function pooled(tasks: (() => Promise<void>)[], limit: number): Promise<void> {
+  let next = 0, failure: { error: unknown } | undefined;
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+    while (!failure && next < tasks.length) {
+      const task = tasks[next++];
+      try { await task(); } catch (error) { failure ??= { error }; }
+    }
+  }));
+  if (failure) throw failure.error;
+}
 const rpcOutage = (error: unknown) => !(error instanceof WalletError) && (isTransportFailure(error) || error instanceof BundlerUnavailableError)
   ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : error;
 /** Refusals that say nothing about the request itself, so an unsigned request returns to approval_required and keeps its ID. */
@@ -1197,7 +1215,7 @@ const PAID_REQUEST_TIMEOUT_MS = 90_000;
  */
 const X402_RECONFIRM_MS = 60 * 60_000;
 /** Maximum simultaneous settlement reads per configured RPC. */
-const X402_SETTLEMENT_CONCURRENCY = 2;
+export const X402_SETTLEMENT_CONCURRENCY = 4;
 /** Terminal x402 payments older than this are archived; the daily limit only looks back one day. */
 const COMPACT_AFTER_MS = 2 * 86_400_000;
 /** New x402 payments pause above this journal size, leaving room below the 16 MiB limit for everything else. */
