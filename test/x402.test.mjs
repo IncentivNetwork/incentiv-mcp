@@ -350,7 +350,11 @@ test("a first purchase rechecks policy expiry after simulation, before signing a
   // Expires after signing, before the payment first leaves: it stays unsent and expires at its deadline.
   const after = await expiring(), other = randomUUID();
   const stateFor = after.chain.stateFor.bind(after.chain);
-  after.chain.stateFor = async (...a) => { await sleep(60_000); return stateFor(...a); };
+  after.chain.stateFor = async (...a) => {
+    after.chain.stateFor = stateFor;
+    await sleep(60_000);
+    return stateFor(...a);
+  };
   await assert.rejects(after.service.payX402({ url: URL_, max_amount: "0.05", request_id: other }), e => e.code === "policy_denied" && /policy_expired.*never sent/.test(e.message));
   assert.equal(after.seen.payments.length, 0);
   assert.equal((await after.service.operation(other)).status, "signed");
@@ -1179,6 +1183,25 @@ test("a signed payment past its deadline expires only while its nonce lane is un
       assert.equal((await f.used())[usdc], laneUsed ? "80000" : undefined);
     } finally { Date.now = now; }
   }
+});
+
+test("a signed x402 payment with a spent nonce is reconciled before its deadline", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), http = f.service.http;
+  const { NOT_SENT } = await import("../src/x402/http.ts");
+  f.service.http = async req => {
+    if (!req.headers?.["payment-signature"]) return http(req);
+    throw Object.defineProperty(new Error("connect failed"), NOT_SENT, { value: true });
+  };
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), { code: "x402_request_failed" });
+  assert.equal((await f.service.operation(id)).status, "signed");
+  assert.ok((await f.records())[0].deadline > Math.floor(Date.now() / 1000));
+
+  const transactionHash = `0x${"ab".repeat(32)}`;
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash });
+  const settled = await f.service.operation(id);
+  assert.equal(settled.status, "confirmed");
+  assert.equal(settled.transaction_hash, transactionHash);
+  assert.equal(f.seen.payments.length, 0);
 });
 
 test("a lane read that fails keeps a past-deadline payment signed until it can be checked", async t => {

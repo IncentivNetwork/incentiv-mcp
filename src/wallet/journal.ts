@@ -96,7 +96,7 @@ const transitions: Record<OperationRecord["status"], string[]> = {
   preparing: ["approval_required", "signed", "failed", "cancelled"],
   approval_required: ["preparing", "expired", "cancelled"],
   // Only an x402 payment that never left this computer expires from signed: nobody else holds its signature.
-  // An x402 payment past its deadline whose nonce lane was used anyway reached the seller after all.
+  // An x402 payment whose nonce lane was used needs receipt reconciliation even if it was recorded as unsent.
   signed: ["submitting", "superseding", "expired", "submission_unknown"],
   // Back to its earlier status only when the last check before the outbound request or broadcast refused it, so it never left.
   submitting: ["submitted", "submission_unknown", "signed"],

@@ -166,12 +166,8 @@ export class WalletService {
     // before it was signed: nothing can send it, so it is closed.
     for (const r of journal.data.records) if (r.intent.kind === "x402_payment" && r.status === "preparing") { r.lastError = "x402_preparation_interrupted"; await journal.transition(r, "failed"); }
     for (const r of journal.data.records.filter(r => ownsNonce(r.status))) {
-      if (r.status === "signed") {
-        // No network submission was started; exact bytes remain retryable. An x402 payment that was never sent
-        // is known only to this computer, so once its deadline passes the seller can no longer accept it.
-        if (r.intent.kind === "x402_payment" && r.deadline! <= Math.floor(Date.now() / 1000)) await this.expireUnsentX402(journal, r);
-        continue;
-      }
+      if (r.status === "signed" && r.intent.kind === "x402_payment") await this.reconcileSignedX402(journal, r);
+      if (r.status === "signed" || !ownsNonce(r.status)) continue;
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
       try {
         const searched = r.searchedBlock;
@@ -737,20 +733,25 @@ export class WalletService {
 
   /** The seller's deadline passed: an unsent payment expires; one the seller may hold stays reserved until resolved. */
   private async pastDeadlineX402(journal: Journal, r: OperationRecord) {
-    if (r.status === "signed" && await this.expireUnsentX402(journal, r)) return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." };
+    if (r.status === "signed" && await this.reconcileSignedX402(journal, r)) return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." };
     return { ...x402Result(r), next_action: X402_UNKNOWN_ACTION(r.requestId) };
   }
   /**
-   * Expires a signed payment past its deadline. The chain does not enforce that deadline, so this happens only while
-   * its nonce lane is unused: a used lane means the seller got it after all, and it stays reserved until its receipt
-   * is found. When the lane cannot be read, the payment stays signed and is checked again later. Returns whether it expired.
+   * Rechecks a signed payment whose delivery was never recorded. A spent lane needs receipt reconciliation
+   * immediately. An unused lane can expire only after the seller's deadline. Returns whether the payment expired.
    */
-  private async expireUnsentX402(journal: Journal, r: OperationRecord): Promise<boolean> {
+  private async reconcileSignedX402(journal: Journal, r: OperationRecord): Promise<boolean> {
     const lane = await this.chain.stateFor(journal.session.envelope, r).catch(() => undefined);
     if (!lane) return false;
-    if (lane.nonce === BigInt(r.nonce!)) { r.lastError = "x402_payment_expired"; await journal.transition(r, "expired"); return true; }
-    r.lastError = "submission_unknown"; await journal.transition(r, "submission_unknown");
-    return false;
+    if (lane.nonce !== BigInt(r.nonce!)) {
+      r.lastError = "submission_unknown";
+      await journal.transition(r, "submission_unknown");
+      return false;
+    }
+    if (r.deadline === undefined || r.deadline > Math.floor(Date.now() / 1000)) return false;
+    r.lastError = "x402_payment_expired";
+    await journal.transition(r, "expired");
+    return true;
   }
   /** Sends the signed payment with the request, and records what the seller answered. */
   private async deliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request, limits: Limits, freshlySimulated = false) {
