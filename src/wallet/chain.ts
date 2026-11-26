@@ -18,6 +18,13 @@ const revertReasonEvent = parseAbiItem("event UserOperationRevertReason(bytes32 
 /** A node or network problem that a retry can clear, as opposed to an answer from the chain. */
 export { isTransportFailure };
 const same = (values: unknown[]) => values.every(v => String(v).toLowerCase() === String(values[0]).toLowerCase());
+/** Drain each provider's read before another settlement batch can start, even when one provider fails. */
+async function settlementReads<T>(reads: Promise<T>[]): Promise<T[]> {
+  return (await Promise.allSettled(reads)).map(result => {
+    if (result.status === "rejected") throw result.reason;
+    return result.value;
+  });
+}
 export const SWAP_DEADLINE_SECONDS = 60;
 /** How far back, and in what steps, an operation is looked for in EntryPoint events. */
 // One reconciliation searches at most SEARCH_PER_PASS blocks while it holds the wallet lock; saved progress continues it.
@@ -55,7 +62,7 @@ export class WalletChain {
     return { nonce: nonces[0], deployed, block, blockHash, timestamp: Number(blocks[0].timestamp), fees: { baseFeePerGas: base, maxFeePerGas: base * 2n + 1_000_000_000n, maxPriorityFeePerGas: 1_000_000_000n } };
   }
   async canonicalBlockHash(blockNumber: bigint): Promise<Hex> {
-    const hashes = await Promise.all(this.clients.map(c => c.getBlock({ blockNumber }).then(block => block.hash)));
+    const hashes = await settlementReads(this.clients.map(c => c.getBlock({ blockNumber }).then(block => block.hash)));
     const [hash] = hashes;
     if (!hash || !same(hashes)) throw new RpcDisagreementError("RPC block hashes disagree");
     return hash;
@@ -67,7 +74,7 @@ export class WalletChain {
 
   /** The account's next nonce on one EntryPoint key, agreed by every configured RPC at `block`. */
   async laneNonce(wallet: WalletEnvelope, key: bigint, block: bigint): Promise<bigint> {
-    const nonces = await Promise.all(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "getNonce", args: [wallet.account as Address, key], blockNumber: block })));
+    const nonces = await settlementReads(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "getNonce", args: [wallet.account as Address, key], blockNumber: block })));
     if (!same(nonces)) throw new RpcDisagreementError("RPC nonces disagree");
     return nonces[0];
   }
@@ -387,10 +394,10 @@ export class WalletChain {
     if (!record.userOpHash || !record.operation) return;
     const receipts = await Promise.all(this.clients.map(c => c.getTransactionReceipt({ hash: transactionHash })));
     if (!same(receipts.map(r => r.blockHash)) || !same(receipts.map(r => r.blockNumber)) || receipts.some(r => r.status !== "success")) throw new Error("Receipt disagreement");
-    const blocks = await Promise.all(this.clients.map((c, i) => c.getBlock({ blockNumber: receipts[i].blockNumber })));
-    if (blocks.some((b, i) => b.hash !== receipts[i].blockHash)) throw new Error("Receipt is not in the canonical chain");
     const heads = await Promise.all(this.clients.map(c => c.getBlockNumber({ cacheTime: 0 })));
     if (heads.some(h => h < receipts[0].blockNumber + 2n)) return;
+    const blocks = await Promise.all(this.clients.map((c, i) => c.getBlock({ blockNumber: receipts[i].blockNumber })));
+    if (blocks.some((b, i) => b.hash !== receipts[i].blockHash)) throw new Error("Receipt is not in the canonical chain");
     const matches = receipts.map(r => r.logs.flatMap(log => {
       if (log.address.toLowerCase() !== this.ctx.config.identity.entryPoint.address.toLowerCase()) return [];
       try {

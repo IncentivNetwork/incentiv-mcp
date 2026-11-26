@@ -2098,3 +2098,149 @@ test("receipt discovery falls back to an excluded RPC for the failing range", as
   assert.deepEqual(reads, [["A", 500n], ["B", 500n], ["B", 5500n], ["A", 5500n]]);
   assert.equal(record.searchedBlock, undefined, "partial coverage cannot advance the verified cursor");
 });
+
+test("a reorg during the pre-send write preserves both first-send and uncertain retry states", async t => {
+  for (const previous of ["signed", "submission_unknown"]) {
+    const f = await x402Fixture(t), first = randomUUID(), second = randomUUID(), baseState = f.chain.state;
+    const earlierIds = [first, randomUUID(), randomUUID()];
+    const oldHash = `0x${"77".repeat(32)}`, newHash = `0x${"88".repeat(32)}`;
+    let blockHash = oldHash, native = 1_000_000n;
+    f.chain.state = async (...params) => ({ ...(await baseState(...params)), deployed: true, blockHash });
+    f.chain.canonicalBlockHash = async () => blockHash;
+    f.chain.assertCanonicalSnapshot = snapshot => WalletChain.prototype.assertCanonicalSnapshot.call(f.chain, snapshot);
+    f.chain.balances = async (_wallet, tokens) => Object.fromEntries(tokens.map(token =>
+      [token.toLowerCase(), token === "native" ? native.toString() : token.toLowerCase() === usdc ? "5000000" : "0"]));
+    for (const request_id of earlierIds) await f.service.payX402({ url: URL_, max_amount: "0.05", gas_token: "native", request_id });
+    const earlier = await f.records();
+    const firstGas = BigInt(earlier[0].reservation.native);
+    const receipt = { success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}`, blockNumber: 1n, blockHash };
+    await f.settle(receipt);
+    assert.equal((await f.service.operation(first)).status, "confirmed");
+    f.setReceipt(undefined);
+    const laneNonce = f.chain.laneNonce;
+    const earlierKeys = new Set(earlier.map(r => BigInt(r.nonce) >> 64n));
+    let concurrent = 0, recovered = false;
+    f.chain.laneNonce = async (wallet, key, block) => {
+      const inFlight = ++concurrent;
+      try {
+        await new Promise(resolve => setImmediate(resolve));
+        if (inFlight > 2) throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 429 });
+        if (recovered && earlierKeys.has(key)) return (key << 64n) + 1n;
+        return await laneNonce(wallet, key, block);
+      } finally { concurrent--; }
+    };
+    native = firstGas;
+    const purchase = { url: URL_, max_amount: "0.05", gas_token: "native", request_id: second };
+    if (previous === "submission_unknown") {
+      f.seen.fail = 1;
+      assert.equal((await f.service.payX402(purchase)).status, previous);
+    }
+    const sent = f.seen.payments.length;
+    let reorged = false;
+    f.deps.checkpoint = async point => {
+      if (!reorged && /^journal_\d+_submitting$/.test(point)) {
+        reorged = true;
+        f.unsettle();
+        blockHash = newHash;
+        native = firstGas + 1n;
+      }
+    };
+    await assert.rejects(f.service.payX402(purchase), { code: "rpc_unavailable" });
+    assert.equal(reorged, true);
+    assert.equal(f.seen.payments.length, sent);
+    const record = (await f.records()).find(r => r.requestId === second);
+    assert.equal(record.status, previous);
+    assert.equal(record.attempts, previous === "signed" ? 0 : 1);
+    if (previous === "submission_unknown") {
+      const exposed = f.seen.payments[sent - 1].payload.userOperation;
+      assert.equal(record.operation.signature, exposed.signature);
+      assert.equal(record.userOpHash, f.seen.payments[sent - 1].payload.userOpHash);
+    }
+    assert.equal((await f.service.operation(first)).status, "submitted");
+    await assert.rejects(f.service.payX402(purchase), { code: "policy_denied" });
+    assert.equal(f.seen.payments.length, sent);
+    assert.equal((await f.service.get()).pending_reservations.native, (firstGas * 4n).toString());
+    recovered = true;
+    f.chain.receipt = async r => earlierIds.includes(r.requestId) ? { ...receipt, blockHash: newHash } : undefined;
+    assert.equal((await f.service.payX402(purchase)).status, "submitted");
+    assert.equal(f.seen.payments.length, sent + 1);
+    assert.equal(f.seen.payments.at(-1).payload.userOperation.signature, record.operation.signature);
+    assert.equal((await f.service.get()).pending_reservations.native, firstGas.toString());
+  }
+});
+
+test("settlement rechecks stay within the RPC concurrency limit and reuse shared block hashes", async t => {
+  const f = await x402Fixture(t), baseState = f.chain.state, ids = [];
+  let head = 100n;
+  f.chain.state = async (...params) => ({ ...(await baseState(...params)), deployed: true, block: head });
+  for (let i = 0; i < 4; i++) {
+    const requestId = randomUUID();
+    ids.push(requestId);
+    await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: requestId });
+  }
+  const blockHash = `0x${"77".repeat(32)}`;
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}`, blockNumber: 98n, blockHash });
+  f.chain.canonicalBlockHash = async () => blockHash;
+  assert.equal((await f.service.operation(ids[0])).status, "confirmed");
+  f.setReceipt(undefined);
+  assert.equal((await f.records()).filter(r => r.status === "confirmed").length, 4);
+  let inFlight = 0, peak = 0, hashReads = 0, failLane = false, snapshotChanges = false;
+  const limit = read => async (...params) => {
+    const concurrent = ++inFlight;
+    peak = Math.max(peak, concurrent);
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      if (concurrent > 2) throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 429 });
+      return await read(...params);
+    } finally { inFlight--; }
+  };
+  const laneNonce = f.chain.laneNonce;
+  f.chain.laneNonce = limit((...params) => {
+    if (failLane) throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 });
+    return laneNonce(...params);
+  });
+  f.chain.canonicalBlockHash = limit(async () => { hashReads++; return blockHash; });
+  f.chain.assertCanonicalSnapshot = async () => {
+    if (snapshotChanges) throw new RpcDisagreementError("snapshot changed");
+  };
+  head = 300n;
+  failLane = true;
+  await assert.rejects(f.service.send("transfer", args(randomUUID())), { code: "rpc_unavailable" });
+  assert.equal(inFlight, 0);
+  assert.equal((await f.records()).filter(r => r.settlementFinal).length, 0);
+  failLane = false;
+  snapshotChanges = true;
+  await assert.rejects(f.service.send("transfer", args(randomUUID())), { code: "rpc_unavailable" });
+  assert.equal((await f.records()).filter(r => r.settlementFinal).length, 0);
+  snapshotChanges = false;
+  hashReads = 0;
+  assert.equal((await f.service.send("transfer", args(randomUUID()))).status, "submitted");
+  assert.equal((await f.records()).filter(r => r.settlementFinal).length, 4);
+  assert.equal(hashReads, 1);
+  assert.equal(peak, 2);
+});
+
+test("receipt verification rejects an older fork without releasing the payment reservation", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), chain = f.chain;
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const [payment] = await f.records();
+  const at = 1_000n, nonce = BigInt(payment.nonce), userOpHash = payment.userOpHash, sender = payment.operation.sender;
+  const hash = n => `0x${n.repeat(64)}`;
+  const tx = hash("a"), oldHash = hash("b"), newHash = hash("c");
+  const event = parseAbiItem("event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)");
+  const log = { address: entryPoint, topics: encodeEventTopics({ abi: [event], eventName: "UserOperationEvent", args: { userOpHash, sender, paymaster } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [nonce, true, 1234n, 1n]) };
+  let canonical = oldHash, receiptBlock = oldHash;
+  const client = () => ({
+    getTransactionReceipt: async () => ({ status: "success", blockHash: receiptBlock, blockNumber: at, transactionHash: tx, logs: [log] }),
+    getBlock: async () => ({ hash: canonical }),
+    getBlockNumber: async () => { canonical = newHash; return at + 2n; },
+  });
+  chain.clients = [client(), client()];
+  chain.receipt = record => chain.verifiedReceipt(record, tx).catch(() => undefined);
+  assert.equal((await f.service.operation(id)).status, "submitted");
+  assert.equal((await f.service.get()).pending_reservations[usdc], "80000");
+  assert.equal(await chain.canonicalBlockHash(at), newHash);
+  receiptBlock = newHash;
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  assert.equal((await f.records())[0].settledBlockHash, newHash);
+});

@@ -122,22 +122,27 @@ export class WalletService {
     try {
       const snapshot = spend?.state ?? await read(this.chain.state(wallet));
       const { block } = snapshot;
-      // The reads run in parallel, since this recheck precedes every spend and can run while a seller's payment
-      // window is open; the journal is updated once they are all in. Each settlement block's hash is read once.
+      // Each check issues one read at a time to each provider. A block hash is shared by settlements in that block.
       const blockHashes = new Map<bigint, Promise<Hex>>();
       const blockHash = (n: bigint) => { let hash = blockHashes.get(n); if (!hash) blockHashes.set(n, hash = read(this.chain.canonicalBlockHash(n))); return hash; };
-      const checks = await Promise.all(settled.map(async r => {
+      const check = async (r: OperationRecord) => {
         const settledBlock = r.settledBlock === undefined ? undefined : BigInt(r.settledBlock);
         const nonce = BigInt(r.nonce!);
         const behind = settledBlock !== undefined && block < settledBlock;
-        const [current, hash] = await Promise.all([
-          read(this.chain.laneNonce(wallet, nonce >> 64n, block)),
-          !behind && settledBlock !== undefined && r.settledBlockHash ? blockHash(settledBlock) : undefined,
-        ]);
+        const current = await read(this.chain.laneNonce(wallet, nonce >> 64n, block));
+        const hash = !behind && settledBlock !== undefined && r.settledBlockHash ? await blockHash(settledBlock) : undefined;
         const orphaned = behind || (hash !== undefined && hash.toLowerCase() !== r.settledBlockHash);
         // A lagging RPC also shows the lane unused, or a head below the settlement; the payment is held either way.
         return { r, reopen: current === nonce || orphaned, final: settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS };
-      }));
+      };
+      const checks = [];
+      for (let start = 0; start < settled.length; start += X402_SETTLEMENT_CONCURRENCY) {
+        const batch = await Promise.allSettled(settled.slice(start, start + X402_SETTLEMENT_CONCURRENCY).map(check));
+        for (const result of batch) {
+          if (result.status === "rejected") throw result.reason;
+          checks.push(result.value);
+        }
+      }
       // Use the same height for balances and nonce reads. Discard the whole read if its block changed,
       // before changing any reservation or marking a settlement final.
       const balances = await (spend ? this.chain.balances(wallet, spend.tokens, block) : Promise.resolve({}))
@@ -724,7 +729,7 @@ export class WalletService {
    * every send must still pass current wallet policy, balance and its nonce lane, as it did when signed. Its own
    * reservation is excluded from what is already used. A refusal sends nothing and keeps the record as it was.
    */
-  private async recheckX402(s: WalletSession, journal: Journal, r: OperationRecord, limits: Limits, consequence: string, freshlySimulated: boolean): Promise<void> {
+  private async recheckX402(s: WalletSession, journal: Journal, r: OperationRecord, limits: Limits, consequence: string, freshlySimulated: boolean): Promise<ChainState> {
     const state = await this.chain.stateFor(s.envelope, r);
     if (state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "This payment's nonce lane has moved; check get_agent_operation");
     const validated = validateOperation(this.ctx.config, s.envelope, r.intent, { ...r.operation!, signature: "0x" }, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash! });
@@ -740,7 +745,7 @@ export class WalletService {
       if (error instanceof WalletError && error.code === "simulation_failed") throw new WalletError(error.code, `${error.detail}; ${consequence}`);
       throw rpcOutage(error);
     });
-    if (!freshlySimulated) await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
+    return state;
   }
 
   /**
@@ -755,13 +760,18 @@ export class WalletService {
     let response: Awaited<ReturnType<typeof this.http>> | undefined;
     // Neither a seller's report nor a confirmation the chain later drops is proof: while the nonce is unused, the
     // seller could still submit the payment, so sending it again would be a send under no current policy.
-    if ((await this.chain.stateFor(s.envelope, r)).nonce === BigInt(r.nonce!)) {
-      if (r.status === "confirmed") await this.reopenX402Settlement(journal, r);
+    const state = await this.chain.stateFor(s.envelope, r);
+    if (state.nonce === BigInt(r.nonce!)) {
+      if (r.status === "confirmed") {
+        await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
+        await this.reopenX402Settlement(journal, r);
+      }
       return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The RPC no longer shows this payment's settlement: the chain reorganized, or the RPC is behind" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid. ${X402_UNKNOWN_ACTION(r.requestId)}` };
     }
     if (replayable(req)) {
       // Asking again sends a request from this computer, so it needs current policy like any other x402 request.
       // The payment itself has settled, so a refusal only withholds the answer.
+      await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
       await s.assertOwned(); await this.enabled(s);
       const refused = !limits.x402 ? "x402 payments are now off in local wallet policy"
         : x402Violations(limits, req.origin, ZERO_ADDRESS, "0").includes("x402_origin_not_allowed") ? "local wallet policy no longer allows this site"
@@ -818,15 +828,19 @@ export class WalletService {
     // (say the process stopped before the request started) the seller may still never have received it.
     const before = r.status, first = before === "signed";
     const consequence = first ? "it was never sent and expires unpaid" : `it was not sent again. The seller may already hold it, so it stays reserved; ${X402_UNKNOWN_ACTION(r.requestId)}`;
-    await this.recheckX402(s, journal, r, limits, consequence, freshlySimulated);
+    const snapshot = await this.recheckX402(s, journal, r, limits, consequence, freshlySimulated);
     await this.canSubmit(s, r);
     assertPolicyLive(limits, consequence);
     r.attempts++;
     await journal.transition(r, "submitting"); // From here the seller may hold the signed payment.
-    // While that write completes, the wallet can be disabled, policy can expire or the deadline can pass. They are
-    // checked again at the request itself, with nothing awaited in between; a refusal records that it never left.
+    // The chain, wallet enablement, policy expiry and deadline can change during the write. A refusal here
+    // restores the previous delivery state because this attempt never left the wallet.
     const unsent = async () => { r.attempts--; await journal.transition(r, before); };
-    try { await this.canSubmit(s, r); assertPolicyLive(limits, consequence); }
+    try {
+      await this.chain.assertCanonicalSnapshot(snapshot).catch(rethrowX402RecheckError);
+      await this.canSubmit(s, r);
+      assertPolicyLive(limits, consequence);
+    }
     catch (error) { await unsent(); throw error; }
     if (x.validUntil <= Math.floor(Date.now() / 1000)) { await unsent(); return this.pastDeadlineX402(journal, r); }
     const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
@@ -1182,6 +1196,8 @@ const PAID_REQUEST_TIMEOUT_MS = 90_000;
  * Reorg check window for existing settlements that predate recording their receipt block.
  */
 const X402_RECONFIRM_MS = 60 * 60_000;
+/** Maximum simultaneous settlement reads per configured RPC. */
+const X402_SETTLEMENT_CONCURRENCY = 2;
 /** Terminal x402 payments older than this are archived; the daily limit only looks back one day. */
 const COMPACT_AFTER_MS = 2 * 86_400_000;
 /** New x402 payments pause above this journal size, leaving room below the 16 MiB limit for everything else. */
