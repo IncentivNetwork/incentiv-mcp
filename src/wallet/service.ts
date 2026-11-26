@@ -98,7 +98,7 @@ export class WalletService {
     // Policy and approval expiry may pass during the reads above, so they are checked again with nothing awaited before the broadcast.
     permitted();
   }
-  private async reconcileX402Settlements(journal: Journal): Promise<void> {
+  private async reconcileX402Settlements(journal: Journal, forSpending: boolean): Promise<void> {
     const recent = Date.now() - X402_RECONFIRM_MS;
     // A settlement past the reorg margin is marked final once, so it no longer needs the RPC on every wallet call.
     const settled = journal.data.records.filter(r => r.intent.kind === "x402_payment" && !r.settlementFinal
@@ -106,11 +106,11 @@ export class WalletService {
       && r.nonce !== undefined && (r.status === "confirmed" || r.status === "reverted" || r.status === "superseded"));
     if (!settled.length) return;
     const wallet = journal.session.envelope;
-    // Sending needs the RPC anyway, so during an outage only a settlement from the last hour holds up the call;
-    // older ones are checked again, and marked final, once the RPC answers.
+    // Reads can still show older, recorded settlements during an outage. Spending needs a fresh check because
+    // a failing receipt or nonce read does not imply that balance reads and simulation are unavailable.
     const outage = Symbol("outage");
     const read = <T>(value: Promise<T>) => value.catch((error: unknown): never => {
-      if (!(error instanceof WalletError) && settled.every(r => (r.consumedAt ?? 0) <= recent)) throw outage;
+      if (!forSpending && !(error instanceof WalletError) && settled.every(r => (r.consumedAt ?? 0) <= recent)) throw outage;
       rethrowX402RecheckError(error);
     });
     try {
@@ -156,8 +156,8 @@ export class WalletService {
     await journal.transition(r, status);
   }
 
-  private async reconcile(journal: Journal): Promise<void> {
-    await this.reconcileX402Settlements(journal);
+  private async reconcile(journal: Journal, forSpending = false): Promise<void> {
+    await this.reconcileX402Settlements(journal, forSpending);
     // Connections are permanent: an unlink an earlier build left awaiting approval can never be approved, so it is cancelled.
     for (const r of journal.data.records) if (r.intent.kind === "unlink_agent" && (r.status === "preparing" || r.status === "approval_required")) {
       delete r.approval; r.lastError = "registry_unlink_unsupported"; await journal.transition(r, "cancelled");
@@ -272,7 +272,7 @@ export class WalletService {
       const intent = intentSchema.parse(await this.chain.normalize(kind, args));
       let r = journal.data.records.find(r => r.requestId === requestId);
       if ((r && r.intentHash !== digest(intent)) || (!r && (journal.data.probes?.some(p => p.requestId === requestId) || journal.data.archived?.some(a => a.requestId === requestId)))) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different intent");
-      await this.reconcile(journal);
+      await this.reconcile(journal, true);
       if (r && terminal(r.status)) return result(r);
       if (r && ownsNonce(r.status)) {
         if (prepareOnly) return result(r);
@@ -532,7 +532,7 @@ export class WalletService {
   private async payX402In(s: WalletSession, requestId: string, req: X402Request, request: Hex, maxAmount: bigint, gasToken: string) {
     const cfg = this.ctx.config, xcfg = x402Config(cfg);
     const limits = await this.enabled(s);
-    const journal = await Journal.open(s); await this.reconcile(journal);
+    const journal = await Journal.open(s); await this.reconcile(journal, true);
     const archived = journal.data.archived?.find(a => a.requestId === requestId);
     if (archived) {
       if (archived.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
@@ -894,7 +894,7 @@ export class WalletService {
   async resolve(id: string, passphrase: Buffer) {
     return this.store.session(async s => {
       await authorize(s.envelope.policy, passphrase);
-      const journal = await Journal.open(s); await this.reconcile(journal);
+      const journal = await Journal.open(s); await this.reconcile(journal, true);
       const r = journal.data.records.find(r => r.requestId === id);
       if (!r) throw new WalletError("operation_not_found", "Unknown request ID");
       if (r.status === "superseding") await this.submitReplacement(s, journal, r);
@@ -989,7 +989,7 @@ export class WalletService {
   async replace(id: string, passphrase: Buffer, reviewedDigest: Hex) {
     return this.store.session(async s => {
       await authorize(s.envelope.policy, passphrase); await this.canSubmit(s);
-      const journal = await Journal.open(s); await this.reconcile(journal);
+      const journal = await Journal.open(s); await this.reconcile(journal, true);
       const r = journal.data.records.find(r => r.requestId === id);
       if (!r || !ownsNonce(r.status) || !r.replacement || r.replacement.signed || r.replacement.expiresAt <= Date.now() || digest(r) !== reviewedDigest) throw new WalletError("approval_required", "Replacement changed or expired; review it again");
       const state = await this.chain.stateFor(s.envelope, r);
@@ -1112,7 +1112,11 @@ async function compactX402(journal: Journal, now = Date.now()) {
   if (probes && probes.length !== journal.data.probes!.length) { journal.data.probes = probes; changed = true; }
   const archive = [...journal.data.archived ?? []];
   const records = journal.data.records.filter(r => {
-    if (r.intent.kind !== "x402_payment" || !terminal(r.status) || (!UNSENT_TERMINAL.includes(r.status) && r.updatedAt > now - COMPACT_AFTER_MS)) return true;
+    if (r.intent.kind !== "x402_payment" || !terminal(r.status)) return true;
+    if (!UNSENT_TERMINAL.includes(r.status)) {
+      if (r.updatedAt > now - COMPACT_AFTER_MS) return true;
+      if (r.settledBlock !== undefined && !r.settlementFinal) return true;
+    }
     archive.push({ requestId: r.requestId, request: r.intent.x402!.request, status: r.status, ...(r.lastError ? { lastError: r.lastError.slice(0, 64) } : {}), ...(r.userOpHash ? { userOpHash: r.userOpHash } : {}), ...(r.transactionHash ? { transactionHash: r.transactionHash } : {}), at: r.updatedAt });
     return false;
   });

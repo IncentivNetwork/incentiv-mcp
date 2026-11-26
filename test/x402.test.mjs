@@ -1404,6 +1404,37 @@ test("during an outage only a settlement from the last hour holds up wallet call
   assert.equal((await f.records())[0].settlementFinal, undefined, "rechecked, and marked final, once the RPC answers");
 });
 
+test("an old x402 receipt survives a partial RPC outage and blocks new spending until rechecked", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+  let head = 100n;
+  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true, block: head });
+  const purchase = { url: URL_, max_amount: "0.05", request_id: id };
+  await f.service.payX402(purchase);
+  const transactionHash = `0x${"ab".repeat(32)}`, blockHash = `0x${"bc".repeat(32)}`;
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash, blockNumber: 98n, blockHash });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  f.unsettle();
+  head += 128n;
+  await f.store.session(async s => {
+    const journal = await Journal.open(s);
+    journal.data.records[0].updatedAt -= 3 * 86_400_000;
+    journal.data.records[0].consumedAt -= 3 * 86_400_000;
+    await journal.save();
+  });
+
+  f.chain.canonicalBlockHash = async () => { throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 }); };
+  const recorded = await f.service.operation(id);
+  assert.equal(recorded.status, "confirmed");
+  assert.equal(recorded.archived, undefined);
+  await assert.rejects(f.service.payX402({ ...purchase, request_id: randomUUID() }), { code: "rpc_unavailable" });
+  assert.equal(f.seen.unpaid, 1);
+
+  f.chain.canonicalBlockHash = async () => `0x${"cd".repeat(32)}`;
+  const reopened = await f.service.operation(id);
+  assert.equal(reopened.status, "submitted");
+  assert.equal((await f.service.get()).pending_reservations[usdc], "80000");
+});
+
 test("a lagging node's missing block during the settlement recheck is an RPC outage, not wallet damage", async t => {
   for (const failure of [new BlockNotFoundError({ blockNumber: 98n }), new RpcRequestError({ body: {}, url: "https://rpc.incentiv.io", error: { code: -32000, message: "header not found" } })]) {
     const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
