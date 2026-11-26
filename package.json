@@ -9,6 +9,7 @@
     "ci": "npm run typecheck && npm test",
     "build": "tsc && node scripts/copy-wallet-assets.mjs",
     "check:package": "node scripts/check-package.mjs",
+    "e2e:x402": "node scripts/x402-mainnet-e2e.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"
   },
@@ -43,6 +44,8 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
+    "@x402/express": "2.32.0",
+    "express": "5.3.0",
     "tsx": "^4.23.1",
     "typescript": "^7.0.2",
     "wormhole-x402": "0.11.0"

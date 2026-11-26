@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { decodeFunctionData, HttpRequestError } from "viem";
+import { decodeFunctionData, encodeFunctionData, HttpRequestError } from "viem";
 import { MAINNET } from "../src/config.ts";
 import { accountAbi, erc20Abi } from "../src/abi.ts";
 import { billableGas, buildUserOpUnsigned, computeGasTokenAmount, getPaymasterConfig, requiredPaymentUsdc } from "../src/userop.ts";
@@ -84,6 +84,31 @@ test("a token-paid operation pays the schedule for its own limits, whatever the 
     paid.push(transfer.args[1]);
   }
   assert.equal(new Set(paid).size, 1, "the USDC price does not move with the base fee");
+});
+
+test("unsigned token-gas estimation can use a balance that covers price and actual fee", async t => {
+  const balance = 50_000n, price = 10_000n;
+  const recipient = "0x0000000000000000000000000000000000000001";
+  const estimatedFees = [];
+  t.mock.method(globalThis, "fetch", async (_url, { body }) => {
+    const [estimate] = JSON.parse(body).params;
+    assert.equal(estimate.paymaster, undefined);
+    const [, , data] = decodeFunctionData({ abi: accountAbi, data: estimate.callData }).args;
+    const charge = decodeFunctionData({ abi: erc20Abi, data: data[0] }).args[1];
+    assert.equal(decodeFunctionData({ abi: erc20Abi, data: data[1] }).args[1], price);
+    estimatedFees.push(charge);
+    if (charge + price > balance) return Response.json({ error: { code: -32521, message: "ERC20: transfer amount exceeds balance" } });
+    return Response.json({ result: { callGasLimit: "0x11170", verificationGasLimit: "0x493e0", preVerificationGas: "0x9c40" } });
+  });
+  const built = await buildUserOpUnsigned(fakeCtx(), {
+    account: "0x214324E3412eD8864Da4EfB2c2D34c3281dbEe7A",
+    calls: [{ to: USDC, value: 0n, data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [recipient, price] }) }],
+    gasToken: token(USDC, "USDC", 6),
+    state: { deployed: true, nonce: 0n, fees: { maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, baseFeePerGas: 1n } },
+  });
+  assert.deepEqual(estimatedFees, [26_000n, 26_000n]);
+  assert.equal(built.op.signature, "0x");
+  assert.equal(built.gasToken.tokenAmount + price, 36_000n);
 });
 
 test("an operation to sign prices gas with the paymaster's current overhead, not a cached one", async t => {
