@@ -1388,6 +1388,20 @@ test("a native replacement is priced above every operation signed at its nonce",
   assert.deepEqual(replacementFees({ ...current, maxFeePerGas: 500n, maxPriorityFeePerGas: 50n }, { ...original, replacement: token }), { ...current, maxFeePerGas: 500n, maxPriorityFeePerGas: 50n });
 });
 
+test("the replacement builder prices above every signed operation and ignores an unsigned draft", async t => {
+  const fetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = fetch; });
+  globalThis.fetch = async () => Response.json({ jsonrpc: "2.0", id: 1, result: { callGasLimit: "0x1", verificationGasLimit: "0x1", preVerificationGas: "0x1" } });
+  const chain = new WalletChain(new Ctx(MAINNET)), account = `0x${"11".repeat(20)}`, wallet = { account, owner: `0x${"22".repeat(20)}` };
+  const op = (maxFeePerGas, maxPriorityFeePerGas) => userOpToJson({ sender: account, nonce: 7n, callData: "0x", callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas, maxPriorityFeePerGas, signature: "0x" });
+  const state = { block: 1n, nonce: 7n, deployed: true, fees: { baseFeePerGas: 1n, maxFeePerGas: 10n, maxPriorityFeePerGas: 1n } };
+  // The draft outbids both signed operations; a re-review must not compound its price.
+  const record = { intent: {}, operation: op(100n, 10n), priorReplacement: { operation: op(121n, 13n), signed: true }, replacement: { operation: op(10_000n, 1_000n), signed: false } };
+  const built = await chain.buildReplacement(wallet, record, state, "native");
+  assert.equal(built.op.maxFeePerGas, 146n);
+  assert.equal(built.op.maxPriorityFeePerGas, 16n);
+});
+
 test("only a token-paid replacement can be followed by a native one", async t => {
   const f = await tokenRegistryFixture(t), id = randomUUID(), balances = f.chain.balances;
   await f.service.send("link_agent", { request_id: id, approval: f.approval, gas_token: "USDC" });
