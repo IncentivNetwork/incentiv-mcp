@@ -27,7 +27,7 @@ export const REORG_MARGIN_BLOCKS = 128n;
 export const MAX_RETRY_LOGS = 16;
 type RetryLog = NonNullable<OperationRecord["retryLogs"]>[number];
 export const MIN_SWAP_REMAINING_SECONDS = 10;
-export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
+export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; blockHash: Hex; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
 export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string; blockNumber?: bigint; blockHash?: Hex }
 
 export class WalletChain {
@@ -42,7 +42,8 @@ export class WalletChain {
     const blocks = await Promise.all(this.clients.map(c => c.getBlock({ blockNumber: block })));
     const nonces = await Promise.all(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "getNonce", args: [wallet.account as Address, 0n], blockNumber: block })));
     const codes = await Promise.all(this.clients.map(c => c.getCode({ address: wallet.account as Address, blockNumber: block })));
-    if (blocks.some(b => !b.hash) || !same(blocks.map(b => b.hash)) || !same(blocks.map(b => b.timestamp)) || !same(blocks.map(b => b.baseFeePerGas)) || !same(nonces) || !same(codes)) throw new RpcDisagreementError("RPC nonce, account or fee state disagrees");
+    const blockHash = blocks[0].hash;
+    if (!blockHash || !same(blocks.map(b => b.hash)) || !same(blocks.map(b => b.timestamp)) || !same(blocks.map(b => b.baseFeePerGas)) || !same(nonces) || !same(codes)) throw new RpcDisagreementError("RPC nonce, account or fee state disagrees");
     const deployed = !!codes[0] && codes[0] !== "0x";
     if (deployed) {
       const owners = await Promise.all(this.clients.map(c => c.readContract({ address: wallet.account as Address, abi: accountAbi, functionName: "owner", blockNumber: block })));
@@ -51,13 +52,17 @@ export class WalletChain {
     }
     const base = blocks[0].baseFeePerGas;
     if (base === null || base === undefined) throw new WalletError("validation_failed", "Missing base fee");
-    return { nonce: nonces[0], deployed, block, timestamp: Number(blocks[0].timestamp), fees: { baseFeePerGas: base, maxFeePerGas: base * 2n + 1_000_000_000n, maxPriorityFeePerGas: 1_000_000_000n } };
+    return { nonce: nonces[0], deployed, block, blockHash, timestamp: Number(blocks[0].timestamp), fees: { baseFeePerGas: base, maxFeePerGas: base * 2n + 1_000_000_000n, maxPriorityFeePerGas: 1_000_000_000n } };
   }
   async canonicalBlockHash(blockNumber: bigint): Promise<Hex> {
     const hashes = await Promise.all(this.clients.map(c => c.getBlock({ blockNumber }).then(block => block.hash)));
     const [hash] = hashes;
     if (!hash || !same(hashes)) throw new RpcDisagreementError("RPC block hashes disagree");
     return hash;
+  }
+  /** A height-pinned read is usable only while the original block at that height is canonical. */
+  async assertCanonicalSnapshot({ block, blockHash }: ChainState): Promise<void> {
+    if (!same([blockHash, await this.canonicalBlockHash(block)])) throw new RpcDisagreementError("Chain snapshot changed during wallet authorization");
   }
 
   /** The account's next nonce on one EntryPoint key, agreed by every configured RPC at `block`. */
@@ -105,10 +110,10 @@ export class WalletChain {
     if (output.address === token.address) throw new WalletError("validation_failed", "Swap tokens must differ");
     return { ...base, tokenOut: output.address, minimumOut: exactAmount(String(args.minimum_out), output.decimals).toString() };
   }
-  async balances(wallet: WalletEnvelope, tokens: string[]): Promise<Spend> {
+  async balances(wallet: WalletEnvelope, tokens: string[], blockNumber?: bigint): Promise<Spend> {
     const result: Spend = {};
     await Promise.all([...new Set(tokens.map(t => t.toLowerCase()))].map(async token => {
-      const values = await Promise.all(this.clients.map(c => token === "native" ? c.getBalance({ address: wallet.account as Address }) : c.readContract({ address: token as Address, abi: erc20Abi, functionName: "balanceOf", args: [wallet.account as Address] })));
+      const values = await Promise.all(this.clients.map(c => token === "native" ? c.getBalance({ address: wallet.account as Address, blockNumber }) : c.readContract({ address: token as Address, abi: erc20Abi, functionName: "balanceOf", args: [wallet.account as Address], blockNumber })));
       if (!same(values)) throw new WalletError("validation_failed", "RPC balances disagree");
       result[token] = values[0].toString();
     }));
@@ -313,10 +318,13 @@ export class WalletChain {
       const canonical = await this.canonicalBlockHash(BigInt(blockNumber)).catch(() => undefined);
       return canonical !== undefined && canonical.toLowerCase() !== blockHash;
     };
-    const retry: RetryLog[] = [];
-    for (const log of record.retryLogs ?? []) {
-      const receipt = await this.verifiedReceipt(record, log.transactionHash as Hex).catch(() => undefined);
+    const saved = record.retryLogs ?? [];
+    for (const hash of new Set(saved.map(log => log.transactionHash as Hex))) {
+      const receipt = await this.verifiedReceipt(record, hash).catch(() => undefined);
       if (receipt) return receipt;
+    }
+    const retry: RetryLog[] = [];
+    for (const log of saved) {
       if (!await orphaned(log)) retry.push(log);
     }
     // Past MAX_RETRY_LOGS unresolved logs, the cursors wait instead, as a log that is never resolved cannot be dropped.
@@ -327,8 +335,15 @@ export class WalletChain {
       const last = from + (budget < SEARCH_CHUNK ? budget : SEARCH_CHUNK) - 1n;
       const to = last < head ? last : head;
       // A failed log query blocks the cursor, but other RPCs can still locate a receipt for all RPCs to verify.
-      const results = await Promise.allSettled(logClients.map(c => logsIn(from, to, range =>
+      const readLogs = (clients: PublicClient[]) => Promise.allSettled(clients.map(c => logsIn(from, to, range =>
         c.getLogs({ address: entryPoint, event: operationEvent, args: { userOpHash: record.userOpHash as Hex }, ...range }))));
+      let results = await readLogs(logClients);
+      if (results.every(result => result.status === "rejected") && logClients.length < this.clients.length) {
+        // An earlier failure may be range-specific. Try each excluded provider once before giving up on this range.
+        const excluded = this.clients.filter(client => !logClients.includes(client));
+        logClients = excluded;
+        results = await readLogs(excluded);
+      }
       logClients = logClients.filter((_, index) => results[index].status === "fulfilled");
       if (!logClients.length) {
         const failure = results.find(result => result.status === "rejected");
@@ -344,8 +359,10 @@ export class WalletChain {
         if (receipt) return receipt;
       }
       for (const { blockNumber, blockHash, transactionHash } of found) {
-        if (!transactionHash || retry.some(log => log.transactionHash === transactionHash.toLowerCase())) continue;
+        if (!transactionHash) continue;
         const log: RetryLog = { transactionHash: transactionHash.toLowerCase() as Hex, ...(blockNumber != null ? { blockNumber: blockNumber.toString() } : {}), ...(blockHash ? { blockHash: blockHash.toLowerCase() as Hex } : {}) };
+        // A bundle can land again after a reorg. Its earlier inclusion may be orphaned independently.
+        if (retry.some(saved => saved.transactionHash === log.transactionHash && saved.blockNumber === log.blockNumber && saved.blockHash === log.blockHash)) continue;
         if (await orphaned(log)) continue;
         if (retry.length < MAX_RETRY_LOGS) retry.push(log); else inconclusive = true;
       }

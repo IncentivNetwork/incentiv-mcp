@@ -13,7 +13,7 @@ import { RpcDisagreementError } from "./errors.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
 import { Journal, digest, holdsMainNonce, intentSchema, ownsNonce, signedReplacements, terminal, type Intent, type OperationRecord } from "./journal.js";
 import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, x402QuoteViolations, x402Violations, type Limits, type Spend } from "./policy.js";
-import { MIN_SWAP_REMAINING_SECONDS, REORG_MARGIN_BLOCKS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure } from "./chain.js";
+import { MIN_SWAP_REMAINING_SECONDS, REORG_MARGIN_BLOCKS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure, type ChainState } from "./chain.js";
 import { validateOperation } from "./validate.js";
 import { httpsTransport, sentNothing, type HttpResponse, type HttpTransport } from "../x402/http.js";
 import { incentivX402, parsePaymentRequired, paymentHeader, paymentNonceKey, selectRequirements, settlement, x402Config, X402_SCHEME, type PaymentRequirements, type SettleResponse } from "../x402/protocol.js";
@@ -69,11 +69,9 @@ export class WalletService {
     await this.canSubmit(s, r);
     const limits = await this.enabled(s), state = await this.chain.state(s.envelope);
     if (!r.operation || !r.userOpHash || state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "Operation nonce changed; reconcile before retrying");
-    // As at signing: an x402 settlement rolled back since then holds its reservation again before the balance is counted.
-    await this.reconcileX402Settlements(journal, true);
     const validated = validateOperation(this.ctx.config, s.envelope, r.intent, { ...r.operation, signature: "0x" }, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash, deadline: r.deadline });
     if (digest(validated.spend) !== digest(r.reservation)) throw new WalletError("wallet_recovery_required", "Operation reservation does not match the signed spend");
-    const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
+    const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state), used = journal.used();
     if (ownsNonce(r.status)) for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
     const policyInput = { ...this.registryPolicy(r.intent), token: r.intent.token, tokenOut: r.intent.tokenOut, amount: r.intent.amount, to: r.intent.to, swap: r.intent.kind === "swap", slippage: r.intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls };
     const permitted = () => {
@@ -96,18 +94,23 @@ export class WalletService {
       if (!(error instanceof WalletError) || error.code !== "simulation_failed") throw error;
       throw new WalletError(error.code, `${error.detail}. Signed request ${r.requestId} still holds the account nonce. If retrying later does not help, clear it with wallet operation resolve ${r.requestId} --replace${r.intent.gasToken === "native" ? "" : " --native-gas"} in your local terminal`);
     });
+    await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
     await this.canSubmit(s, r);
     if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", `Operation deadline is too close; reconcile, or review a same-nonce replacement with wallet operation resolve ${r.requestId} --replace in your local terminal`);
     // Policy and approval expiry may pass during the reads above, so they are checked again with nothing awaited before the broadcast.
     permitted();
   }
-  private async reconcileX402Settlements(journal: Journal, forSpending: boolean): Promise<void> {
+  private spendingBalances(journal: Journal, tokens: string[], state?: ChainState): Promise<Spend> {
+    return this.reconcileX402Settlements(journal, true, { tokens, state });
+  }
+
+  private async reconcileX402Settlements(journal: Journal, forSpending: boolean, spend?: { tokens: string[]; state?: ChainState }): Promise<Spend> {
     const recent = Date.now() - X402_RECONFIRM_MS;
     // A settlement past the reorg margin is marked final once, so it no longer needs the RPC on every wallet call.
     const settled = journal.data.records.filter(r => r.intent.kind === "x402_payment" && !r.settlementFinal
       && (r.settledBlock !== undefined || (r.consumedAt ?? 0) > recent)
       && r.nonce !== undefined && (r.status === "confirmed" || r.status === "reverted" || r.status === "superseded"));
-    if (!settled.length) return;
+    if (!settled.length && !spend) return {};
     const wallet = journal.session.envelope;
     // Reads can still show older, recorded settlements during an outage. Spending needs a fresh check because
     // a failing receipt or nonce read does not imply that balance reads and simulation are unavailable.
@@ -117,7 +120,8 @@ export class WalletService {
       rethrowX402RecheckError(error);
     });
     try {
-      const { block } = await read(this.chain.state(wallet));
+      const snapshot = spend?.state ?? await read(this.chain.state(wallet));
+      const { block } = snapshot;
       // The reads run in parallel, since this recheck precedes every spend and can run while a seller's payment
       // window is open; the journal is updated once they are all in. Each settlement block's hash is read once.
       const blockHashes = new Map<bigint, Promise<Hex>>();
@@ -134,6 +138,11 @@ export class WalletService {
         // A lagging RPC also shows the lane unused, or a head below the settlement; the payment is held either way.
         return { r, reopen: current === nonce || orphaned, final: settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS };
       }));
+      // Use the same height for balances and nonce reads. Discard the whole read if its block changed,
+      // before changing any reservation or marking a settlement final.
+      const balances = await (spend ? this.chain.balances(wallet, spend.tokens, block) : Promise.resolve({}))
+        .catch((error: unknown) => { throw rpcOutage(error); })
+        .finally(() => read(this.chain.assertCanonicalSnapshot(snapshot)));
       let finalized = false;
       for (const { r, reopen, final } of checks) {
         if (reopen) await this.reopenX402Settlement(journal, r);
@@ -141,8 +150,10 @@ export class WalletService {
         else if (final) { r.settlementFinal = true; r.sequence = ++journal.data.sequence; finalized = true; }
       }
       if (finalized) await journal.save();
+      return balances;
     } catch (error) {
       if (error !== outage) throw error;
+      return {};
     }
   }
 
@@ -322,7 +333,7 @@ export class WalletService {
       try {
         if (existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
         const state = await this.chain.state(s.envelope);
-        const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits));
+        const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state);
         const used = journal.used();
         // First policy evaluation precedes building; violations may build an unsigned review candidate.
         const initialSpend: Spend = {}; addSpend(initialSpend, intent.token, BigInt(intent.amount));
@@ -353,9 +364,7 @@ export class WalletService {
         if (fresh.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Gas fee no longer covers the current base fee");
         if (isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent, fresh);
         if (kind === "swap") await this.chain.verifySwap(s.envelope, intent, limits, fresh);
-        // An x402 settlement rolled back during simulation must hold its reservation again before the balance is counted.
-        await this.reconcileX402Settlements(journal, true);
-        const freshBalances = await this.chain.balances(s.envelope, this.balanceTokens(limits));
+        const freshBalances = await this.spendingBalances(journal, this.balanceTokens(limits), fresh);
         const finalViolations = policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used: journal.used(), balances: freshBalances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
         if (finalViolations.includes("exposure_limit") || (finalViolations.length && (!r.approval || r.approval.liveTest))) {
           r.reasons = finalViolations; delete r.approval; await journal.transition(r, "approval_required"); return result(r);
@@ -649,8 +658,8 @@ export class WalletService {
     // anything is journaled, so an agent retrying a refused purchase under new request IDs cannot fill the journal.
     // The unpaid request can take a while; a settlement rolled back meanwhile must hold its reservation again
     // before the balance is counted, or the restored funds would pay twice.
-    await this.reconcileX402Settlements(journal, true);
-    const [state, balances] = await Promise.all([this.chain.state(s.envelope), this.chain.balances(s.envelope, this.balanceTokens(limits))]);
+    const state = await this.chain.state(s.envelope).catch(rethrowX402RecheckError);
+    const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state);
     assertDeploysOnce(state.deployed, journal);
     const price: Spend = { [xcfg.usdc.toLowerCase()]: accepted.amount };
     const priced = policyViolations(limits, { token: xcfg.usdc.toLowerCase(), amount: accepted.amount, swap: false, slippage: 0, spend: price, used: journal.used(), balances, gasCost: 0n, fee: 0n, gasUnits: 0n, gasToken, gasCharge: 0n, calls: [], x402: { origin: req.origin, payTo } });
@@ -691,6 +700,7 @@ export class WalletService {
       if (!covers(balances, journal, validated.spend)) throw new WalletError("policy_denied", "Balance cannot cover the price plus the maximum gas payment beside other pending operations; nothing was paid");
       r.operation = wire; r.userOpHash = validated.hash; r.nonce = laneNonce.toString(); r.deadline = validUntil; r.reservation = validated.spend; r.fromBlock = state.block.toString();
       await this.chain.simulate(validated);
+      await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
       if (validUntil <= Math.floor(Date.now() / 1000) + 5) throw new WalletError("validation_failed", "The seller's payment window closed while the payment was prepared; retry with a new request ID");
       assertPolicyLive(limits, "it expired while the payment was prepared; nothing was paid");
       await this.canSubmit(s, r);
@@ -719,9 +729,7 @@ export class WalletService {
     if (state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "This payment's nonce lane has moved; check get_agent_operation");
     const validated = validateOperation(this.ctx.config, s.envelope, r.intent, { ...r.operation!, signature: "0x" }, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash! });
     if (digest(validated.spend) !== digest(r.reservation)) throw new WalletError("wallet_recovery_required", "Operation reservation does not match the signed spend");
-    // As when signing: a settlement rolled back since then holds its reservation again before the balance is counted.
-    await this.reconcileX402Settlements(journal, true);
-    const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
+    const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state), used = journal.used();
     for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
     const violations = policyViolations(limits, { token: r.intent.token, amount: r.intent.amount, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls, x402: { origin: r.intent.x402!.origin, payTo: r.intent.to! } });
     if (violations.length) throw new WalletError("policy_denied", `Local wallet policy no longer allows this payment: ${violations.join(", ")}; ${consequence}`);
@@ -732,6 +740,7 @@ export class WalletService {
       if (error instanceof WalletError && error.code === "simulation_failed") throw new WalletError(error.code, `${error.detail}; ${consequence}`);
       throw rpcOutage(error);
     });
+    if (!freshlySimulated) await this.chain.assertCanonicalSnapshot(state).catch(rethrowX402RecheckError);
   }
 
   /**
@@ -929,7 +938,7 @@ export class WalletService {
       if (isRegistryIntent(r.intent)) await this.chain.verifyRegistry(s.envelope, r.intent, state);
       if (r.intent.kind === "swap") await this.chain.verifySwap(s.envelope, r.intent, limits, state);
       if (liveTest) {
-        const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
+        const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state), used = journal.used();
         // An exact retry already owns this reservation; do not count it twice.
         if (ownsNonce(r.status)) for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
         const violations = policyViolations(limits, { ...this.registryPolicy(r.intent), token: r.intent.token, amount: r.intent.amount, to: r.intent.to, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
@@ -1055,7 +1064,7 @@ export class WalletService {
       const gasToken = replacement.gasToken ?? "native";
       if (gasToken !== "native" && validated.gasCharge.toString() !== replacement.gasCharge) throw new WalletError("validation_failed", "Replacement token gas payment changed");
       await this.replacementStep(r.requestId, gasToken, () => this.chain.simulate(validated));
-      await this.checkReplacementBalance(journal, r, gasToken, validated.gasCharge.toString());
+      await this.checkReplacementBalance(journal, r, gasToken, validated.gasCharge.toString(), state);
       await this.canSubmit(s);
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");
       replacement.operation.signature = await this.signRaw(s, validated.hash);
@@ -1068,9 +1077,8 @@ export class WalletService {
       return result(r);
     });
   }
-  private async checkReplacementBalance(journal: Journal, r: OperationRecord, gasToken: string, gasCharge: string) {
-    await this.reconcileX402Settlements(journal, true);
-    const balances = await this.chain.balances(journal.session.envelope, [gasToken]);
+  private async checkReplacementBalance(journal: Journal, r: OperationRecord, gasToken: string, gasCharge: string, state?: ChainState) {
+    const balances = await this.spendingBalances(journal, [gasToken], state);
     // The original and replacements share one nonce. Other lanes may still settle independently.
     if (!covers(balances, journal, { [gasToken]: gasCharge }, r)) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment beside other pending operations.${nativeGasHint(this.ctx.config, gasToken)}`);
   }

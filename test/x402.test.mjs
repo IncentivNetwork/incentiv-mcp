@@ -1994,3 +1994,107 @@ test("offer selection uses the wallet policy after the seller answers", async t 
   assert.equal(quote.price.pay_to, getAddress(recipient));
   assert.deepEqual(quote.policy, { allowed: true, reasons: [] });
 });
+
+test("x402 delivery refuses a snapshot that changes during its balance read", async t => {
+  const f = await x402Fixture(t), first = randomUUID(), second = randomUUID(), state = f.chain.state;
+  const oldBlock = `0x${"77".repeat(32)}`, replacementBlock = `0x${"88".repeat(32)}`;
+  let blockHash = oldBlock;
+  f.chain.state = async (...params) => ({ ...(await state(...params)), deployed: true, blockHash });
+  f.chain.canonicalBlockHash = async () => blockHash;
+  f.chain.assertCanonicalSnapshot = snapshot => WalletChain.prototype.assertCanonicalSnapshot.call(f.chain, snapshot);
+  const usdcBefore = "160000";
+  let usdcBalance = usdcBefore;
+  let nativeBalance = "1000000";
+  f.chain.balances = async (_wallet, tokens) => Object.fromEntries(tokens.map(token => [
+    token, token === "native" ? nativeBalance : token.toLowerCase() === usdc ? usdcBalance : "0",
+  ]));
+  await f.service.payX402({ url: URL_, max_amount: "0.05", gas_token: "native", request_id: first });
+  const [earlier] = await f.records();
+  const firstGas = BigInt(earlier.reservation.native);
+  const tx = `0x${"ab".repeat(32)}`;
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: tx, blockNumber: 1n, blockHash });
+  assert.equal((await f.service.operation(first)).status, "confirmed");
+  f.setReceipt(undefined);
+  // Before the reorg the remaining native balance can cover the second payment by itself.
+  nativeBalance = firstGas.toString();
+  usdcBalance = "110000";
+  const balances = f.chain.balances;
+  const heights = [];
+  f.chain.balances = async (wallet, tokens, blockNumber) => {
+    heights.push(blockNumber);
+    if (heights.length === 2) {
+      // Delivery reads balances after reading settlement evidence. Here it sees the new fork's balance.
+      f.unsettle();
+      usdcBalance = usdcBefore;
+      nativeBalance = (firstGas + 1n).toString();
+      blockHash = replacementBlock;
+    }
+    return balances(wallet, tokens);
+  };
+  const purchase = { url: URL_, max_amount: "0.05", gas_token: "native", request_id: second };
+  await assert.rejects(f.service.payX402(purchase), { code: "rpc_unavailable" });
+  assert.deepEqual(heights, [1n, 1n]);
+  assert.equal(f.seen.payments.length, 1);
+  const records = await f.records();
+  assert.equal(records[0].status, "confirmed", "a mixed snapshot cannot mutate the earlier payment");
+  assert.equal(records[1].status, "signed", "the second payment remains available for retry");
+  await assert.rejects(f.service.payX402(purchase), { code: "policy_denied" });
+  assert.equal((await f.service.operation(first)).status, "submitted");
+  assert.equal(f.seen.payments.length, 1);
+});
+
+test("receipt search keeps the new inclusion when the same transaction's earlier block is orphaned", async () => {
+  const chain = new WalletChain(new Ctx(MAINNET));
+  const head = 20_000n, old = 5_498n, canonical = 5_502n;
+  const hash = n => `0x${n.repeat(64)}`;
+  const tx = hash("a"), oldHash = hash("b"), canonicalHash = hash("c");
+  const record = { intent: { kind: "x402_payment" }, userOpHash: hash("1"), nonce: "0", fromBlock: "500", operation: { sender: seller } };
+  let oldHeaderAvailable = false, receiptAvailable = false;
+  const client = stale => ({
+    getBlockNumber: async () => head,
+    readContract: async () => 1n,
+    getBlock: async ({ blockNumber }) => {
+      if (blockNumber === old && !oldHeaderAvailable) throw new Error("old header temporarily unavailable");
+      return { hash: blockNumber === old ? hash("d") : canonicalHash };
+    },
+    getLogs: async ({ fromBlock, toBlock }) => [
+      ...(stale && !oldHeaderAvailable && fromBlock <= old && old <= toBlock ? [{ transactionHash: tx, blockNumber: old, blockHash: oldHash }] : []),
+      ...(fromBlock <= canonical && canonical <= toBlock ? [{ transactionHash: tx, blockNumber: canonical, blockHash: canonicalHash }] : []),
+    ],
+  });
+  chain.clients = [client(true), client(false)];
+  const receipt = { success: true, blockNumber: canonical, blockHash: canonicalHash, transactionHash: tx };
+  chain.verifiedReceipt = async (_record, candidate) => receiptAvailable && candidate === tx ? receipt : undefined;
+  assert.equal(await chain.searchOperation(record), undefined);
+  assert.equal(record.retryLogs.length, 2);
+  assert.ok(BigInt(record.searchedBlock) >= canonical);
+  oldHeaderAvailable = true;
+  assert.equal(await chain.searchOperation(record), undefined);
+  assert.deepEqual(record.retryLogs, [{ transactionHash: tx, blockNumber: canonical.toString(), blockHash: canonicalHash }]);
+  receiptAvailable = true;
+  assert.deepEqual(await chain.searchOperation(record), receipt);
+});
+
+test("receipt discovery falls back to an excluded RPC for the failing range", async () => {
+  const chain = new WalletChain(new Ctx(MAINNET));
+  const head = 20_000n, at = 6_000n;
+  const hash = n => `0x${n.repeat(64)}`;
+  const tx = hash("a"), blockHash = hash("b");
+  const record = { intent: { kind: "x402_payment" }, userOpHash: hash("1"), nonce: "0", fromBlock: "500", operation: { sender: seller } };
+  const reads = [];
+  const client = (name, refuse) => ({
+    getBlockNumber: async () => head,
+    readContract: async () => 1n,
+    getLogs: async ({ fromBlock, toBlock }) => {
+      reads.push([name, fromBlock]);
+      if (refuse(fromBlock)) throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 });
+      return fromBlock <= at && at <= toBlock ? [{ transactionHash: tx, blockNumber: at, blockHash }] : [];
+    },
+  });
+  chain.clients = [client("A", from => from < 5500n), client("B", from => from >= 5500n)];
+  const receipt = { success: true, blockNumber: at, blockHash, transactionHash: tx };
+  chain.verifiedReceipt = async (_record, candidate) => candidate === tx ? receipt : undefined;
+  assert.deepEqual(await chain.searchOperation(record), receipt);
+  assert.deepEqual(reads, [["A", 500n], ["B", 500n], ["B", 5500n], ["A", 5500n]]);
+  assert.equal(record.searchedBlock, undefined, "partial coverage cannot advance the verified cursor");
+});
