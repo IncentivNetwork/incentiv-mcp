@@ -561,6 +561,22 @@ test("discovery uses the same compatibility checks as live payment requirements"
   assert.equal(found.resources[0].listed_price, "0.001 USDC");
 });
 
+test("discovery bounds oversized pages and only forwards valid pagination metadata", async () => {
+  const urls = [`${URL_}/one`, `${URL_}/two`, `${URL_}/three`];
+  const items = urls.map(resource => ({ resource, accepts: [requirements] }));
+  const response = (body, truncated = false) => async () => ({ status: 200, headers: {}, body: Buffer.from(JSON.stringify(body)), truncated });
+  const clipped = await discoverResources(MAINNET, response({ items, pagination: { total: 7 } }), { limit: 2 });
+  assert.deepEqual(clipped.resources.map(r => r.url), urls.slice(0, 2));
+  assert.equal(clipped.total, 7);
+  assert.equal(clipped.partial_results, true);
+
+  const malformed = await discoverResources(MAINNET, response({ resources: items, pagination: { total: { count: 7 } }, partialResults: "false" }), { query: "weather" });
+  assert.equal(malformed.resources.length, 3);
+  assert.equal(malformed.total, undefined);
+  assert.equal(malformed.partial_results, undefined);
+  await assert.rejects(discoverResources(MAINNET, response({ items }, true), {}), { code: "x402_discovery_unavailable" });
+});
+
 test("the transport connects directly even when Node's environment proxy is on", async () => {
   const seen = [];
   const proxy = createServer(socket => socket.once("data", data => { seen.push(data.toString().split("\r\n")[0]); socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n"); }));

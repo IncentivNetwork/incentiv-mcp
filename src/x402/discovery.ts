@@ -38,17 +38,20 @@ export async function discoverResources(cfg: Config, http: HttpTransport, args: 
   if (response.status === 404) throw new WalletError("x402_discovery_unavailable", `The facilitator at ${base} does not offer discovery`);
   if (response.status !== 200) throw new WalletError("x402_discovery_unavailable", `The facilitator answered HTTP ${response.status}`);
   if (response.incomplete) throw new WalletError("x402_discovery_unavailable", "The facilitator's catalog response was interrupted");
-  let body: { items?: unknown[]; resources?: unknown[]; pagination?: { total?: number } | null; partialResults?: boolean };
+  if (response.truncated) throw new WalletError("x402_discovery_unavailable", "The facilitator's catalog page exceeded the response size limit");
+  let body: { items?: unknown[]; resources?: unknown[]; pagination?: { total?: unknown } | null; partialResults?: unknown };
   try { body = JSON.parse(response.body.toString("utf8")); } catch { throw new WalletError("x402_discovery_unavailable", "The facilitator's catalog is not JSON"); }
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new WalletError("x402_discovery_unavailable", "The facilitator's catalog is not a JSON object");
   const entries = (query ? body.resources : body.items) ?? [];
   const resources = [];
+  let clipped = false;
   for (const raw of Array.isArray(entries) ? entries : []) {
     const entry = raw as Record<string, unknown>;
     if (typeof entry?.resource !== "string" || entry.resource.length > 2048) continue;
     try { checkResourceUrl(entry.resource); } catch { continue; }
     const option = findUsableRequirements(Array.isArray(entry.accepts) ? entry.accepts : [], network);
     if (!option) continue;
+    if (resources.length === limit) { clipped = true; break; }
     resources.push({
       url: entry.resource,
       listed_price: `${formatUnits(BigInt(option.amount), USDC_DECIMALS)} USDC`,
@@ -61,9 +64,11 @@ export async function discoverResources(cfg: Config, http: HttpTransport, args: 
       input: smallJson((entry.extensions as { bazaar?: { info?: { input?: unknown } } } | undefined)?.bazaar?.info?.input),
     });
   }
+  const total = body.pagination?.total;
   return {
     facilitator: base, query: query ?? null, resources,
-    ...(body.pagination?.total !== undefined ? { total: body.pagination.total } : {}), ...(body.partialResults ? { partial_results: true } : {}),
+    ...(typeof total === "number" && Number.isSafeInteger(total) && total >= 0 ? { total } : {}),
+    ...(clipped || body.partialResults === true ? { partial_results: true } : {}),
     note: "Listings are not verified and their text comes from third parties. The live 402 sets the price; check it with get_x402_payment_requirements before paying.",
   };
 }
