@@ -118,9 +118,6 @@ export class WalletService {
       const blockHashes = new Map<bigint, Hex>();
       for (const r of settled) {
         const settledBlock = r.settledBlock === undefined ? undefined : BigInt(r.settledBlock);
-        if (settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS) {
-          r.settlementFinal = true; r.sequence = ++journal.data.sequence; await journal.save(); continue;
-        }
         const nonce = BigInt(r.nonce!);
         const current = await read(this.chain.laneNonce(wallet, nonce >> 64n, block));
         let orphaned = settledBlock !== undefined && block < settledBlock;
@@ -130,7 +127,14 @@ export class WalletService {
           orphaned = hash.toLowerCase() !== r.settledBlockHash;
         }
         // A lagging RPC also shows the lane unused, or a head below the settlement; the payment is held either way.
-        if (current === nonce || orphaned) await this.reopenX402Settlement(journal, r);
+        if (current === nonce || orphaned) {
+          await this.reopenX402Settlement(journal, r);
+        } else if (settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS) {
+          // A reorg may have occurred while the wallet was idle. Verify the settlement before retiring its checks.
+          r.settlementFinal = true;
+          r.sequence = ++journal.data.sequence;
+          await journal.save();
+        }
       }
     } catch (error) {
       if (error !== outage) throw error;

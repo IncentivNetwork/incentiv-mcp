@@ -726,7 +726,8 @@ test("a rolled-back x402 cancellation restores the original and replacement rese
 
 test("reconciliation detects a different operation winning the same x402 lane after a reorg", async t => {
   const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
-  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true, block: 100n });
+  let head = 100n;
+  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true, block: head });
   const payment = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   const review = await f.service.reviewReplacement(id, true);
   await f.service.replace(id, password, digest(review.records[0]));
@@ -739,6 +740,8 @@ test("reconciliation detects a different operation winning the same x402 lane af
   f.chain.canonicalBlockHash = async () => cancelled.blockHash;
   assert.equal((await f.service.operation(id)).status, "superseded");
 
+  // The reorg happened while the wallet was idle. A later head does not make the old receipt canonical.
+  head += 128n;
   f.chain.receipt = async record => record.userOpHash === payment.user_op_hash ? paid : undefined;
   f.chain.canonicalBlockHash = async () => paid.blockHash;
   const reconciled = await f.service.operation(id);
@@ -1320,8 +1323,11 @@ test("a recent confirmation with an unreadable lane blocks new spend until the l
   await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() }), { code: "rpc_unavailable" });
   assert.equal(f.seen.payments.length, 1);
   head = 226n;
-  assert.equal((await f.service.operation(id)).status, "confirmed");
+  await assert.rejects(f.service.operation(id), { code: "rpc_unavailable" });
+  assert.equal((await f.records())[0].settlementFinal, undefined);
   f.chain.laneNonce = laneNonce;
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  assert.equal((await f.records())[0].settlementFinal, true);
 });
 
 test("retrying an archived request ID reports how it ended: a payment that never reached the seller is not called paid", async t => {
