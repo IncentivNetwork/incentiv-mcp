@@ -178,9 +178,13 @@ export class WalletService {
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
       try {
         const searched = searchProgress(r);
-        // A failed lookup of the original must not hide a mined cancellation: the two are looked up independently.
-        let lookupError: unknown;
-        const receipt = await this.chain.receipt(r).catch((error: unknown) => { if (error instanceof WalletError) throw error; lookupError = error; return undefined; });
+        // Search each signed candidate independently. Report lookup failures only if none yields a receipt.
+        let lookupFailure: { error: unknown } | undefined;
+        const findReceipt = (record: OperationRecord) => this.chain.receipt(record).catch((error: unknown) => {
+          if (!lookupFailure || error instanceof WalletError) lookupFailure = { error };
+          return undefined;
+        });
+        const receipt = await findReceipt(r);
         // Search progress is kept, so a payment settled long ago is reached over several reconciliations.
         if (!receipt && searchProgress(r) !== searched) { r.sequence = ++journal.data.sequence; await journal.save(); }
         let superseded = false;
@@ -188,7 +192,7 @@ export class WalletService {
         for (const candidate of receipt ? [] : signedReplacements(r)) {
           // A replacement has its own search start and progress: the payment's say nothing about it.
           const lookup: OperationRecord = { ...r, operation: candidate.operation, userOpHash: candidate.userOpHash, replacement: candidate, transactionHash: undefined, fromBlock: candidate.fromBlock ?? r.fromBlock, searchedBlock: candidate.searchedBlock, discoveredBlock: candidate.discoveredBlock, retryLogs: candidate.retryLogs };
-          const replaced = await this.chain.receipt(lookup);
+          const replaced = await findReceipt(lookup);
           if (!replaced && searchProgress(lookup) !== searchProgress(candidate)) {
             for (const key of ["searchedBlock", "discoveredBlock", "retryLogs"] as const) {
               if (lookup[key] === undefined) delete candidate[key]; else Object.assign(candidate, { [key]: lookup[key] });
@@ -206,7 +210,7 @@ export class WalletService {
           await journal.transition(r, "superseded"); superseded = true; break;
         }
         if (superseded) continue;
-        if (lookupError) throw lookupError;
+        if (lookupFailure) throw lookupFailure.error;
         // For an x402 payment, submitted means the seller reported its settlement; keep that until the receipt shows.
         const settledBySeller = r.intent.kind === "x402_payment" && r.status === "submitted";
         if (!receipt) { if (r.status === "submitted" && !settledBySeller) await journal.transition(r, "submission_unknown"); continue; }
@@ -485,7 +489,7 @@ export class WalletService {
   async x402Requirements(args: Record<string, unknown>) {
     const req = x402Request(args);
     // The request goes out from this computer and the endpoint may act on it, so x402 must be on and the site allowed.
-    const { pending, limits } = await this.store.session(async s => {
+    const { pending } = await this.store.session(async s => {
       await s.assertOwned();
       const policy = s.envelope.policy;
       if (!policy.configured) throw new WalletError("policy_not_configured", "Run incentiv-mcp setup in your local terminal; nothing was sent");
@@ -496,7 +500,7 @@ export class WalletService {
       // Start the request while the policy is still locked. Release the wallet before waiting on the seller.
       const pending = this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: 30_000 })
         .then(response => ({ response }), (error: unknown) => ({ error }));
-      return { pending, limits: policy.limits };
+      return { pending };
     });
     const result = await pending;
     if ("error" in result) throw result.error;
@@ -505,16 +509,18 @@ export class WalletService {
     if (response.status !== 402) return { url: req.url, ...unpaidHttpFailure(response) };
     const required = parsePaymentRequired(response);
     let accepted: PaymentRequirements | undefined, unsupported: string | undefined;
-    // The cheapest option local policy allows, so a cheaper one to a recipient it refuses does not hide it.
-    const usdc = x402Config(this.ctx.config).usdc;
-    try { accepted = selectRequirements(required, this.ctx.config, o => !x402QuoteViolations(limits, usdc, req.origin, o.payTo, o.amount).length); }
+    try { accepted = selectRequirements(required, this.ctx.config); }
     catch (error) { if (!(error instanceof WalletError)) throw error; unsupported = error.detail; }
-    // Whether local policy would allow it, read without unlocking the key. Balance and gas are checked when paying.
+    // Select and assess the offer under the same policy, which may have changed while the seller was answering.
     const reasons = accepted ? await this.store.session(async s => {
       const policy = s.envelope.policy;
       if (!policy.configured) return ["policy_not_configured"];
-      const reasons = x402QuoteViolations(policy.limits, x402Config(this.ctx.config).usdc, req.origin, accepted.payTo, accepted.amount);
-      return !policy.enabled || await s.disabled() ? ["wallet_disabled", ...reasons] : reasons;
+      const disabled = !policy.enabled || await s.disabled();
+      const usdc = x402Config(this.ctx.config).usdc;
+      const violations = (o: PaymentRequirements) => x402QuoteViolations(policy.limits, usdc, req.origin, o.payTo, o.amount);
+      accepted = selectRequirements(required, this.ctx.config, o => !violations(o).length);
+      const reasons = violations(accepted);
+      return disabled ? ["wallet_disabled", ...reasons] : reasons;
     }).catch(() => ["wallet_unavailable"]) : undefined;
     return {
       url: req.url, payment_required: true, payable: !!accepted, ...(unsupported ? { unsupported } : {}),
@@ -1049,10 +1055,7 @@ export class WalletService {
       const gasToken = replacement.gasToken ?? "native";
       if (gasToken !== "native" && validated.gasCharge.toString() !== replacement.gasCharge) throw new WalletError("validation_failed", "Replacement token gas payment changed");
       await this.replacementStep(r.requestId, gasToken, () => this.chain.simulate(validated));
-      const balances = await this.chain.balances(s.envelope, [gasToken]);
-      // The original and replacement share one nonce. Other lanes may still settle independently.
-      const replacementSpend = { [gasToken]: validated.gasCharge.toString() };
-      if (!covers(balances, journal, replacementSpend, r)) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment beside other pending operations.${nativeGasHint(this.ctx.config, gasToken)}`);
+      await this.checkReplacementBalance(journal, r, gasToken, validated.gasCharge.toString());
       await this.canSubmit(s);
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");
       replacement.operation.signature = await this.signRaw(s, validated.hash);
@@ -1065,18 +1068,37 @@ export class WalletService {
       return result(r);
     });
   }
+  private async checkReplacementBalance(journal: Journal, r: OperationRecord, gasToken: string, gasCharge: string) {
+    await this.reconcileX402Settlements(journal, true);
+    const balances = await this.chain.balances(journal.session.envelope, [gasToken]);
+    // The original and replacements share one nonce. Other lanes may still settle independently.
+    if (!covers(balances, journal, { [gasToken]: gasCharge }, r)) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment beside other pending operations.${nativeGasHint(this.ctx.config, gasToken)}`);
+  }
   private async submitReplacement(s: WalletSession, journal: Journal, r: OperationRecord) {
     await this.canSubmit(s);
     // The latest signed replacement; while a native one reviewed over a token-paid one is unsigned, that earlier one.
     const signed = r.replacement?.signed ? r.replacement : r.priorReplacement;
     if (!signed || r.status !== "superseding") throw new WalletError("wallet_recovery_required", "Missing signed replacement");
     r.attempts++; r.sequence = ++journal.data.sequence; await journal.save();
+    let refusal: { error: unknown } | undefined;
     try {
-      const hash = await this.chain.relay(signed.operation, () => this.canSubmit(s));
+      const hash = await this.chain.relay(signed.operation, async () => {
+        try {
+          await this.checkReplacementBalance(journal, r, signed.gasToken ?? "native", signed.gasCharge ?? signed.maxGasCost);
+          await this.canSubmit(s);
+        } catch (error) {
+          refusal = { error: rpcOutage(error) };
+          throw error;
+        }
+      });
       if (hash !== signed.userOpHash) throw new Error();
       delete r.lastError;
-    } catch { r.lastError = "submission_unknown"; }
+    } catch {
+      if (!refusal) r.lastError = "submission_unknown";
+      else r.attempts--;
+    }
     r.sequence = ++journal.data.sequence; await journal.save();
+    if (refusal) throw refusal.error;
   }
 }
 const httpSucceeded = (status: number) => status >= 200 && status < 300;

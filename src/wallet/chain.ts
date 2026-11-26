@@ -321,6 +321,7 @@ export class WalletChain {
     }
     // Past MAX_RETRY_LOGS unresolved logs, the cursors wait instead, as a log that is never resolved cannot be dropped.
     let progressBlocked = false, inconclusive = false;
+    let failedChunk: { reason: unknown } | undefined;
     let logClients = this.clients;
     for (let from = start, budget = SEARCH_PER_PASS; from <= head && budget > 0n;) {
       const last = from + (budget < SEARCH_CHUNK ? budget : SEARCH_CHUNK) - 1n;
@@ -331,7 +332,8 @@ export class WalletChain {
       logClients = logClients.filter((_, index) => results[index].status === "fulfilled");
       if (!logClients.length) {
         const failure = results.find(result => result.status === "rejected");
-        throw failure?.reason ?? new Error("No RPC could search EntryPoint logs");
+        failedChunk = { reason: failure?.reason ?? new Error("No RPC could search EntryPoint logs") };
+        break;
       }
       if (logClients.length !== this.clients.length) progressBlocked = true;
       const found = results.flatMap(result => result.status === "fulfilled" ? result.value : []);
@@ -359,7 +361,9 @@ export class WalletChain {
       if (progressBlocked && discovered !== undefined && discovered >= from) from = discovered + 1n;
     }
     if (record.discoveredBlock !== undefined && record.searchedBlock !== undefined && BigInt(record.searchedBlock) >= BigInt(record.discoveredBlock)) delete record.discoveredBlock;
+    // The caller can save the cursors even after a failure, so keep every candidate they advanced past.
     if (retry.length) record.retryLogs = retry; else delete record.retryLogs;
+    if (failedChunk) throw failedChunk.reason;
   }
   /** The operation's outcome in one bundle transaction, agreed by every configured RPC; undefined until 2 blocks deep. */
   async verifiedReceipt(record: OperationRecord, transactionHash: Hex): Promise<ChainReceipt | undefined> {

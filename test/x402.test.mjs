@@ -1904,3 +1904,93 @@ test("a payment record keeps the URL without its query values, while the seller 
   assert.equal((await f.records())[0].intent.x402.url, `${URL_}?city=[redacted]&api_key=[redacted]`);
   assert.ok(urls.every(url => url === `${URL_}?city=Kyiv&api_key=secret`));
 });
+
+test("a failed log chunk preserves earlier receipt candidates with the search cursor", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const [payment] = await f.records();
+  const nonce = BigInt(payment.nonce), sender = payment.operation.sender, userOpHash = payment.userOpHash;
+  const at = 1000n, tx = `0x${"ee".repeat(32)}`, blockHash = `0x${"77".repeat(32)}`;
+  const event = parseAbiItem("event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)");
+  const log = { address: entryPoint, topics: encodeEventTopics({ abi: [event], eventName: "UserOperationEvent", args: { userOpHash, sender, paymaster } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [nonce, true, 1234n, 1n]) };
+  let recovering = false;
+  const ranges = [];
+  const client = () => ({
+    getBlockNumber: async () => 20_000n,
+    readContract: async () => nonce + 1n,
+    getBlock: async () => ({ hash: blockHash }),
+    getLogs: async ({ fromBlock, toBlock }) => {
+      ranges.push(fromBlock);
+      if (fromBlock > at && !recovering) throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 });
+      return fromBlock <= at && at <= toBlock ? [{ transactionHash: tx, blockNumber: at, blockHash }] : [];
+    },
+    getTransactionReceipt: async ({ hash }) => {
+      if (hash !== tx || !recovering) throw new Error("receipt temporarily unavailable");
+      return { status: "success", blockHash, blockNumber: at, transactionHash: tx, logs: [log] };
+    },
+  });
+  f.chain.clients = [client(), client()];
+  f.chain.receipt = WalletChain.prototype.receipt.bind(f.chain);
+  f.chain.bundlerHint = async () => undefined;
+  assert.equal((await f.service.operation(id)).status, "submitted");
+  const [saved] = await f.records();
+  assert.equal(saved.searchedBlock, "5000");
+  assert.equal(saved.retryLogs[0].transactionHash, tx);
+  recovering = true;
+  ranges.length = 0;
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  assert.deepEqual(ranges, []);
+  assert.equal((await f.used())[usdc], "80000");
+});
+
+test("a cancellation rechecks x402 reservations before signing and relaying", async t => {
+  for (const reorgAt of ["simulation", "relay"]) {
+    const f = await x402Fixture(t), first = randomUUID(), second = randomUUID(), state = f.chain.state;
+    f.chain.state = async (...params) => ({ ...(await state(...params)), deployed: true });
+    await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: first, gas_token: "native" });
+    const firstGas = BigInt((await f.records())[0].reservation.native);
+    await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+    assert.equal((await f.service.operation(first)).status, "confirmed");
+    f.setReceipt(undefined);
+    await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: second });
+    const [review] = (await f.service.reviewReplacement(second, true)).records;
+    const gas = BigInt(review.replacement.maxGasCost), balances = f.chain.balances;
+    let native = gas;
+    f.chain.balances = async (...params) => ({ ...await balances(...params), native: native.toString() });
+    const reorg = () => { f.unsettle(); native = gas + 1n; };
+    const relay = f.chain.relay;
+    if (reorgAt === "simulation") f.chain.simulate = async () => reorg();
+    else f.chain.relay = async (...params) => { reorg(); return relay(...params); };
+
+    await assert.rejects(f.service.replace(second, password, digest(review)), { code: "policy_denied" }, reorgAt);
+    assert.equal(f.submissions.length, 0, reorgAt);
+    assert.equal((await f.service.operation(first)).status, "submitted", reorgAt);
+    const [, target] = await f.records();
+    assert.equal(target.replacement.signed, reorgAt === "relay");
+    assert.equal(target.attempts, review.attempts, reorgAt);
+    assert.equal(target.lastError, review.lastError, reorgAt);
+    assert.equal((await f.service.get()).pending_reservations.native, (firstGas + (reorgAt === "relay" ? gas : 0n)).toString());
+
+    if (reorgAt === "relay") {
+      native = firstGas + gas;
+      f.chain.relay = relay;
+      assert.equal((await f.service.resolve(second, password)).status, "superseding");
+      assert.equal(f.submissions[0].signature, target.replacement.operation.signature);
+    }
+  }
+});
+
+test("offer selection uses the wallet policy after the seller answers", async t => {
+  const f = await x402Fixture(t);
+  f.service.http = async req => {
+    await f.store.session(async s => {
+      const policy = s.envelope.policy;
+      const x402 = { ...policy.limits.x402, payTo: { mode: "allowlist", addresses: [recipient] } };
+      await s.savePolicy({ ...policy, limits: { ...policy.limits, x402 } });
+    });
+    return { status: 402, headers: { "payment-required": encodePaymentRequiredHeader({ x402Version: 2, resource: { url: req.url }, accepts: [{ ...requirements, amount: "20000" }, { ...requirements, amount: "50000", payTo: recipient }] }) }, body: Buffer.from("{}"), truncated: false };
+  };
+  const quote = await f.service.x402Requirements({ url: URL_ });
+  assert.equal(quote.price.pay_to, getAddress(recipient));
+  assert.deepEqual(quote.policy, { allowed: true, reasons: [] });
+});
