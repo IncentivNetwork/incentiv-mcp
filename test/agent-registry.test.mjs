@@ -12,7 +12,7 @@ import { intentSchema, Journal, digest, ownsNonce } from "../src/wallet/journal.
 import { validateOperation } from "../src/wallet/validate.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { limitsSchema, policyViolations } from "../src/wallet/policy.ts";
-import { isTransportFailure, WalletChain } from "../src/wallet/chain.ts";
+import { isTransportFailure, replacementFees, WalletChain } from "../src/wallet/chain.ts";
 import { Ctx } from "../src/context.ts";
 import { computeUserOpHash, encodeExecuteBatch, userOpToJson } from "../src/userop.ts";
 import { args as transfer, fixture, limits, password, unsigned } from "../scripts/wallet-pipeline-fixture.mjs";
@@ -1352,9 +1352,16 @@ test("a token-paid replacement the bundler keeps refusing can be replaced once m
     };
     const native = (await f.service.reviewReplacement(id, true)).records[0];
     assert.equal(native.priorReplacement.userOpHash, token.replacement.userOpHash);
+    // A resend while the native one awaits signing sends the signed token-paid bytes, never the unsigned ones.
+    const resent = [];
+    f.chain.relay = async (operation, beforeSubmit) => { await beforeSubmit?.(); resent.push(operation); throw new Error("paymaster: insufficient token payment"); };
+    assert.equal((await f.service.resolve(id, password)).status, "superseding");
+    const [held] = await f.store.session(async s => (await Journal.open(s)).data.records);
+    assert.deepEqual(resent, [held.priorReplacement.operation]);
+    assert.notEqual(held.priorReplacement.operation.signature, "0x");
     await assert.rejects(f.service.reviewReplacement(id), e => e.code === "operation_pending" && /--native-gas/.test(e.message));
     f.chain.relay = relay;
-    const sent = await f.service.replace(id, password, digest(native));
+    const sent = await f.service.replace(id, password, digest(held));
     assert.equal(sent.status, "superseding"); assert.equal(sent.prior_replacement_user_op_hash, token.replacement.userOpHash);
     // Every signed operation keeps its reservation until a receipt shows which one won.
     await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "273", native: native.replacement.maxGasCost }));
@@ -1402,4 +1409,37 @@ test("a receipt lookup error for the native replacement preserves its progress a
     assert.equal(record.priorReplacement.searchedBlock, undefined);
     assert.deepEqual(record.consumed, { [f.token]: "150" });
   });
+});
+
+test("a native replacement is priced above every operation signed at its nonce", () => {
+  const current = { baseFeePerGas: 1n, maxFeePerGas: 10n, maxPriorityFeePerGas: 1n };
+  const op = (maxFeePerGas, maxPriorityFeePerGas) => userOpToJson({ sender: `0x${"11".repeat(20)}`, nonce: 0n, callData: "0x", callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas, maxPriorityFeePerGas, signature: "0x" });
+  const original = { operation: op(100n, 10n) };
+  assert.deepEqual(replacementFees(current, original), { ...current, maxFeePerGas: 121n, maxPriorityFeePerGas: 13n });
+  // The token-paid replacement outbid the original; the native one must outbid it too, signed or kept as prior.
+  const token = { operation: op(121n, 13n), signed: true };
+  for (const record of [{ ...original, replacement: token }, { ...original, priorReplacement: token, replacement: { operation: op(1n, 1n), signed: false } }]) {
+    assert.deepEqual(replacementFees(current, record), { ...current, maxFeePerGas: 146n, maxPriorityFeePerGas: 16n });
+  }
+  // Current fees above the bump are kept.
+  assert.deepEqual(replacementFees({ ...current, maxFeePerGas: 500n, maxPriorityFeePerGas: 50n }, { ...original, replacement: token }), { ...current, maxFeePerGas: 500n, maxPriorityFeePerGas: 50n });
+});
+
+test("only a token-paid replacement can be followed by a native one", async t => {
+  const f = await tokenRegistryFixture(t), id = randomUUID(), balances = f.chain.balances;
+  await f.service.send("link_agent", { request_id: id, approval: f.approval, gas_token: "USDC" });
+  f.chain.balances = async (...a) => ({ ...await balances(...a), native: "1000000" });
+  f.chain.buildReplacement = (wallet, _original, state) => {
+    const built = unsigned(wallet, { to: wallet.account, amount: "0" }, state);
+    built.op.maxFeePerGas = 2n; built.op.maxPriorityFeePerGas = 2n;
+    built.userOpHash = computeUserOpHash(built.op, MAINNET.identity.entryPoint.address, 24101);
+    return built;
+  };
+  const native = (await f.service.reviewReplacement(id, true)).records[0];
+  assert.equal(native.replacement.gasToken, undefined);
+  assert.equal((await f.service.replace(id, password, digest(native))).status, "superseding");
+  // A signed native replacement leaves nothing a second native one could fix, so no follower is offered.
+  await assert.rejects(f.service.reviewReplacement(id, true), e => e.code === "operation_pending" && !/--native-gas/.test(e.message));
+  const [record] = await f.store.session(async s => (await Journal.open(s)).data.records);
+  assert.equal(record.priorReplacement, undefined);
 });
