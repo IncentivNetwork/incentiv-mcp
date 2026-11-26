@@ -23,6 +23,9 @@ export const SWAP_DEADLINE_SECONDS = 60;
 // One reconciliation searches at most SEARCH_PER_PASS blocks while it holds the wallet lock; saved progress continues it.
 const SEARCH_CHUNK = 5_000n, SEARCH_BLOCKS = 1_000_000n, SEARCH_PER_PASS = 100_000n;
 export const REORG_MARGIN_BLOCKS = 128n;
+/** How many unresolved EntryPoint logs one operation's receipt search keeps for retry. */
+export const MAX_RETRY_LOGS = 16;
+type RetryLog = NonNullable<OperationRecord["retryLogs"]>[number];
 export const MIN_SWAP_REMAINING_SECONDS = 10;
 export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
 export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex; registryError?: string; blockNumber?: bigint; blockHash?: Hex }
@@ -303,6 +306,20 @@ export class WalletChain {
     const discovered = record.discoveredBlock !== undefined ? BigInt(record.discoveredBlock) : undefined;
     // Progress stops short of the head, so a reorg cannot hide an event in blocks already searched.
     const settled = head > REORG_MARGIN_BLOCKS ? head - REORG_MARGIN_BLOCKS : 0n;
+    // A log that could not yet be verified or ruled out, say because its block header was unavailable, is kept and
+    // tried first on every pass, so neither cursor has to wait for it. One known orphaned is dropped.
+    const orphaned = async ({ blockNumber, blockHash }: RetryLog) => {
+      if (!blockHash || blockNumber === undefined) return false;
+      const canonical = await this.canonicalBlockHash(BigInt(blockNumber)).catch(() => undefined);
+      return canonical !== undefined && canonical.toLowerCase() !== blockHash;
+    };
+    const retry: RetryLog[] = [];
+    for (const log of record.retryLogs ?? []) {
+      const receipt = await this.verifiedReceipt(record, log.transactionHash as Hex).catch(() => undefined);
+      if (receipt) return receipt;
+      if (!await orphaned(log)) retry.push(log);
+    }
+    // Past MAX_RETRY_LOGS unresolved logs, the cursors wait instead, as a log that is never resolved cannot be dropped.
     let progressBlocked = false, inconclusive = false;
     let logClients = this.clients;
     for (let from = start, budget = SEARCH_PER_PASS; from <= head && budget > 0n;) {
@@ -318,25 +335,21 @@ export class WalletChain {
       }
       if (logClients.length !== this.clients.length) progressBlocked = true;
       const found = results.flatMap(result => result.status === "fulfilled" ? result.value : []);
-      // Try each distinct transaction. An inconclusive log must be revisited, but it cannot hide a receipt
-      // in a later range of this pass. A log from a known orphaned block can be skipped on future passes.
+      // Try each distinct transaction: an unresolved log cannot hide a receipt in a later range of this pass.
       const candidates = [...new Set(found.flatMap(log => log.transactionHash ? [log.transactionHash.toLowerCase() as Hex] : []))];
       for (const hash of candidates) {
         const receipt = await this.verifiedReceipt(record, hash).catch(() => undefined);
         if (receipt) return receipt;
       }
-      if (!inconclusive && candidates.length) {
-        const orphaned = await Promise.all(found.map(async ({ blockNumber, blockHash, transactionHash }) => {
-          if (!transactionHash) return true;
-          if (!blockHash || blockNumber == null) return false;
-          const canonical = await this.canonicalBlockHash(blockNumber).catch(() => undefined);
-          return canonical !== undefined && canonical.toLowerCase() !== blockHash.toLowerCase();
-        }));
-        inconclusive = !orphaned.every(Boolean);
+      for (const { blockNumber, blockHash, transactionHash } of found) {
+        if (!transactionHash || retry.some(log => log.transactionHash === transactionHash.toLowerCase())) continue;
+        const log: RetryLog = { transactionHash: transactionHash.toLowerCase() as Hex, ...(blockNumber != null ? { blockNumber: blockNumber.toString() } : {}), ...(blockHash ? { blockHash: blockHash.toLowerCase() as Hex } : {}) };
+        if (await orphaned(log)) continue;
+        if (retry.length < MAX_RETRY_LOGS) retry.push(log); else inconclusive = true;
       }
       budget -= to - from + 1n;
       from = to + 1n;
-      // Neither cursor passes an inconclusive log, so the next pass reaches it again.
+      // Neither cursor passes a log that could not be kept for retry, so the next pass reaches it again.
       if (inconclusive) continue;
       const covered = to < settled ? to : settled;
       if (covered < start) continue;
@@ -346,6 +359,7 @@ export class WalletChain {
       if (progressBlocked && discovered !== undefined && discovered >= from) from = discovered + 1n;
     }
     if (record.discoveredBlock !== undefined && record.searchedBlock !== undefined && BigInt(record.searchedBlock) >= BigInt(record.discoveredBlock)) delete record.discoveredBlock;
+    if (retry.length) record.retryLogs = retry; else delete record.retryLogs;
   }
   /** The operation's outcome in one bundle transaction, agreed by every configured RPC; undefined until 2 blocks deep. */
   async verifiedReceipt(record: OperationRecord, transactionHash: Hex): Promise<ChainReceipt | undefined> {

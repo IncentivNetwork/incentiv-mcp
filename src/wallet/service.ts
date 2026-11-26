@@ -17,7 +17,7 @@ import { MIN_SWAP_REMAINING_SECONDS, REORG_MARGIN_BLOCKS, SWAP_DEADLINE_SECONDS,
 import { validateOperation } from "./validate.js";
 import { httpsTransport, sentNothing, type HttpResponse, type HttpTransport } from "../x402/http.js";
 import { incentivX402, parsePaymentRequired, paymentHeader, paymentNonceKey, selectRequirements, settlement, x402Config, X402_SCHEME, type PaymentRequirements, type SettleResponse } from "../x402/protocol.js";
-import { MAX_RESPONSE_BYTES, responseContent, usdcAmount, USDC_DECIMALS, x402Request, type X402Request } from "../x402/request.js";
+import { MAX_RESPONSE_BYTES, recordedUrl, responseContent, usdcAmount, USDC_DECIMALS, x402Request, type X402Request } from "../x402/request.js";
 
 // Source-controlled local candidate signing, explicitly authorized for acceptance testing.
 // Every request still needs the authenticated wallet policy and all transaction checks.
@@ -69,6 +69,8 @@ export class WalletService {
     await this.canSubmit(s, r);
     const limits = await this.enabled(s), state = await this.chain.state(s.envelope);
     if (!r.operation || !r.userOpHash || state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "Operation nonce changed; reconcile before retrying");
+    // As at signing: an x402 settlement rolled back since then holds its reservation again before the balance is counted.
+    await this.reconcileX402Settlements(journal, true);
     const validated = validateOperation(this.ctx.config, s.envelope, r.intent, { ...r.operation, signature: "0x" }, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash, deadline: r.deadline });
     if (digest(validated.spend) !== digest(r.reservation)) throw new WalletError("wallet_recovery_required", "Operation reservation does not match the signed spend");
     const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
@@ -116,27 +118,29 @@ export class WalletService {
     });
     try {
       const { block } = await read(this.chain.state(wallet));
-      const blockHashes = new Map<bigint, Hex>();
-      for (const r of settled) {
+      // The reads run in parallel, since this recheck precedes every spend and can run while a seller's payment
+      // window is open; the journal is updated once they are all in. Each settlement block's hash is read once.
+      const blockHashes = new Map<bigint, Promise<Hex>>();
+      const blockHash = (n: bigint) => { let hash = blockHashes.get(n); if (!hash) blockHashes.set(n, hash = read(this.chain.canonicalBlockHash(n))); return hash; };
+      const checks = await Promise.all(settled.map(async r => {
         const settledBlock = r.settledBlock === undefined ? undefined : BigInt(r.settledBlock);
         const nonce = BigInt(r.nonce!);
-        const current = await read(this.chain.laneNonce(wallet, nonce >> 64n, block));
-        let orphaned = settledBlock !== undefined && block < settledBlock;
-        if (!orphaned && settledBlock !== undefined && r.settledBlockHash) {
-          const hash = blockHashes.get(settledBlock) ?? await read(this.chain.canonicalBlockHash(settledBlock));
-          blockHashes.set(settledBlock, hash);
-          orphaned = hash.toLowerCase() !== r.settledBlockHash;
-        }
+        const behind = settledBlock !== undefined && block < settledBlock;
+        const [current, hash] = await Promise.all([
+          read(this.chain.laneNonce(wallet, nonce >> 64n, block)),
+          !behind && settledBlock !== undefined && r.settledBlockHash ? blockHash(settledBlock) : undefined,
+        ]);
+        const orphaned = behind || (hash !== undefined && hash.toLowerCase() !== r.settledBlockHash);
         // A lagging RPC also shows the lane unused, or a head below the settlement; the payment is held either way.
-        if (current === nonce || orphaned) {
-          await this.reopenX402Settlement(journal, r);
-        } else if (settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS) {
-          // A reorg may have occurred while the wallet was idle. Verify the settlement before retiring its checks.
-          r.settlementFinal = true;
-          r.sequence = ++journal.data.sequence;
-          await journal.save();
-        }
+        return { r, reopen: current === nonce || orphaned, final: settledBlock !== undefined && block >= settledBlock + REORG_MARGIN_BLOCKS };
+      }));
+      let finalized = false;
+      for (const { r, reopen, final } of checks) {
+        if (reopen) await this.reopenX402Settlement(journal, r);
+        // A reorg may have occurred while the wallet was idle. The settlement was verified above before its checks retire.
+        else if (final) { r.settlementFinal = true; r.sequence = ++journal.data.sequence; finalized = true; }
       }
+      if (finalized) await journal.save();
     } catch (error) {
       if (error !== outage) throw error;
     }
@@ -151,7 +155,8 @@ export class WalletService {
     delete r.settlementFinal;
     delete r.searchedBlock;
     delete r.discoveredBlock;
-    for (const replacement of [r.replacement, r.priorReplacement]) if (replacement) { delete replacement.searchedBlock; delete replacement.discoveredBlock; }
+    delete r.retryLogs;
+    for (const replacement of [r.replacement, r.priorReplacement]) if (replacement) { delete replacement.searchedBlock; delete replacement.discoveredBlock; delete replacement.retryLogs; }
     const confirmed = r.status === "confirmed";
     r.lastError = confirmed ? "x402_confirmation_rolled_back" : "x402_settlement_rolled_back";
     const status = signedReplacements(r).length ? "superseding" : confirmed ? "submitted" : "submission_unknown";
@@ -172,21 +177,22 @@ export class WalletService {
       if (r.status === "signed" || !ownsNonce(r.status)) continue;
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
       try {
-        const searched = [r.searchedBlock, r.discoveredBlock].join();
+        const searched = searchProgress(r);
         // A failed lookup of the original must not hide a mined cancellation: the two are looked up independently.
         let lookupError: unknown;
         const receipt = await this.chain.receipt(r).catch((error: unknown) => { if (error instanceof WalletError) throw error; lookupError = error; return undefined; });
         // Search progress is kept, so a payment settled long ago is reached over several reconciliations.
-        if (!receipt && [r.searchedBlock, r.discoveredBlock].join() !== searched) { r.sequence = ++journal.data.sequence; await journal.save(); }
+        if (!receipt && searchProgress(r) !== searched) { r.sequence = ++journal.data.sequence; await journal.save(); }
         let superseded = false;
         // Each signed replacement is looked up, including a token-paid one a native replacement was reviewed over.
         for (const candidate of receipt ? [] : signedReplacements(r)) {
           // A replacement has its own search start and progress: the payment's say nothing about it.
-          const lookup = { ...r, operation: candidate.operation, userOpHash: candidate.userOpHash, replacement: candidate, transactionHash: undefined, fromBlock: candidate.fromBlock ?? r.fromBlock, searchedBlock: candidate.searchedBlock, discoveredBlock: candidate.discoveredBlock };
+          const lookup: OperationRecord = { ...r, operation: candidate.operation, userOpHash: candidate.userOpHash, replacement: candidate, transactionHash: undefined, fromBlock: candidate.fromBlock ?? r.fromBlock, searchedBlock: candidate.searchedBlock, discoveredBlock: candidate.discoveredBlock, retryLogs: candidate.retryLogs };
           const replaced = await this.chain.receipt(lookup);
-          if (!replaced && (lookup.searchedBlock !== candidate.searchedBlock || lookup.discoveredBlock !== candidate.discoveredBlock)) {
-            candidate.searchedBlock = lookup.searchedBlock; candidate.discoveredBlock = lookup.discoveredBlock;
-            if (lookup.discoveredBlock === undefined) delete candidate.discoveredBlock;
+          if (!replaced && searchProgress(lookup) !== searchProgress(candidate)) {
+            for (const key of ["searchedBlock", "discoveredBlock", "retryLogs"] as const) {
+              if (lookup[key] === undefined) delete candidate[key]; else Object.assign(candidate, { [key]: lookup[key] });
+            }
             r.sequence = ++journal.data.sequence; await journal.save();
           }
           if (!replaced) continue;
@@ -343,6 +349,8 @@ export class WalletService {
         if (fresh.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Gas fee no longer covers the current base fee");
         if (isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent, fresh);
         if (kind === "swap") await this.chain.verifySwap(s.envelope, intent, limits, fresh);
+        // An x402 settlement rolled back during simulation must hold its reservation again before the balance is counted.
+        await this.reconcileX402Settlements(journal, true);
         const freshBalances = await this.chain.balances(s.envelope, this.balanceTokens(limits));
         const finalViolations = policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used: journal.used(), balances: freshBalances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
         if (finalViolations.includes("exposure_limit") || (finalViolations.length && (!r.approval || r.approval.liveTest))) {
@@ -477,7 +485,7 @@ export class WalletService {
   async x402Requirements(args: Record<string, unknown>) {
     const req = x402Request(args);
     // The request goes out from this computer and the endpoint may act on it, so x402 must be on and the site allowed.
-    const { pending } = await this.store.session(async s => {
+    const { pending, limits } = await this.store.session(async s => {
       await s.assertOwned();
       const policy = s.envelope.policy;
       if (!policy.configured) throw new WalletError("policy_not_configured", "Run incentiv-mcp setup in your local terminal; nothing was sent");
@@ -488,7 +496,7 @@ export class WalletService {
       // Start the request while the policy is still locked. Release the wallet before waiting on the seller.
       const pending = this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: 30_000 })
         .then(response => ({ response }), (error: unknown) => ({ error }));
-      return { pending };
+      return { pending, limits: policy.limits };
     });
     const result = await pending;
     if ("error" in result) throw result.error;
@@ -497,7 +505,9 @@ export class WalletService {
     if (response.status !== 402) return { url: req.url, ...unpaidHttpFailure(response) };
     const required = parsePaymentRequired(response);
     let accepted: PaymentRequirements | undefined, unsupported: string | undefined;
-    try { accepted = selectRequirements(required, this.ctx.config); }
+    // The cheapest option local policy allows, so a cheaper one to a recipient it refuses does not hide it.
+    const usdc = x402Config(this.ctx.config).usdc;
+    try { accepted = selectRequirements(required, this.ctx.config, o => !x402QuoteViolations(limits, usdc, req.origin, o.payTo, o.amount).length); }
     catch (error) { if (!(error instanceof WalletError)) throw error; unsupported = error.detail; }
     // Whether local policy would allow it, read without unlocking the key. Balance and gas are checked when paying.
     const reasons = accepted ? await this.store.session(async s => {
@@ -580,17 +590,18 @@ export class WalletService {
       if (probe.outcome === "not_required") return { request_id: requestId, status: "not_required", content_delivered: false, next_action: "This POST was already sent under this request ID and needed no payment; its answer was returned then. This wallet does not send it again: use a new request ID to send it again." };
       if (probe.outcome === "sending") throw new WalletError("x402_request_uncertain", "This POST may already have reached the resource under this request ID, which may have acted on it. Nothing was paid. This wallet does not send it again: use a new request ID to send it again.");
     }
-    const bind = async (outcome: "sending" | "payment_required" | "not_required" | undefined, at = Date.now()) => {
+    const bind = async (outcome: "sending" | "payment_required" | "not_required" | undefined, at = Date.now(), bound: string = request) => {
       if (replayable(req)) return;
       journal.data.probes = (journal.data.probes ?? []).filter(p => p.requestId !== requestId);
       // A binding that may guard an acted-on POST is never dropped, so their number is capped instead.
       if (outcome === "sending" && journal.data.probes.length >= MAX_PROBES) throw new WalletError("policy_denied", `This wallet already keeps ${MAX_PROBES} unpaid POST requests bound to their request IDs, so it sends no more without an Idempotency-Key header the seller honours; nothing was sent or paid. The user can clear old bindings with incentiv-mcp wallet x402 clear-bindings in their own terminal`);
-      if (outcome) journal.data.probes.push({ requestId, request, outcome, at });
+      if (outcome) journal.data.probes.push({ requestId, request: bound, outcome, at });
       await journal.save();
     };
     assertPolicyLive(limits, "nothing was sent or paid");
     await bind("sending");
-    const restoreProbe = () => bind(probe?.outcome, probe?.at);
+    // The earlier binding comes back as it was, its own request included.
+    const restoreProbe = () => bind(probe?.outcome, probe?.at, probe?.request);
     // An unpaid request can still have side effects. Check again after the durable POST binding.
     try {
       await s.assertOwned();
@@ -621,7 +632,8 @@ export class WalletService {
     // effect, so the binding stays uncertain if it is not one.
     const required = parsePaymentRequired(unpaid);
     await bind("payment_required");
-    const accepted = selectRequirements(required, cfg);
+    // The cheapest option within max_amount that local policy allows; failing that, the cheapest, whose refusal says why.
+    const accepted = selectRequirements(required, cfg, o => BigInt(o.amount) <= maxAmount && !x402QuoteViolations(limits, xcfg.usdc, req.origin, o.payTo, o.amount).length);
     const amount = BigInt(accepted.amount);
     if (amount > maxAmount) throw new WalletError("x402_price_above_max", `The resource asks ${formatUnits(amount, USDC_DECIMALS)} USDC, above max_amount ${formatUnits(maxAmount, USDC_DECIMALS)}; nothing was paid`);
     const payTo = getAddress(accepted.payTo).toLowerCase();
@@ -644,7 +656,7 @@ export class WalletService {
     // The seller chooses the size of its terms; terms too large to journal are its error, not this wallet's.
     const parsed = intentSchema.safeParse({
       intentSchemaVersion: 1, kind: "x402_payment", token: xcfg.usdc.toLowerCase(), amount: accepted.amount, gasToken, to: payTo, slippageBps: 0, feeTier: 3000,
-      x402: { url: req.url, origin: req.origin, method: req.method, request, maxAmount: maxAmount.toString(), accepted: JSON.stringify(accepted), ...(required.resource ? { resource: JSON.stringify(required.resource) } : {}), paymentId, validUntil },
+      x402: { url: recordedUrl(req.url), origin: req.origin, method: req.method, request, maxAmount: maxAmount.toString(), accepted: JSON.stringify(accepted), ...(required.resource ? { resource: JSON.stringify(required.resource) } : {}), paymentId, validUntil },
     });
     if (!parsed.success) throw new WalletError("x402_invalid_response", "The resource's payment terms or URL are too large to record; nothing was paid");
     const intent = parsed.data;
@@ -730,7 +742,7 @@ export class WalletService {
     // seller could still submit the payment, so sending it again would be a send under no current policy.
     if ((await this.chain.stateFor(s.envelope, r)).nonce === BigInt(r.nonce!)) {
       if (r.status === "confirmed") await this.reopenX402Settlement(journal, r);
-      return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The RPC no longer shows this payment's settlement: the chain reorganized, or the RPC is behind" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid.` };
+      return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The RPC no longer shows this payment's settlement: the chain reorganized, or the RPC is behind" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid. ${X402_UNKNOWN_ACTION(r.requestId)}` };
     }
     if (replayable(req)) {
       // Asking again sends a request from this computer, so it needs current policy like any other x402 request.
@@ -1085,6 +1097,8 @@ function unpaidHttpFailure(response: HttpResponse) {
  * spend keeps its original time instead of counting against the daily limit for another day.
  */
 const sameSettlement = (r: OperationRecord, blockHash: Hex | undefined) => r.consumedAt !== undefined && blockHash !== undefined && blockHash === r.settledBlockHash;
+/** A receipt search's saved progress, compared to see whether a pass moved it. */
+const searchProgress = (x: Pick<OperationRecord, "searchedBlock" | "discoveredBlock" | "retryLogs">) => JSON.stringify([x.searchedBlock, x.discoveredBlock, x.retryLogs]);
 /** A failed read, or configured RPCs that disagree (one lagging behind, say): neither says anything about the wallet. */
 const rpcFault = (error: unknown) => !(error instanceof WalletError) || error instanceof RpcDisagreementError;
 /**

@@ -42,15 +42,22 @@ for (const [net, prefix] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10]
 // IPv6 is allowed only in global unicast (2000::/3), less documentation, 6to4 and Teredo, which embed other addresses.
 const v6Global = new BlockList(); v6Global.addSubnet("2000::", 3, "ipv6");
 const v6 = new BlockList();
-for (const [net, prefix] of [["2001::", 32], ["2001:db8::", 32], ["2002::", 16], ["2001:10::", 28], ["2001:20::", 28]] as const) v6.addSubnet(net, prefix, "ipv6");
+for (const [net, prefix] of [["2001::", 32], ["2001:db8::", 32], ["2002::", 16], ["2001:10::", 28], ["2001:20::", 28], ["3fff::", 20]] as const) v6.addSubnet(net, prefix, "ipv6");
 
 /** Whether an IP address is one this server may connect to on the user's behalf. */
 export function isPublicAddress(address: string): boolean {
   const family = isIP(address);
   if (family === 4) return !v4.check(address, "ipv4");
   if (family !== 6) return false;
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
-  if (mapped) return isPublicAddress(mapped[1]);
+  // An IPv4-mapped address is judged as its IPv4 address, in whatever notation it is written (::ffff:8.8.8.8,
+  // ::ffff:808:808 or fully expanded): the URL parser writes every form the same way.
+  let canonical: string;
+  try { canonical = new URL(`http://[${address}]`).hostname.slice(1, -1); } catch { return false; }
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(canonical);
+  if (mapped) {
+    const [high, low] = [parseInt(mapped[1], 16), parseInt(mapped[2], 16)];
+    return isPublicAddress([high >> 8, high & 255, low >> 8, low & 255].join("."));
+  }
   return v6Global.check(address, "ipv6") && !v6.check(address, "ipv6");
 }
 

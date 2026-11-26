@@ -53,7 +53,12 @@ export function parsePaymentRequired(response: HttpResponse): PaymentRequired {
 }
 
 /** The cheapest option this wallet can pay, shared by catalog discovery and live quotes. */
-export function findUsableRequirements(accepts: unknown[], { usdc, entryPoint }: Pick<ReturnType<typeof x402Config>, "usdc" | "entryPoint">) {
+export function findUsableRequirements(accepts: unknown[], network: Pick<ReturnType<typeof x402Config>, "usdc" | "entryPoint">) {
+  return usableRequirements(accepts, network)[0];
+}
+
+/** Every option this wallet can pay, cheapest first; options at the same price keep the seller's order. */
+export function usableRequirements(accepts: unknown[], { usdc, entryPoint }: Pick<ReturnType<typeof x402Config>, "usdc" | "entryPoint">): PaymentRequirements[] {
   const usable = accepts.filter((candidate): candidate is PaymentRequirements => {
     const r = candidate as Partial<PaymentRequirements> | null | undefined;
     return !!r && r.scheme === X402_SCHEME && r.network === X402_NETWORK
@@ -64,13 +69,17 @@ export function findUsableRequirements(accepts: unknown[], { usdc, entryPoint }:
       && r.maxTimeoutSeconds >= X402_MIN_TIMEOUT_SECONDS && r.maxTimeoutSeconds <= X402_MAX_TIMEOUT_SECONDS
       && typeof r.extra?.entryPoint === "string" && r.extra.entryPoint.toLowerCase() === entryPoint.toLowerCase();
   });
-  // Every usable option is USDC on this network, so they differ only in price; the first listed wins a tie.
-  return usable.reduce<PaymentRequirements | undefined>((best, r) => !best || BigInt(r.amount) < BigInt(best.amount) ? r : best, undefined);
+  // Every usable option is USDC on this network, so they differ in price and recipient. The sort is stable.
+  return usable.sort((a, b) => BigInt(a.amount) < BigInt(b.amount) ? -1 : BigInt(a.amount) > BigInt(b.amount) ? 1 : 0);
 }
 
-/** A payable live option, or a reason why the requested payment is unsupported. */
-export function selectRequirements(required: PaymentRequired, cfg: Config): PaymentRequirements {
-  const usable = findUsableRequirements(required.accepts, x402Config(cfg));
+/**
+ * A payable live option, or a reason why the requested payment is unsupported: the cheapest one `allowed` accepts,
+ * such as one local policy lets this wallet pay, or else the cheapest, so a refusal can name its reasons.
+ */
+export function selectRequirements(required: PaymentRequired, cfg: Config, allowed: (option: PaymentRequirements) => boolean = () => true): PaymentRequirements {
+  const options = usableRequirements(required.accepts, x402Config(cfg));
+  const usable = options.find(allowed) ?? options[0];
   if (!usable) {
     const short = required.accepts.find(r => r && r.scheme === X402_SCHEME && r.network === X402_NETWORK && Number.isInteger(r.maxTimeoutSeconds) && r.maxTimeoutSeconds < X402_MIN_TIMEOUT_SECONDS);
     if (short) throw new WalletError("x402_unsupported", `The resource allows only ${short.maxTimeoutSeconds} seconds to pay, too short to prepare and send a payment (this wallet needs at least ${X402_MIN_TIMEOUT_SECONDS}); nothing was paid`);

@@ -15,6 +15,7 @@ import { BundlerUnavailableError, computeUserOpHash, encodeExecuteBatch, userOpF
 import { Journal, digest, intentSchema } from "../src/wallet/journal.ts";
 import { limitsSchema, policyViolations, x402Violations } from "../src/wallet/policy.ts";
 import { checkHeaders, checkResourceUrl, isPublicAddress } from "../src/x402/http.ts";
+import { NOT_SENT } from "../src/x402/http.ts";
 import { parsePaymentRequired, paymentNonceKey, selectRequirements, x402Config, X402_NETWORK, X402_SCHEME } from "../src/x402/protocol.ts";
 import { facilitatorUrl } from "../src/x402/discovery.ts";
 import { usdcAmount, x402Request } from "../src/x402/request.ts";
@@ -178,6 +179,8 @@ test("pays a resource within policy: the signed payment is exactly the quoted on
   const early = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   assert.equal(early.status, "submitted"); assert.equal(early.content_delivered, false);
   assert.match(early.next_action, /not on chain yet/);
+  // A seller that reports success and never submits leaves the payment reserved; the result says how to cancel it.
+  assert.match(early.next_action, new RegExp(`wallet operation resolve ${id} --replace`));
   assert.equal(f.seen.payments.length, 1);
   const lane = f.chain.laneNonce;
   f.chain.laneNonce = async (...a) => (await lane(...a)) + 1n;
@@ -1358,10 +1361,10 @@ test("the receipt search reads every RPC, tries each distinct transaction, and n
   const narrow = client([{ transactionHash: tx }], 100n);
   assert.deepEqual(await chain(narrow).searchOperation({ ...record }), expected);
   assert.ok(narrow.ranges.some(([from, to]) => to - from <= 100n && from <= at && at <= to));
-  // A log that no RPC can verify keeps the search where it was, rather than moving past it.
+  // A log that no RPC can verify, from a block not known to be orphaned, is kept for retry while the search moves on.
   const unverified = { ...record };
   assert.equal(await chain(client([{ transactionHash: stale }])).searchOperation(unverified), undefined);
-  assert.equal(unverified.searchedBlock, undefined);
+  assert.equal(unverified.searchedBlock, "872"); assert.deepEqual(unverified.retryLogs, [{ transactionHash: stale }]);
   // A stale earlier chunk cannot mask a canonical receipt in a later chunk of the same pass.
   const later = 6990n, head = 8000n;
   const first = client([{ transactionHash: stale }], undefined, at, head);
@@ -1802,4 +1805,102 @@ test("an unpaid error body is screened as seller error text in both x402 request
   await handlers.get_x402_payment_requirements({ url: URL_ });
   await handlers.pay_x402_resource({ url: URL_, max_amount: "0.05", request_id: randomUUID() });
   assert.deepEqual(screened, [["text"], ["text"]]);
+});
+
+test("a transfer does not use funds an x402 settlement rolled back during its simulation still reserves", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+  f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true });
+  let native = "1000000";
+  f.chain.balances = async (_wallet, list) => Object.fromEntries(list.map(token => [token.toLowerCase(), token === "native" ? native : token.toLowerCase() === usdc ? "5000000" : "0"]));
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id, gas_token: "native" });
+  const reserved = BigInt((await f.records())[0].reservation.native);
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  // What one transfer reserves, from an identical request that only prepares.
+  await f.service.send("transfer", args(randomUUID()), true);
+  const transfer = BigInt((await f.records()).at(-1).reservation.native);
+  assert.ok(reserved > 1n);
+  // The balance covers the transfer exactly. The reorg during simulation adds back only the payment's actual gas,
+  // while the reopened payment reserves its maximum again.
+  native = transfer.toString();
+  const simulate = f.chain.simulate;
+  let reorged = false;
+  f.chain.simulate = async (...a) => { if (!reorged) { reorged = true; f.unsettle(); native = (transfer + 1n).toString(); } return simulate(...a); };
+  await assert.rejects(f.service.send("transfer", args(randomUUID())), e => e.code === "policy_denied" && /Balance changed before signing/.test(e.message));
+  assert.equal(f.submissions.length, 0, "the transfer was neither signed nor relayed");
+  assert.equal((await f.service.operation(id)).status, "submitted");
+});
+
+test("an unresolvable old log does not keep the receipt search from a later verifiable receipt", async () => {
+  const event = parseAbiItem("event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)");
+  const sender = "0x30a343d137ed0492d9d7ad25fc55590d807629b3", userOpHash = `0x${"77".repeat(32)}`, nonce = (5n << 64n) | 3n;
+  const tx = `0x${"aa".repeat(32)}`, stale = `0x${"bb".repeat(32)}`, blockHash = `0x${"cc".repeat(32)}`, at = 151_000n, old = 990n, head = 300_000n;
+  const log = { address: entryPoint, topics: encodeEventTopics({ abi: [event], eventName: "UserOperationEvent", args: { userOpHash, sender, paymaster } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [nonce, true, 1234n, 1n]) };
+  const client = () => ({
+    getBlockNumber: async () => head,
+    // The old candidate's block header stays unavailable, so it can be neither verified nor ruled out.
+    getBlock: async ({ blockNumber }) => { if (blockNumber === old) throw new Error("header not found"); return { hash: blockHash }; },
+    readContract: async () => nonce + 1n,
+    getLogs: async ({ fromBlock, toBlock }) => [
+      ...(fromBlock <= old && old <= toBlock ? [{ transactionHash: stale, blockNumber: old, blockHash: `0x${"dd".repeat(32)}` }] : []),
+      ...(fromBlock <= at && at <= toBlock ? [{ transactionHash: tx, blockNumber: at, blockHash }] : []),
+    ],
+    getTransactionReceipt: async ({ hash }) => { if (hash !== tx) throw new Error("transaction not found"); return { status: "success", blockHash, blockNumber: at, transactionHash: tx, logs: [log] }; },
+  });
+  const chain = new WalletChain(new Ctx(MAINNET));
+  chain.clients = [client(), client()];
+  chain.bundlerHint = async () => undefined;
+  const record = { requestId: randomUUID(), intent: { kind: "x402_payment" }, userOpHash, nonce: nonce.toString(), fromBlock: "500", operation: { sender, paymaster } };
+  assert.equal(await chain.searchOperation(record), undefined);
+  // The old candidate is kept for retry, and the search moves past it.
+  assert.equal(record.searchedBlock, "100499");
+  assert.deepEqual(record.retryLogs, [{ transactionHash: stale, blockNumber: "990", blockHash: `0x${"dd".repeat(32)}` }]);
+  assert.deepEqual(await chain.searchOperation({ ...record }), { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: at, blockHash });
+});
+
+test("the cheapest offer local policy allows is chosen over a cheaper one to a recipient it refuses", async t => {
+  const f = await x402Fixture(t, { policy: { ...x402Policy, payTo: { mode: "allowlist", addresses: [seller] } } }), http = f.service.http;
+  const accepts = [{ ...requirements, amount: "20000", payTo: recipient }, { ...requirements, amount: "50000" }];
+  f.service.http = async req => req.headers?.["payment-signature"] ? http(req)
+    : { status: 402, headers: { "payment-required": encodePaymentRequiredHeader({ x402Version: 2, resource: { url: req.url }, accepts }) }, body: Buffer.from("{}"), truncated: false };
+  const quote = await f.service.x402Requirements({ url: URL_ });
+  assert.equal(quote.price.amount_atomic, "50000"); assert.equal(quote.price.pay_to, getAddress(seller)); assert.equal(quote.policy.allowed, true);
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: randomUUID() })).status, "submitted");
+  assert.equal(f.seen.payments[0].accepted.payTo, seller);
+  // With no offer policy allows, the cheapest is reported with its reasons.
+  const refusing = await x402Fixture(t, { policy: { ...x402Policy, payTo: { mode: "allowlist", addresses: [paymaster] } } });
+  refusing.service.http = f.service.http;
+  const refused = await refusing.service.x402Requirements({ url: URL_ });
+  assert.equal(refused.price.amount_atomic, "20000"); assert.deepEqual(refused.policy.reasons, ["x402_pay_to_not_allowed"]);
+});
+
+test("IPv4-mapped addresses are judged as their IPv4 address in every notation, and the 3fff::/20 documentation prefix is not public", () => {
+  for (const address of ["::ffff:8.8.8.8", "::ffff:808:808", "0:0:0:0:0:ffff:808:808"]) assert.equal(isPublicAddress(address), true, address);
+  for (const address of ["::ffff:10.0.0.1", "::ffff:a00:1", "::ffff:7f00:1", "3fff::1", "3fff:fff::1"]) assert.equal(isPublicAddress(address), false, address);
+  assert.equal(isPublicAddress("2606:4700::1"), true);
+});
+
+test("a POST binding restored after a request that was never sent keeps its own request", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  let price = "60000", unreachable = false;
+  f.service.http = async req => {
+    if (unreachable) throw Object.defineProperty(new Error("connect failed"), NOT_SENT, { value: true });
+    return { status: 402, headers: { "payment-required": encodePaymentRequiredHeader({ x402Version: 2, resource: { url: req.url }, accepts: [{ ...requirements, amount: price }] }) }, body: Buffer.from("{}"), truncated: false };
+  };
+  const post = { url: URL_, method: "POST", body: "{}", request_id: id };
+  await assert.rejects(f.service.payX402({ ...post, max_amount: "0.05" }), { code: "x402_price_above_max" });
+  const probes = () => f.store.session(async s => (await Journal.open(s)).data.probes);
+  const [before] = await probes();
+  unreachable = true;
+  await assert.rejects(f.service.payX402({ ...post, max_amount: "0.10" }), { code: "x402_request_failed" });
+  assert.deepEqual(await probes(), [before]);
+});
+
+test("a payment record keeps the URL without its query values, while the seller gets the full request", async t => {
+  const f = await x402Fixture(t), urls = [], http = f.service.http;
+  f.service.http = async req => { urls.push(req.url); return http(req); };
+  const paid = await f.service.payX402({ url: `${URL_}?city=Kyiv&api_key=secret`, max_amount: "0.05", request_id: randomUUID() });
+  assert.equal(paid.intent.url, `${URL_}?city=[redacted]&api_key=[redacted]`);
+  assert.equal((await f.records())[0].intent.x402.url, `${URL_}?city=[redacted]&api_key=[redacted]`);
+  assert.ok(urls.every(url => url === `${URL_}?city=Kyiv&api_key=secret`));
 });

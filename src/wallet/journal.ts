@@ -42,8 +42,10 @@ export const ownsNonce = (status: string) => ["signed", "submitting", "submitted
 /** x402 payments use their own nonce lane, so only other operations hold the account's main nonce. */
 export const holdsMainNonce = (r: { status: string; intent: { kind: string } }) => ownsNonce(r.status) && r.intent.kind !== "x402_payment";
 export const terminal = (status: string) => ["confirmed", "reverted", "failed", "cancelled", "expired", "superseded"].includes(status);
-// fromBlock, searchedBlock and discoveredBlock (x402 only) are the replacement's own receipt search start and progress, as for the original.
-const replacementSchema = z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int(), fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional() }).superRefine((replacement, ctx) => {
+/** x402 only: EntryPoint logs a receipt search found but could not yet verify or rule out, retried on every pass. */
+const retryLogsSchema = z.array(z.strictObject({ transactionHash: hash, blockNumber: uint.optional(), blockHash: hash.optional() })).max(16);
+// fromBlock, searchedBlock, discoveredBlock and retryLogs (x402 only) are the replacement's own receipt search start and progress, as for the original.
+const replacementSchema = z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int(), fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional(), retryLogs: retryLogsSchema.optional() }).superRefine((replacement, ctx) => {
   if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
 });
 const recordSchema = z.strictObject({
@@ -64,7 +66,7 @@ const recordSchema = z.strictObject({
   // x402 only: the block the payment was signed at, which bounds an on-chain search for it, the last block that
   // search has covered without finding it (discoveredBlock: the last block only some RPCs could search, while
   // another RPC's log queries failed), the block and hash it settled in, and whether the seller's answer for it was handed back.
-  fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional(), settledBlock: uint.optional(), settledBlockHash: hash.optional(), delivered: z.boolean().optional(),
+  fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional(), retryLogs: retryLogsSchema.optional(), settledBlock: uint.optional(), settledBlockHash: hash.optional(), delivered: z.boolean().optional(),
   // x402 only: the settlement is past the reorg margin, so reconciliation no longer rechecks it.
   settlementFinal: z.literal(true).optional(),
   replacement: replacementSchema.optional(),

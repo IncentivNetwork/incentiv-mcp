@@ -20,6 +20,17 @@ export interface X402Request {
 }
 
 /** Validates the caller's request without touching the network. */
+/**
+ * The URL as the payment record keeps it: query values, which can hold an API key, are replaced, and only a
+ * digest of the full request is kept. Requests are always sent from the caller's own arguments.
+ */
+export function recordedUrl(value: string): string {
+  const url = new URL(value);
+  if (!url.search) return url.href;
+  const names = [...new Set(url.searchParams.keys())].map(name => `${encodeURIComponent(name)}=[redacted]`);
+  return `${url.origin}${url.pathname}?${names.join("&")}`.slice(0, 2048);
+}
+
 export function x402Request(args: Record<string, unknown>): X402Request {
   const url = checkResourceUrl(String(args.url ?? ""));
   const method = String(args.method ?? "GET").toUpperCase();
