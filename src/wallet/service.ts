@@ -9,6 +9,7 @@ import { Ctx } from "../context.js";
 import { NetworkError } from "../network.js";
 import { BundlerUnavailableError, userOpToJson } from "../userop.js";
 import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
+import { RpcDisagreementError } from "./errors.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
 import { Journal, digest, holdsMainNonce, intentSchema, ownsNonce, terminal, type Intent, type OperationRecord } from "./journal.js";
 import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, x402QuoteViolations, x402Violations, type Limits, type Spend } from "./policy.js";
@@ -110,7 +111,7 @@ export class WalletService {
     // a failing receipt or nonce read does not imply that balance reads and simulation are unavailable.
     const outage = Symbol("outage");
     const read = <T>(value: Promise<T>) => value.catch((error: unknown): never => {
-      if (!forSpending && !(error instanceof WalletError) && settled.every(r => (r.consumedAt ?? 0) <= recent)) throw outage;
+      if (!forSpending && rpcFault(error) && settled.every(r => (r.consumedAt ?? 0) <= recent)) throw outage;
       rethrowX402RecheckError(error);
     });
     try {
@@ -142,11 +143,11 @@ export class WalletService {
   }
 
   private async reopenX402Settlement(journal: Journal, r: OperationRecord): Promise<void> {
+    // consumedAt and settledBlockHash are kept: while the record is open they count for nothing, and if a lagging
+    // RPC caused the reopen, the payment confirms again in the same block and keeps its original spend time.
     delete r.consumed;
-    delete r.consumedAt;
     delete r.transactionHash;
     delete r.settledBlock;
-    delete r.settledBlockHash;
     delete r.settlementFinal;
     delete r.searchedBlock;
     if (r.replacement) delete r.replacement.searchedBlock;
@@ -185,7 +186,7 @@ export class WalletService {
             const gasToken = r.replacement!.gasToken ?? "native";
             r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: r.replacement!.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
             if (replaced.blockNumber !== undefined) r.settledBlock = replaced.blockNumber.toString();
-            if (replaced.blockHash) r.settledBlockHash = replaced.blockHash.toLowerCase() as Hex;
+            if (replaced.blockHash) r.settledBlockHash = replaced.blockHash.toLowerCase() as Hex; else delete r.settledBlockHash;
             // A mined replacement consumes the nonce even if its execution reverted.
             await journal.transition(r, "superseded"); continue;
           }
@@ -206,9 +207,13 @@ export class WalletService {
         if (gas < 0n) throw new WalletError("wallet_recovery_required", "Invalid persisted gas reservation");
         addSpend(spend, r.intent.gasToken, gas);
         if (receipt.registryError) r.lastError = receipt.registryError;
-        r.consumed = spend; r.consumedAt = Date.now(); r.transactionHash = receipt.transactionHash;
+        const blockHash = receipt.blockHash?.toLowerCase() as Hex | undefined;
+        // A payment reopened while an RPC lagged that confirms again in the same block is the same settlement, so its
+        // spend keeps its original time instead of counting against the daily limit for another day.
+        const sameSettlement = r.consumedAt !== undefined && blockHash !== undefined && blockHash === r.settledBlockHash;
+        r.consumed = spend; r.consumedAt = sameSettlement ? r.consumedAt : Date.now(); r.transactionHash = receipt.transactionHash;
         if (receipt.blockNumber !== undefined) r.settledBlock = receipt.blockNumber.toString();
-        if (receipt.blockHash) r.settledBlockHash = receipt.blockHash.toLowerCase() as Hex;
+        if (blockHash) r.settledBlockHash = blockHash; else delete r.settledBlockHash;
         await journal.transition(r, receipt.success ? "confirmed" : "reverted");
       } catch (error) {
         if (error instanceof WalletError) throw error;
@@ -551,7 +556,7 @@ export class WalletService {
         return this.deliverX402(s, journal, existing, req, limits);
       }
       // Whether an answer handed back earlier reached the caller is unknown here, so a retry may ask the seller again.
-      if (existing.status === "submitted" || existing.status === "confirmed") return this.redeliverX402(s, journal, existing, req);
+      if (existing.status === "submitted" || existing.status === "confirmed") return this.redeliverX402(s, journal, existing, req, limits);
       // Either the payment or its cancellation will take the nonce lane; a new request ID uses another lane, so both could pay.
       if (existing.status === "superseding") return { ...x402Result(existing), next_action: "A cancellation of this payment is pending, and the payment itself may still settle instead. Check get_agent_operation and wait until it shows superseded (cancelled, nothing paid) or confirmed (paid; retry this request ID for the answer). Buying again with a new request ID before then may pay twice." };
       return { ...x402Result(existing), next_action: "Use a new request ID to try again." };
@@ -706,7 +711,7 @@ export class WalletService {
    * it cannot be charged again, and the seller may serve it. Any other POST is never repeated: a seller that
    * accepts the payment again would run its handler a second time.
    */
-  private async redeliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request) {
+  private async redeliverX402(s: WalletSession, journal: Journal, r: OperationRecord, req: X402Request, limits: Limits) {
     const x = r.intent.x402!;
     let response: Awaited<ReturnType<typeof this.http>> | undefined;
     // Neither a seller's report nor a confirmation the chain later drops is proof: while the nonce is unused, the
@@ -716,6 +721,13 @@ export class WalletService {
       return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The RPC no longer shows this payment's settlement: the chain reorganized, or the RPC is behind" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid.` };
     }
     if (replayable(req)) {
+      // Asking again sends a request from this computer, so it needs current policy like any other x402 request.
+      // The payment itself has settled, so a refusal only withholds the answer.
+      await s.assertOwned(); await this.enabled(s);
+      const refused = !limits.x402 ? "x402 payments are now off in local wallet policy"
+        : x402Violations(limits, req.origin, ZERO_ADDRESS, "0").includes("x402_origin_not_allowed") ? "local wallet policy no longer allows this site"
+        : limits.expiresAt && Date.now() >= limits.expiresAt ? "local wallet policy expired" : undefined;
+      if (refused) return { ...x402Result(r), content_delivered: false, next_action: `This payment ${r.status === "confirmed" ? "settled" : "was reported settled by the seller"}, but ${refused}, so this wallet did not ask the seller for its answer again. Nothing more was paid. To retrieve the answer, the user can allow it again with incentiv-mcp setup and you retry this request ID; buying again with a new request ID pays again.` };
       const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
       response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: PAID_REQUEST_TIMEOUT_MS }).catch(() => undefined);
       if (response && httpSucceeded(response.status) && !response.incomplete) {
@@ -733,16 +745,22 @@ export class WalletService {
 
   /** The seller's deadline passed: an unsent payment expires; one the seller may hold stays reserved until resolved. */
   private async pastDeadlineX402(journal: Journal, r: OperationRecord) {
-    if (r.status === "signed" && await this.reconcileSignedX402(journal, r)) return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." };
+    if (r.status === "signed") {
+      const expired = await this.reconcileSignedX402(journal, r);
+      if (expired) return { ...x402Result(r), next_action: "The payment expired before it was sent, so nothing was paid. Use a new request ID." };
+      // It never left this computer, so it will expire unpaid; only the lane read that would release it failed.
+      if (expired === undefined) throw new WalletError("rpc_unavailable", "Could not read this payment's nonce lane from RPC. It was never sent and its deadline has passed, so it expires unpaid; retry with the same request ID when RPC is available to release its reservation. Do not cancel it.");
+    }
     return { ...x402Result(r), next_action: X402_UNKNOWN_ACTION(r.requestId) };
   }
   /**
    * Rechecks a signed payment whose delivery was never recorded. A spent lane needs receipt reconciliation
-   * immediately. An unused lane can expire only after the seller's deadline. Returns whether the payment expired.
+   * immediately. An unused lane can expire only after the seller's deadline. Returns whether the payment expired,
+   * or undefined when the lane could not be read.
    */
-  private async reconcileSignedX402(journal: Journal, r: OperationRecord): Promise<boolean> {
+  private async reconcileSignedX402(journal: Journal, r: OperationRecord): Promise<boolean | undefined> {
     const lane = await this.chain.stateFor(journal.session.envelope, r).catch(() => undefined);
-    if (!lane) return false;
+    if (!lane) return undefined;
     if (lane.nonce !== BigInt(r.nonce!)) {
       r.lastError = "submission_unknown";
       await journal.transition(r, "submission_unknown");
@@ -1042,12 +1060,15 @@ function unpaidHttpFailure(response: HttpResponse) {
   } as const;
 }
 
+/** A failed read, or configured RPCs that disagree (one lagging behind, say): neither says anything about the wallet. */
+const rpcFault = (error: unknown) => !(error instanceof WalletError) || error instanceof RpcDisagreementError;
 /**
- * Any failed read in the settlement recheck, including a lagging node's missing block or header, says nothing about
- * the wallet: it becomes rpc_unavailable rather than escaping as wallet_recovery_required.
+ * Any failed read in the settlement recheck, including a lagging node's missing block or header or RPCs that
+ * disagree, says nothing about the wallet: it becomes rpc_unavailable rather than escaping as
+ * wallet_recovery_required or validation_failed.
  */
 function rethrowX402RecheckError(error: unknown): never {
-  if (error instanceof WalletError) throw error;
+  if (!rpcFault(error)) throw error;
   throw new WalletError("rpc_unavailable", "Could not recheck recent x402 settlements; retry when RPC is available");
 }
 

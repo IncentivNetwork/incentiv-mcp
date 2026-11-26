@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { WalletError } from "../src/wallet/errors.ts";
+import { RpcDisagreementError, WalletError } from "../src/wallet/errors.ts";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { BlockNotFoundError, encodeAbiParameters, encodeEventTopics, encodeFunctionData, erc20Abi, getAddress, HttpRequestError, parseAbiItem, recoverMessageAddress, RpcRequestError, TimeoutError } from "viem";
@@ -1604,5 +1604,89 @@ test("discovery screens every text field of a listing, tags included", async t =
   registerX402Tools({ registerTool: (name, _config, handler) => { handlers[name] = handler; } }, f.service, { fields: (item, fields, nested) => { screened.push([fields, nested]); return item; } });
   await handlers.discover_x402_resources({});
   const [[fields, nested]] = screened;
-  assert.deepEqual([...fields, ...[nested].flat()].sort(), ["description", "input", "last_updated", "mime_type", "service_name", "tags"]);
+  assert.deepEqual([...fields, ...[nested].flat()].sort(), ["description", "input", "last_updated", "mime_type", "service_name", "tags", "url"]);
+});
+
+test("RPCs that disagree during the settlement recheck are an RPC outage, not a validation failure", async t => {
+  for (const [stage, failure] of [["laneNonce", new RpcDisagreementError("RPC nonces disagree")], ["state", new RpcDisagreementError("RPC chain heads disagree")], ["canonicalBlockHash", new RpcDisagreementError("RPC block hashes disagree")]]) {
+    const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+    f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true, block: 100n });
+    await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+    await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}`, blockNumber: 98n, blockHash: `0x${"bc".repeat(32)}` });
+    f.chain.canonicalBlockHash = async () => `0x${"bc".repeat(32)}`;
+    assert.equal((await f.service.operation(id)).status, "confirmed");
+    const working = f.chain[stage];
+    f.chain[stage] = async () => { throw failure; };
+    // A recent settlement cannot be trusted without the recheck, so reads and spends wait for RPC.
+    await assert.rejects(f.service.operation(id), e => e.code === "rpc_unavailable" && /retry when RPC is available/.test(e.message), stage);
+    await assert.rejects(f.service.send("transfer", args(randomUUID())), { code: "rpc_unavailable" }, stage);
+    // An older one is shown as recorded during the outage.
+    await f.store.session(async s => { const journal = await Journal.open(s); journal.data.records[0].consumedAt -= 3_600_000; await journal.save(); });
+    assert.equal((await f.service.operation(id)).status, "confirmed", stage);
+    f.chain[stage] = working;
+  }
+});
+
+test("a settled payment's answer is not asked for again once policy no longer allows the request", async t => {
+  const changes = [
+    [limits => { const { x402, ...rest } = limits; return rest; }, /x402 payments are now off/],
+    [limits => ({ ...limits, x402: { ...limits.x402, origins: { mode: "allowlist", origins: ["https://other.example.com"] } } }), /no longer allows this site/],
+    [limits => ({ ...limits, expiresAt: 1 }), /policy expired/],
+  ];
+  for (const [change, reason] of changes) {
+    const f = await x402Fixture(t), id = randomUUID();
+    await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+    await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+    assert.equal((await f.service.operation(id)).status, "confirmed");
+    await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, limits: change(s.envelope.policy.limits) }));
+    const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+    assert.equal(retry.status, "confirmed"); assert.equal(retry.content_delivered, false);
+    assert.match(retry.next_action, reason); assert.match(retry.next_action, /Nothing more was paid/);
+    assert.equal(f.seen.payments.length, 1, "no request was sent");
+  }
+});
+
+test("a payment reopened by a lagging RPC keeps its spend time when it confirms again in the same block", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+  let head = 100n;
+  f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true, block: head });
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const blockHash = `0x${"bc".repeat(32)}`, receipt = { success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}`, blockNumber: 98n, blockHash };
+  f.chain.canonicalBlockHash = async () => blockHash;
+  await f.settle(receipt);
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  const consumedAt = (await f.records())[0].consumedAt;
+  const now = Date.now;
+  t.after(() => { Date.now = now; });
+  Date.now = () => now() + 3_600_000;
+  head = 97n; f.setReceipt(undefined);
+  assert.equal((await f.service.operation(id)).status, "submitted");
+  head = 100n; f.setReceipt(receipt);
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  assert.equal((await f.records())[0].consumedAt, consumedAt);
+  // Confirmed in another block after a reorg, it is a new settlement and counts from then.
+  head = 97n; f.setReceipt(undefined);
+  assert.equal((await f.service.operation(id)).status, "submitted");
+  head = 100n; f.setReceipt({ ...receipt, blockHash: `0x${"cd".repeat(32)}` }); f.chain.canonicalBlockHash = async () => `0x${"cd".repeat(32)}`;
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  assert.ok((await f.records())[0].consumedAt >= consumedAt + 3_600_000);
+});
+
+test("a past-deadline payment that was never sent is not offered for cancellation when its lane cannot be read", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), http = f.service.http;
+  const { NOT_SENT } = await import("../src/x402/http.ts");
+  f.service.http = async req => { if (!req.headers?.["payment-signature"]) return http(req); throw Object.defineProperty(new Error("x"), NOT_SENT, { value: true }); };
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }).catch(() => undefined);
+  assert.equal((await f.service.operation(id)).status, "signed");
+  const deadline = (await f.records())[0].deadline, laneNonce = f.chain.laneNonce, now = Date.now;
+  f.chain.laneNonce = async () => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 503 }); };
+  Date.now = () => (deadline + 1) * 1000;
+  try {
+    await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), e => e.code === "rpc_unavailable" && /never sent/.test(e.message) && !/--replace/.test(e.message));
+    f.chain.laneNonce = laneNonce;
+    const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+    // Expired unsent, it is archived at once; nothing was paid and nothing stays reserved.
+    assert.equal(retry.status, "expired"); assert.match(retry.next_action, /without paying the seller/);
+    assert.equal((await f.used())[usdc], undefined);
+  } finally { Date.now = now; }
 });

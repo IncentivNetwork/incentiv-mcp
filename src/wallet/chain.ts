@@ -6,6 +6,7 @@ import { accountAbi, accountFactoryAbi, dexFactoryAbi, dexPoolAbi, entryPointAbi
 import { BundlerUnavailableError, broadcastUserOp, buildUserOpUnsigned, bundlerRpc, userOpFromJson as userOpFromWire, userOpToJson, type UserOp } from "../userop.js";
 import { buildSwapCalls, planRoute, quoteRoute } from "../swap.js";
 import { WalletError, type WalletEnvelope } from "./keystore.js";
+import { RpcDisagreementError } from "./errors.js";
 import { type Intent, type OperationRecord } from "./journal.js";
 import { type Limits, type Spend } from "./policy.js";
 import type { validateOperation } from "./validate.js";
@@ -34,11 +35,11 @@ export class WalletChain {
   async state(wallet: WalletEnvelope): Promise<ChainState> {
     const heads = await Promise.all(this.clients.map(c => c.getBlockNumber({ cacheTime: 0 })));
     const block = heads.reduce((a, b) => a < b ? a : b);
-    if (heads.some(n => n - block > 5n)) throw new WalletError("validation_failed", "RPC chain heads disagree");
+    if (heads.some(n => n - block > 5n)) throw new RpcDisagreementError("RPC chain heads disagree");
     const blocks = await Promise.all(this.clients.map(c => c.getBlock({ blockNumber: block })));
     const nonces = await Promise.all(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "getNonce", args: [wallet.account as Address, 0n], blockNumber: block })));
     const codes = await Promise.all(this.clients.map(c => c.getCode({ address: wallet.account as Address, blockNumber: block })));
-    if (blocks.some(b => !b.hash) || !same(blocks.map(b => b.hash)) || !same(blocks.map(b => b.timestamp)) || !same(blocks.map(b => b.baseFeePerGas)) || !same(nonces) || !same(codes)) throw new WalletError("validation_failed", "RPC nonce, account or fee state disagrees");
+    if (blocks.some(b => !b.hash) || !same(blocks.map(b => b.hash)) || !same(blocks.map(b => b.timestamp)) || !same(blocks.map(b => b.baseFeePerGas)) || !same(nonces) || !same(codes)) throw new RpcDisagreementError("RPC nonce, account or fee state disagrees");
     const deployed = !!codes[0] && codes[0] !== "0x";
     if (deployed) {
       const owners = await Promise.all(this.clients.map(c => c.readContract({ address: wallet.account as Address, abi: accountAbi, functionName: "owner", blockNumber: block })));
@@ -52,14 +53,14 @@ export class WalletChain {
   async canonicalBlockHash(blockNumber: bigint): Promise<Hex> {
     const hashes = await Promise.all(this.clients.map(c => c.getBlock({ blockNumber }).then(block => block.hash)));
     const [hash] = hashes;
-    if (!hash || !same(hashes)) throw new WalletError("validation_failed", "RPC block hashes disagree");
+    if (!hash || !same(hashes)) throw new RpcDisagreementError("RPC block hashes disagree");
     return hash;
   }
 
   /** The account's next nonce on one EntryPoint key, agreed by every configured RPC at `block`. */
   async laneNonce(wallet: WalletEnvelope, key: bigint, block: bigint): Promise<bigint> {
     const nonces = await Promise.all(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "getNonce", args: [wallet.account as Address, key], blockNumber: block })));
-    if (!same(nonces)) throw new WalletError("validation_failed", "RPC nonces disagree");
+    if (!same(nonces)) throw new RpcDisagreementError("RPC nonces disagree");
     return nonces[0];
   }
   /**
