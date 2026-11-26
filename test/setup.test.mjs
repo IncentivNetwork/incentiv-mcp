@@ -183,6 +183,16 @@ test("keeping current permissions still offers the registry once approved, and o
   assert.deepEqual(saved.tokens, limits.tokens);
 });
 
+test("replacing permissions on a wallet that has not approved the registry does not ask for Portal accounts", async t => {
+  const base = withoutAgentRegistry(MAINNET), old = await fixture(t, { config: base }), f = await fixture(t, { root: old.root, existing: true });
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false }));
+  const replaced = interaction(["", "n", "CENT", recipient, "n", "0.01", "100", "1000", "20", "20", "n", "y", "y", ""], join(old.parent, "replaced.json"));
+  await setupWallet(f.service, f.root, replaced.io);
+  assert.ok(!replaced.questions.some(q => /Portal accounts/.test(q)), "setup passes the wallet's approval state to promptPolicy");
+  assert.ok(replaced.output.some(line => line.includes("run wallet capabilities approve, then rerun setup")));
+  assert.equal((await f.service.review()).wallet.policy.limits.agentRegistry, undefined);
+});
+
 test("keeping a policy from an earlier build drops its unlink permission before the review", async t => {
   const old = await fixture(t), f = await fixture(t, { root: old.root, existing: true }), portal = "0x0000000000000000000000000000000000000002";
   const registry = MAINNET.manifest.agentRegistry.proxy.address.toLowerCase(), link = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)"), unlink = toFunctionSelector("unlink()");
