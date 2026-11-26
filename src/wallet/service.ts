@@ -470,15 +470,22 @@ export class WalletService {
   async x402Requirements(args: Record<string, unknown>) {
     const req = x402Request(args);
     // The request goes out from this computer and the endpoint may act on it, so x402 must be on and the site allowed.
-    await this.store.session(async s => {
+    const { pending } = await this.store.session(async s => {
+      await s.assertOwned();
       const policy = s.envelope.policy;
       if (!policy.configured) throw new WalletError("policy_not_configured", "Run incentiv-mcp setup in your local terminal; nothing was sent");
       if (!policy.enabled || await s.disabled()) throw new WalletError("wallet_locked", "Wallet is disabled, so it sends no x402 requests; local administration authorization is required. Nothing was sent");
       assertPolicyLive(policy.limits, "nothing was sent");
       if (!policy.limits.x402) throw new WalletError("policy_denied", "x402 payments are off in local wallet policy, so this wallet sends no x402 requests; the user can enable them with incentiv-mcp setup");
       if (x402Violations(policy.limits, req.origin, ZERO_ADDRESS, "0").includes("x402_origin_not_allowed")) throw new WalletError("policy_denied", "Local wallet policy does not allow this site for x402, so nothing was sent");
+      // Start the request while the policy is still locked. Release the wallet before waiting on the seller.
+      const pending = this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: 30_000 })
+        .then(response => ({ response }), (error: unknown) => ({ error }));
+      return { pending };
     });
-    const response = await this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: 30_000 });
+    const result = await pending;
+    if ("error" in result) throw result.error;
+    const { response } = result;
     if (httpSucceeded(response.status)) return { url: req.url, payment_required: false, content: responseContent(response), next_action: "This request needs no payment; its answer is in content." };
     if (response.status !== 402) return { url: req.url, ...unpaidHttpFailure(response) };
     const required = parsePaymentRequired(response);

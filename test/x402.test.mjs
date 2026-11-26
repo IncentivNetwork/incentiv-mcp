@@ -1073,6 +1073,35 @@ test("quotes send nothing while x402 is off or the site is not allowed", async t
   assert.equal((await f.service.x402Requirements({ url: URL_ })).payment_required, true);
 });
 
+test("a quote starts before releasing the authorized wallet session and does not wait under the lock", { timeout: 5000 }, async t => {
+  const f = await x402Fixture(t), session = f.store.session.bind(f.store);
+  let released = false;
+  const authorizationReleased = Promise.withResolvers();
+  const httpResponse = Promise.withResolvers();
+  let startedWithLock = false;
+  f.store.session = async (...args) => {
+    const result = await session(...args);
+    if (!released) {
+      released = true;
+      await f.store.disable();
+      authorizationReleased.resolve();
+    }
+    return result;
+  };
+  f.service.http = () => {
+    startedWithLock = !released;
+    return httpResponse.promise;
+  };
+  const quote = f.service.x402Requirements({ url: URL_, method: "POST", body: "{}" });
+  try {
+    await authorizationReleased.promise;
+    assert.equal(startedWithLock, true);
+  } finally {
+    httpResponse.resolve({ status: 200, headers: {}, body: Buffer.from("{}"), truncated: false });
+  }
+  assert.equal((await quote).payment_required, false);
+});
+
 test("a paid result shows amounts in USDC, _meta carries the x402 SettleResponse, and a full journal pauses new payments", async t => {
   const f = await x402Fixture(t), tools = {}, state = f.chain.state;
   f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true });
