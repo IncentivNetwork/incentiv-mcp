@@ -11,7 +11,7 @@ export async function installTestPackage(root, directory) {
   ], { cwd: root, encoding: "utf8" }));
   const archive = join(directory, packed.filename);
   execFileSync(process.execPath, [
-    npm, "install", "--prefix", directory, "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline",
+    npm, "install", "--prefix", directory, "--ignore-scripts", "--no-audit", "--no-fund",
     "--no-package-lock", "--omit=dev", archive,
   ], { stdio: ["ignore", "ignore", "inherit"] });
   return {

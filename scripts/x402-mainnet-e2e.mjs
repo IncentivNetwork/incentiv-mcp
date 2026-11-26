@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -287,12 +287,53 @@ async function clearFailedAttempt(run) {
   await syncDirectory(directory);
 }
 
+const lock = join(directory, "running");
+
+// The marker names its runner, so a stopped run can be told apart from an active one.
+async function lockOwner() {
+  let text;
+  try { text = await readFile(lock, "utf8"); } catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
+  try {
+    const owner = JSON.parse(text);
+    if (Number.isSafeInteger(owner.pid) && owner.pid > 0 && typeof owner.host === "string") return owner;
+  } catch { /* an empty or partial marker names no runner */ }
+  return { unknown: true };
+}
+
+function running(owner) {
+  if (owner.unknown || owner.host !== hostname()) return true; // Its runner cannot be checked from here.
+  try { process.kill(owner.pid, 0); return true; } catch (error) { return error.code === "EPERM"; }
+}
+
+const describe = owner => owner.unknown ? "with no recorded owner" : `by process ${owner.pid} on ${owner.host} since ${owner.startedAt}`;
+
+async function acquireLock() {
+  try {
+    await writeFile(lock, JSON.stringify({ pid: process.pid, host: hostname(), startedAt: new Date().toISOString() }), { mode: 0o600, flag: "wx", flush: true });
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    const owner = await lockOwner() ?? { unknown: true };
+    throw new Error(running(owner)
+      ? `Another run holds ${lock}, ${describe(owner)}. If no run is active, delete that file and run again.`
+      : `A stopped run left ${lock} (${describe(owner)}). Run \`npm run e2e:x402 -- unlock\`, then status, before running again.`);
+  }
+}
+
+// Removes only a marker whose runner has exited on this host. Funded attempts stay recorded and still gate the next run.
+async function unlock() {
+  const owner = await lockOwner();
+  if (!owner) return console.log("No run marker is present.");
+  if (running(owner)) throw new Error(`The marker was left ${describe(owner)}, and that run may still be active. Delete ${lock} yourself only once no run is active.`);
+  await unlink(lock);
+  await syncDirectory(directory);
+  console.log(`Removed the marker left ${describe(owner)}. Run status to reconcile any funded attempt.`);
+}
+
 async function runSuite(run, { retryFailed = false, freeOnly = false, dropResponse = false } = {}) {
   if (!freeOnly) assert.equal(await tokenBalance(run.buyer), budget, "The test buyer must hold exactly 0.05 USDC for this run");
   await preflightSeller();
   // Reserve the suite before enabling the wallet. Only one runner may reach the funded case.
-  const lock = join(directory, "running");
-  await writeFile(lock, "", { flag: "wx", mode: 0o600 });
+  await acquireLock();
   const store = localWalletStore(MAINNET, run.buyerProfile);
   let enabled = false, temp;
   try {
@@ -396,11 +437,12 @@ async function status(run) {
 
 async function main(args) {
   if (args.length === 1 && args[0] === "prepare") return prepare();
+  if (args.length === 1 && args[0] === "unlock") return unlock();
   const flags = args.slice(2);
   const fundedRun = args[0] === "run" && args[1] === "--approve-mainnet-spend" &&
     flags.length === new Set(flags).size && flags.every(flag => ["--retry-failed", "--drop-response"].includes(flag));
   if (!fundedRun && !(args.length === 1 && ["status", "preflight"].includes(args[0]))) {
-    throw new Error("Use prepare, preflight, status, or run --approve-mainnet-spend [--retry-failed] [--drop-response]. One purchase may spend up to 0.05 real USDC.");
+    throw new Error("Use prepare, preflight, status, unlock, or run --approve-mainnet-spend [--retry-failed] [--drop-response]. One purchase may spend up to 0.05 real USDC.");
   }
   const run = await load("run.json");
   assert.ok(run, "Prepare the isolated mainnet test wallet first");
