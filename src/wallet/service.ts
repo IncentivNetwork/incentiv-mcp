@@ -482,7 +482,7 @@ export class WalletService {
     const result = await pending;
     if ("error" in result) throw result.error;
     const { response } = result;
-    if (httpSucceeded(response.status)) return { url: req.url, payment_required: false, content: responseContent(response), next_action: "This request needs no payment; its answer is in content." };
+    if (httpSucceeded(response.status) && !response.incomplete) return { url: req.url, payment_required: false, content: responseContent(response), next_action: "This request needs no payment; its answer is in content." };
     if (response.status !== 402) return { url: req.url, ...unpaidHttpFailure(response) };
     const required = parsePaymentRequired(response);
     let accepted: PaymentRequirements | undefined, unsupported: string | undefined;
@@ -595,7 +595,7 @@ export class WalletService {
       const uncertain = !neverSent(error) && !replayable(req) ? " The resource may have received this POST, so this wallet does not send it again under this request ID." : "";
       throw new WalletError("x402_request_failed", `The resource could not be reached, so nothing was paid: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}.${uncertain}`);
     });
-    if (httpSucceeded(unpaid.status)) {
+    if (httpSucceeded(unpaid.status) && !unpaid.incomplete) {
       await bind("not_required");
       return { request_id: requestId, status: "not_required", content: responseContent(unpaid), next_action: "No payment was needed or made." };
     }
@@ -718,7 +718,7 @@ export class WalletService {
     if (replayable(req)) {
       const header = paymentHeader(JSON.parse(x.accepted), x.resource ? JSON.parse(x.resource) : undefined, r.operation!, r.userOpHash as Hex, x.paymentId as Hex, x.validUntil);
       response = await this.http({ ...req, headers: { ...req.headers, "payment-signature": header }, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: PAID_REQUEST_TIMEOUT_MS }).catch(() => undefined);
-      if (response && httpSucceeded(response.status)) {
+      if (response && httpSucceeded(response.status) && !response.incomplete) {
         r.delivered = true; r.sequence = ++journal.data.sequence; await journal.save();
         // From here the nonce is known to be used, so the payment cannot be charged again.
         return { ...x402Result(r), content_delivered: true, content: responseContent(response), next_action: "This payment had settled without its answer; the seller has now served it. Nothing more was paid." };
@@ -786,7 +786,7 @@ export class WalletService {
       return { ...x402Result(r), next_action: `The seller did not answer, so the payment may or may not settle. ${replayable(req) ? "Retry pay_x402_resource with the same request ID while the deadline is open; " : ""}${X402_UNKNOWN_ACTION(r.requestId)}` };
     }
     const settled = sellerSettlement(settlement(response));
-    const served = httpSucceeded(response.status);
+    const served = httpSucceeded(response.status) && !response.incomplete;
     // The seller's report of a successful settlement is kept whatever the HTTP status, since an upfront payment
     // can settle before a handler fails. Reconciliation verifies it on chain either way.
     const paid = settled?.success === true && response.status !== 402;
@@ -807,8 +807,9 @@ export class WalletService {
       // The seller's report is not a receipt: settlement stays pending until get_agent_operation shows confirmed.
       seller_reported_settlement: paid, settlement_confirmed: false,
       ...(served ? { content: responseContent(response) } : { http_status: response.status }),
+      ...(response.incomplete ? { response_incomplete: true } : {}),
       next_action: paid && served ? "The seller reported settling the payment; it is pending until get_agent_operation shows it confirmed on chain. Check it before buying again."
-        : paid ? `The seller reported settling the payment but answered HTTP ${response.status} without its answer. ${recover} Settlement is pending until get_agent_operation shows it confirmed on chain.`
+        : paid ? `The seller reported settling the payment but ${response.incomplete ? "the response ended before its answer was complete" : `answered HTTP ${response.status} without its answer`}. ${recover} Settlement is pending until get_agent_operation shows it confirmed on chain.`
         : response.status === 402 ? `The seller refused the payment. ${X402_UNKNOWN_ACTION(r.requestId)}`
         : served ? `The seller served its answer without confirming settlement. ${X402_UNKNOWN_ACTION(r.requestId)}`
         : `The seller answered without confirming settlement. ${X402_UNKNOWN_ACTION(r.requestId)}`,
@@ -1035,7 +1036,9 @@ function unpaidHttpFailure(response: HttpResponse) {
     status: "request_failed",
     http_status: response.status,
     content: responseContent(response),
-    next_action: `The resource returned HTTP ${response.status} before a payment was sent. Check the resource response before retrying.`,
+    next_action: response.incomplete
+      ? "The resource response was interrupted before a payment was sent. Check the resource before retrying."
+      : `The resource returned HTTP ${response.status} before a payment was sent. Check the resource response before retrying.`,
   } as const;
 }
 

@@ -25,6 +25,8 @@ export interface HttpResponse {
   headers: Record<string, string>;
   body: Buffer;
   truncated: boolean;
+  /** The connection ended before the complete response body arrived. */
+  incomplete?: true;
 }
 export type HttpTransport = (request: HttpRequest) => Promise<HttpResponse>;
 
@@ -112,6 +114,7 @@ export const httpsTransport: HttpTransport = (req) => new Promise((resolve, reje
   const headers: Record<string, string> = { "user-agent": "incentiv-mcp", accept: "application/json, text/*;q=0.9, */*;q=0.5", ...req.headers, "accept-encoding": "identity" };
   if (body) { headers["content-length"] = String(body.length); headers["content-type"] ??= "application/json"; }
   const timeout = req.timeoutMs ?? 60_000;
+  let finishInterrupted: (() => void) | undefined;
   const call = httpsRequest(url, { method: req.method, headers, agent: directAgent, lookup: publicLookup, timeout }, res => {
     const chunks: Buffer[] = [];
     let size = 0, truncated = false;
@@ -122,15 +125,17 @@ export const httpsTransport: HttpTransport = (req) => new Promise((resolve, reje
       chunks.push(chunk); size += chunk.length;
     });
     let done = false;
-    const finish = () => {
+    const finish = (incomplete = false) => {
       if (done) return; done = true;
       const out: Record<string, string> = {};
       for (const [name, value] of Object.entries(res.headers)) if (value !== undefined) out[name.toLowerCase()] = Array.isArray(value) ? value.join(", ") : value;
-      resolve({ status: res.statusCode ?? 0, headers: out, body: Buffer.concat(chunks), truncated });
+      resolve({ status: res.statusCode ?? 0, headers: out, body: Buffer.concat(chunks), truncated: truncated || incomplete, ...(incomplete ? { incomplete: true } : {}) });
     };
-    res.on("end", finish);
-    res.on("close", () => { if (truncated) finish(); });
-    res.on("error", error => truncated ? finish() : reject(error));
+    // Settlement headers may already have arrived even if the handler's response body never finishes.
+    finishInterrupted = () => finish(!truncated);
+    res.on("end", () => finish());
+    res.on("close", () => finish(!truncated && !res.complete));
+    res.on("error", finishInterrupted);
   });
   // Request bytes are written only once the TLS session is up; a failure before that sent nothing.
   let connected = false;
@@ -139,6 +144,7 @@ export const httpsTransport: HttpTransport = (req) => new Promise((resolve, reje
   call.on("close", () => clearTimeout(deadline));
   call.on("timeout", () => call.destroy(new Error("The resource did not answer in time")));
   call.on("error", error => {
+    if (finishInterrupted) return finishInterrupted();
     if ((error as { code?: string }).code === "EX402PRIVATE") return reject(new WalletError("validation_failed", error.message));
     if (!connected) Object.defineProperty(error, NOT_SENT, { value: true });
     reject(error);

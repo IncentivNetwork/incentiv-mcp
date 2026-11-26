@@ -37,6 +37,7 @@ export async function discoverResources(cfg: Config, http: HttpTransport, args: 
   const response = await http({ url: `${base}/discovery/${query ? "search" : "resources"}?${params}`, method: "GET", maxBytes: 1024 * 1024, timeoutMs: 20_000 });
   if (response.status === 404) throw new WalletError("x402_discovery_unavailable", `The facilitator at ${base} does not offer discovery`);
   if (response.status !== 200) throw new WalletError("x402_discovery_unavailable", `The facilitator answered HTTP ${response.status}`);
+  if (response.incomplete) throw new WalletError("x402_discovery_unavailable", "The facilitator's catalog response was interrupted");
   let body: { items?: unknown[]; resources?: unknown[]; pagination?: { total?: number } | null; partialResults?: boolean };
   try { body = JSON.parse(response.body.toString("utf8")); } catch { throw new WalletError("x402_discovery_unavailable", "The facilitator's catalog is not JSON"); }
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new WalletError("x402_discovery_unavailable", "The facilitator's catalog is not a JSON object");

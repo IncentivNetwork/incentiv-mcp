@@ -217,6 +217,42 @@ test("refuses a price above max_amount or outside policy before signing, and che
   await assert.rejects(down.service.payX402({ url: URL_, max_amount: "1", request_id: randomUUID() }), e => e.code === "x402_request_failed" && /nothing was paid/.test(e.message));
 });
 
+test("an interrupted paid HTTP body preserves settlement evidence without marking the answer delivered", async t => {
+  const { Duplex } = await import("node:stream");
+  const { directAgent, httpsTransport } = await import("../src/x402/http.ts");
+  const transaction = `0x${"ef".repeat(32)}`;
+  const header = encodePaymentResponseHeader({ success: true, transaction, network: X402_NETWORK });
+  const connect = directAgent.createConnection;
+  directAgent.createConnection = () => {
+    const socket = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+        setImmediate(() => {
+          socket.push(Buffer.from(`HTTP/1.1 200 OK\r\nContent-Length: 100\r\nPayment-Response: ${header}\r\n\r\npartial`));
+          socket.push(null);
+        });
+      },
+    });
+    socket.setTimeout = () => socket;
+    return socket;
+  };
+  t.after(() => { directAgent.createConnection = connect; });
+  const observed = await httpsTransport({ url: URL_, method: "GET", maxBytes: 1024, timeoutMs: 3000 });
+  assert.equal(observed.incomplete, true);
+  assert.equal(observed.headers["payment-response"], header);
+  const f = await x402Fixture(t), probe = f.service.http, id = randomUUID();
+  f.service.http = req => req.headers?.["payment-signature"] ? Promise.resolve(observed) : probe(req);
+
+  const result = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal(result.status, "submitted");
+  assert.equal(result.seller_reported_settlement, true);
+  assert.equal(result.transaction_hash, transaction);
+  assert.equal(result.response_incomplete, true);
+  assert.match(result.next_action, /response ended before its answer was complete/);
+  assert.equal((await f.records())[0].delivered, undefined);
+});
+
 test("an unanswered or refused payment stays reserved, is resent byte for byte, and is never relayed by the wallet", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   f.seen.fail = 1;

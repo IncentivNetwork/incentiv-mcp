@@ -39,6 +39,7 @@ export function paymentNonceKey(paymentId: Hex, validUntil: number): bigint {
  */
 export function parsePaymentRequired(response: HttpResponse): PaymentRequired {
   const header = response.headers["payment-required"];
+  if (!header && response.incomplete) throw new WalletError("x402_invalid_response", "The payment requirements response was interrupted");
   let parsed: unknown;
   try {
     if (header) parsed = decodePaymentRequiredHeader(header);
