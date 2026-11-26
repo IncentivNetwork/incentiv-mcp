@@ -1,5 +1,5 @@
 import { AGENT_LINK_MIN_SECONDS, AGENT_LINK_REQUEST_SECONDS, assertAgentSignature, assertNotUnlink, assertRegistryApproved, freshBlockTime, hasRegistryEvent, linkBlocker, parentBlocker, readAgentLinkDigest, isContractRejection, isRegistryIntent, isTransportFailure, registryApprovalSchema, registryCall, registryCapability, registryRevertCode, registryStatus, verifyRegistryDeployment, verifyRegistryIntent } from "../agent-registry.js";
-import { BaseError, TimeoutError, createPublicClient, decodeEventLog, decodeFunctionData, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
+import { BaseError, createPublicClient, decodeEventLog, decodeFunctionData, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
 import { accountAbi, accountFactoryAbi, dexFactoryAbi, dexPoolAbi, entryPointAbi, erc20Abi, quoterAbi, swapRouterAbi, transferGateAbi } from "../abi.js";
@@ -394,13 +394,18 @@ export function exactAmount(text: string, decimals: number): bigint {
   return amount;
 }
 
-/**
- * Logs over [from, to], halving the range while an RPC refuses it as too large, down to 64 blocks. A timeout is
- * not a size refusal: halving it would repeat the wait for every half under the wallet lock, so it is thrown.
- */
+const LOG_RANGE_LIMIT = /(?:block range|range of blocks).*(?:too (?:wide|large)|limit|maximum|exceed)|(?:limit|maximum|exceed).*block range|query returned more than|too many (?:logs|results)|(?:log response|response size).*(?:too large|exceed|limit)/i;
+
+function logRangeTooLarge(error: unknown): boolean {
+  const matchesLimit = (cause: unknown) => cause instanceof Error
+    && (LOG_RANGE_LIMIT.test(cause.message) || (cause instanceof BaseError && LOG_RANGE_LIMIT.test(cause.details)));
+  return error instanceof BaseError ? !!error.walk(matchesLimit) : matchesLimit(error);
+}
+
+/** Halve the range down to 64 blocks only when the RPC reports a log range or result size limit. */
 export async function logsIn<L>(from: bigint, to: bigint, read: (range: { fromBlock: bigint; toBlock: bigint }) => Promise<L[]>): Promise<L[]> {
   try { return await read({ fromBlock: from, toBlock: to }); } catch (error) {
-    if (to - from < 64n || (error instanceof BaseError && error.walk(cause => cause instanceof TimeoutError))) throw error;
+    if (to - from < 64n || !logRangeTooLarge(error)) throw error;
     const mid = from + (to - from) / 2n;
     return [...await logsIn(from, mid, read), ...await logsIn(mid + 1n, to, read)];
   }

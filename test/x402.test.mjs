@@ -1426,13 +1426,24 @@ test("an RPC or bundler outage while a payment is prepared asks for a new reques
   }
 });
 
-test("the log search gives up on a timeout instead of halving the range", async () => {
-  let calls = 0;
-  await assert.rejects(logsIn(0n, 4_999n, async () => { calls++; throw new TimeoutError({ body: {}, url: "https://rpc.incentiv.io" }); }), TimeoutError);
-  assert.equal(calls, 1);
-  calls = 0;
-  const found = await logsIn(0n, 4_999n, async ({ fromBlock, toBlock }) => { calls++; if (toBlock - fromBlock > 1_000n) throw new Error("query returned more than 10000 results"); return [fromBlock]; });
-  assert.ok(calls > 1 && found.length > 1, "a size refusal still narrows the range");
+test("the log search narrows explicit range refusals and leaves other RPC errors alone", async () => {
+  const url = "https://rpc.incentiv.io";
+  for (const error of [
+    new TimeoutError({ body: {}, url }),
+    new HttpRequestError({ url, status: 429 }),
+    new HttpRequestError({ url, status: 503 }),
+    new RpcRequestError({ body: {}, url, error: { code: -32005, message: "rate limit exceeded" } }),
+  ]) {
+    let calls = 0;
+    await assert.rejects(logsIn(0n, 4_999n, async () => { calls++; throw error; }), thrown => thrown === error);
+    assert.equal(calls, 1);
+  }
+  const rangeRefusal = new RpcRequestError({ body: {}, url, error: { code: -32005, message: "query returned more than 10000 results" } });
+  const found = await logsIn(0n, 4_999n, async ({ fromBlock, toBlock }) => {
+    if (toBlock - fromBlock > 1_000n) throw rangeRefusal;
+    return [fromBlock];
+  });
+  assert.ok(found.length > 1, "a wrapped size refusal still narrows the range");
 });
 
 test("discovery screens every text field of a listing, tags included", async t => {
