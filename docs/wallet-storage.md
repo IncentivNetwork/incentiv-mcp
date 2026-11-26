@@ -246,6 +246,10 @@ review builds a zero-value self-transfer at the original nonce using the origina
 or native gas with `--native-gas` when the token balance or paymaster cannot cover it;
 either original or replacement may win. Both reservations remain until a verified
 receipt resolves the nonce. Disabling prevents either from being rebroadcast.
+A signed token-paid replacement can become unsendable when the paymaster's terms
+move, since the bundler then refuses the same bytes. It can be replaced once more
+with `--native-gas`. The token-paid one is kept and may still win, so its hash is
+still checked and all three reservations remain until a verified receipt.
 
 Backup refuses while any operation owns a nonce. The portable bundle encrypts
 the envelope, wrapping key and complete authenticated journal using scrypt

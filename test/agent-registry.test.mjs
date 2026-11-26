@@ -1328,3 +1328,41 @@ test("prepare_agent_link gives no Portal URL to a wallet that cannot sign the li
   const refused = await f.service.prepareAgentLink();
   assert.equal(refused.link_blocked, "wallet_locked"); assert.equal(refused.portal_url, undefined); assert.match(refused.next_action, /Do not ask the user to sign/);
 });
+
+test("a token-paid replacement the bundler keeps refusing can be replaced once more with native gas, and either may still win", async t => {
+  for (const winner of ["prior", "native", "original"]) {
+    const f = await tokenRegistryFixture(t), id = randomUUID(), balances = f.chain.balances, args = { request_id: id, approval: f.approval, gas_token: "USDC" };
+    await f.service.send("link_agent", args);
+    f.chain.balances = async (...a) => ({ ...await balances(...a), native: "1000000" });
+    const token = (await f.service.reviewReplacement(id)).records[0];
+    // The paymaster's terms moved: the bundler refuses the signed token-paid bytes every time.
+    const relay = f.chain.relay;
+    f.chain.relay = async () => { throw new Error("paymaster: insufficient token payment"); };
+    assert.equal((await f.service.replace(id, password, digest(token))).status, "superseding");
+    assert.equal((await f.service.resolve(id, password)).status, "superseding");
+    await assert.rejects(f.service.send("link_agent", { ...args, request_id: randomUUID() }), { code: "operation_pending" });
+    // Only native gas may follow it, once.
+    await assert.rejects(f.service.reviewReplacement(id), e => e.code === "operation_pending" && /--native-gas/.test(e.message));
+    f.chain.buildReplacement = (wallet, original, state, gasToken) => {
+      assert.equal(gasToken, "native");
+      const built = unsigned(wallet, { to: wallet.account, amount: "0" }, state);
+      built.op.maxFeePerGas = 2n; built.op.maxPriorityFeePerGas = 2n;
+      built.userOpHash = computeUserOpHash(built.op, MAINNET.identity.entryPoint.address, 24101);
+      return built;
+    };
+    const native = (await f.service.reviewReplacement(id, true)).records[0];
+    assert.equal(native.priorReplacement.userOpHash, token.replacement.userOpHash);
+    await assert.rejects(f.service.reviewReplacement(id), e => e.code === "operation_pending" && /--native-gas/.test(e.message));
+    f.chain.relay = relay;
+    const sent = await f.service.replace(id, password, digest(native));
+    assert.equal(sent.status, "superseding"); assert.equal(sent.prior_replacement_user_op_hash, token.replacement.userOpHash);
+    // Every signed operation keeps its reservation until a receipt shows which one won.
+    await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { [f.token]: "273", native: native.replacement.maxGasCost }));
+    await assert.rejects(f.service.reviewReplacement(id, true), { code: "operation_pending" });
+    const landed = { prior: token.replacement.userOpHash, native: native.replacement.userOpHash, original: token.userOpHash }[winner];
+    f.chain.receipt = async r => r.userOpHash === landed ? { success: true, actualGasCost: 400n, transactionHash: `0x${"77".repeat(32)}` } : undefined;
+    assert.equal((await f.service.operation(id)).status, winner === "original" ? "confirmed" : "superseded");
+    // The original releases both replacements' gas reservations; a replacement consumes only its own gas.
+    await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { prior: { [f.token]: "150" }, native: { native: "400" }, original: { [f.token]: "123" } }[winner]));
+  }
+});

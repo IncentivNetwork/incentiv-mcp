@@ -42,6 +42,10 @@ export const ownsNonce = (status: string) => ["signed", "submitting", "submitted
 /** x402 payments use their own nonce lane, so only other operations hold the account's main nonce. */
 export const holdsMainNonce = (r: { status: string; intent: { kind: string } }) => ownsNonce(r.status) && r.intent.kind !== "x402_payment";
 export const terminal = (status: string) => ["confirmed", "reverted", "failed", "cancelled", "expired", "superseded"].includes(status);
+// fromBlock, searchedBlock and discoveredBlock (x402 only) are the replacement's own receipt search start and progress, as for the original.
+const replacementSchema = z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int(), fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional() }).superRefine((replacement, ctx) => {
+  if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
+});
 const recordSchema = z.strictObject({
   requestId: z.string().uuid(), intent: intentSchema, intentHash: hash,
   status: z.enum(statuses), createdAt: z.number().int(), updatedAt: z.number().int(),
@@ -63,11 +67,13 @@ const recordSchema = z.strictObject({
   fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional(), settledBlock: uint.optional(), settledBlockHash: hash.optional(), delivered: z.boolean().optional(),
   // x402 only: the settlement is past the reorg margin, so reconciliation no longer rechecks it.
   settlementFinal: z.literal(true).optional(),
-  // fromBlock, searchedBlock and discoveredBlock are the replacement's own receipt search start and progress, as for the original.
-  replacement: z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int(), fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional() }).superRefine((replacement, ctx) => {
-    if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
-  }).optional(),
+  replacement: replacementSchema.optional(),
+  // A signed token-paid replacement the bundler kept refusing, kept after a native replacement was reviewed over it:
+  // it may still land, so its hash is still checked and its reservation is still held.
+  priorReplacement: replacementSchema.refine(replacement => replacement.signed && replacement.gasToken !== undefined, "A prior replacement is a signed token-paid one").optional(),
 });
+/** Every signed replacement of an operation; any of them, or the original, may take its nonce. */
+export const signedReplacements = (r: OperationRecord) => [...(r.replacement?.signed ? [r.replacement] : []), ...(r.priorReplacement ? [r.priorReplacement] : [])];
 export type OperationRecord = z.infer<typeof recordSchema>;
 /**
  * x402 only: an unpaid request that cannot safely be sent twice (a POST without an Idempotency-Key), journaled
