@@ -198,8 +198,9 @@ export class WalletService {
         const searched = searchProgress(r);
         // Search each signed candidate independently. Report lookup failures only if none yields a receipt.
         let lookupFailure: { error: unknown } | undefined;
+        // RPCs that disagree, one lagging behind say, leave a lookup unfinished rather than failing the wallet.
         const findReceipt = (record: OperationRecord) => this.chain.receipt(record).catch((error: unknown) => {
-          if (!lookupFailure || error instanceof WalletError) lookupFailure = { error };
+          if (!lookupFailure || (error instanceof WalletError && !(error instanceof RpcDisagreementError))) lookupFailure = { error };
           return undefined;
         });
         const receipt = await findReceipt(r);
@@ -250,7 +251,7 @@ export class WalletService {
         if (blockHash) r.settledBlockHash = blockHash; else delete r.settledBlockHash;
         await journal.transition(r, receipt.success ? "confirmed" : "reverted");
       } catch (error) {
-        if (error instanceof WalletError) throw error;
+        if (error instanceof WalletError && !(error instanceof RpcDisagreementError)) throw error;
         if (r.status === "submitted" && r.intent.kind !== "x402_payment") await journal.transition(r, "submission_unknown");
       }
     }

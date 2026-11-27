@@ -2810,3 +2810,16 @@ test("prepare_agent_link refuses while a pending payment would deploy the agent"
   assert.equal(refused.link_blocked, "operation_pending"); assert.equal(refused.portal_url, undefined);
   assert.match(refused.next_action, new RegExp(id));
 });
+
+test("RPCs that disagree during a pending payment's receipt search leave other wallet calls working", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+  f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true });
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal((await f.service.operation(id)).status, "submitted");
+  const receipt = f.chain.receipt;
+  f.chain.receipt = async r => { if (r.intent.kind === "x402_payment") throw new RpcDisagreementError("RPC nonces disagree"); return receipt(r); };
+  assert.equal((await f.service.operation(id)).status, "submitted");
+  assert.ok((await f.service.get()).account);
+  assert.equal((await f.service.send("transfer", args(randomUUID()))).status, "submitted");
+  f.chain.receipt = receipt;
+});
