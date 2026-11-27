@@ -13,6 +13,11 @@ export type Tell = (message: string) => void;
  * and links an agent declared 1,114,937 units on mainnet, so the default leaves room above that.
  */
 export const technicalLimits = { maxSlippageBps: 50, maxQuoteDeviationBps: 50, maxFeePerGas: "100000000000000", maxGasUnits: "1500000", maxBatchCalls: 4 };
+/** Kept permissions can predate the default above; say so when a link is added under a lower gas unit cap. */
+export function linkGasWarning(limits: Pick<Limits, "maxGasUnits">): string | undefined {
+  if (BigInt(limits.maxGasUnits) >= BigInt(technicalLimits.maxGasUnits)) return undefined;
+  return `The kept gas unit cap of ${Number(limits.maxGasUnits).toLocaleString("en-US")} is below the ${Number(technicalLimits.maxGasUnits).toLocaleString("en-US")} a first link that deploys the agent and pays gas in a token can need, so such a link will need terminal approval. To raise it, rerun setup without keeping the current permissions.`;
+}
 
 /** Policy allowances may be zero. Never round or parse amounts through floating point. */
 export function allowance(text: string, decimals: number): string {

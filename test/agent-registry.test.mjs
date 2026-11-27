@@ -610,6 +610,10 @@ test("registry reads report RPC failures as temporary", async t => {
 test("prepare_agent_link only sends the user to Portal when linking can succeed", async t => {
   const f = await fixture(t), linkable = { parent: zero, agent_is_parent: false, agent_eligible: false, factory_allowed: true, deployed: false };
   const prepared = async status => { f.chain.registryStatus = async () => ({ ...linkable, ...status }); return f.service.prepareAgentLink(); };
+  // A policy that allows no Portal account could not use the approval.
+  const noParent = await prepared({});
+  assert.equal(noParent.link_blocked, "registry_parent_not_allowed"); assert.equal(noParent.portal_url, undefined); assert.match(noParent.next_action, /allows no Portal account/);
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: false } } }));
   const ready = await prepared({});
   assert.ok(ready.portal_url); assert.equal(ready.link_blocked, undefined);
   for (const [status, code] of [[{ parent }, "registry_already_linked"], [{ agent_is_parent: true }, "registry_ineligible"], [{ factory_allowed: false }, "registry_factory_not_allowed"], [{ deployed: true }, "registry_ineligible"], [{ deployed: true, factory_allowed: false }, "registry_factory_not_allowed"]]) {
@@ -1645,4 +1649,14 @@ test("a parent the registry does not currently accept keeps a link retryable ins
   const waiting = await g.service.operation(other);
   assert.equal(waiting.status, "approval_required"); assert.equal(waiting.last_error, code);
   assert.match(waiting.next_action, /does not currently accept this Portal account as a parent/);
+});
+
+test("an unsigned link refused because its approval outlasts local policy keeps its request ID", async t => {
+  const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval };
+  assert.equal((await f.service.send("link_agent", args)).status, "approval_required");
+  f.chain.verifyRegistry = async () => { throw new WalletError("registry_approval_outlasts_policy", "Portal approval lasts past the local wallet policy's expiry; renew the policy with incentiv-mcp setup in your local terminal, or obtain a fresh approval"); };
+  await assert.rejects(f.service.send("link_agent", args), { code: "registry_approval_outlasts_policy" });
+  const waiting = await f.service.operation(id);
+  assert.equal(waiting.status, "approval_required"); assert.equal(waiting.last_error, "registry_approval_outlasts_policy");
+  assert.match(waiting.next_action, /renews the policy.*same request ID/);
 });

@@ -14,7 +14,7 @@ import { authorize, limitsSchema } from "./wallet/policy.js";
 import { digest } from "./wallet/journal.js";
 import { backupWallet } from "./wallet/backup.js";
 import { confirmedSecret, requireTerminal, secretPrompt, textPrompt } from "./wallet/cli.js";
-import { answer, hasLinkPermission, policySummary, promptAgentRegistry, promptPolicy, promptX402, REGISTRY_APPROVAL_HINT, withLinkPermission, withoutUnlink, yesNo, type Ask, type Tell } from "./setup-policy.js";
+import { answer, hasLinkPermission, linkGasWarning, policySummary, promptAgentRegistry, promptPolicy, promptX402, REGISTRY_APPROVAL_HINT, withLinkPermission, withoutUnlink, yesNo, type Ask, type Tell } from "./setup-policy.js";
 import { connectClient, connectionFor, type SetupClient } from "./setup-client.js";
 
 export interface SetupIO {
@@ -68,11 +68,17 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
       if (review.wallet.manifest_id === config.manifest.manifestId) {
         const registry = await promptAgentRegistry(config, ask, tell);
         if (registry.agentRegistry) limits = withLinkPermission(config, limitsSchema.parse({ ...limits, agentRegistry: registry.agentRegistry }));
+        const warning = registry.agentRegistry && linkGasWarning(limits);
+        if (warning) tell(warning);
       } else tell(REGISTRY_APPROVAL_HINT);
     } else if (config.manifest.agentRegistry && limits.agentRegistry && !hasLinkPermission(config, limits)) {
       // The approved registry moved to a new proxy: the kept parents stay, but link() is allowed only on the old address.
       if (review.wallet.manifest_id !== config.manifest.manifestId) tell(REGISTRY_APPROVAL_HINT);
-      else if (await yesNo(ask, tell, `The Agent Registry is now at ${config.manifest.agentRegistry.proxy.address.toLowerCase()}, and the kept permissions do not allow sending a link there. Add that link permission, keeping the allowed Portal accounts (${limits.agentRegistry.parents.join(", ")}) and every other limit? Connections are permanent.`, true)) limits = withLinkPermission(config, limits);
+      else if (await yesNo(ask, tell, `The Agent Registry is now at ${config.manifest.agentRegistry.proxy.address.toLowerCase()}, and the kept permissions do not allow sending a link there. Add that link permission, keeping the allowed Portal accounts (${limits.agentRegistry.parents.join(", ")}) and every other limit? Connections are permanent.`, true)) {
+        limits = withLinkPermission(config, limits);
+        const warning = linkGasWarning(limits);
+        if (warning) tell(warning);
+      }
       else tell("Kept without the new registry's link permission: each link_agent request will need terminal approval.");
     }
     // x402 is asked about when it is off, and when it is on unless the user keeps it: answering no to

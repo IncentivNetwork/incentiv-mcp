@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import vm from "node:vm";
-import { MAINNET } from "../src/config.ts";
+import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
 import { Ctx } from "../src/context.ts";
 import { makeServer } from "../src/server.ts";
 import { renderHtml, renderMarkdown } from "../src/docs.ts";
@@ -77,4 +77,9 @@ test("client choices stay independent and copy supports denied clipboard access"
   deny = true; await button.click();
   assert.equal(selected, code);
   assert.match(status.textContent, /Ctrl\+C or Command\+C/);
+});
+
+test("agent connection docs appear only when the manifest has the Agent Registry", () => {
+  assert.match(renderMarkdown(MAINNET, []), /## Agent connections/);
+  assert.doesNotMatch(renderMarkdown(withoutAgentRegistry(MAINNET), []), /## Agent connections|sign_agent_link/);
 });

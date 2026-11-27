@@ -7,7 +7,7 @@ import { encodeFunctionData, toFunctionSelector } from "viem";
 import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
-import { allowance, answer, MAX_POLICY_LIST, policySummary, promptAgentRegistry, promptPolicy, promptX402, setupTargets, technicalLimits, X402_MIN_USDC_GAS } from "../src/setup-policy.ts";
+import { allowance, answer, linkGasWarning, MAX_POLICY_LIST, policySummary, promptAgentRegistry, promptPolicy, promptX402, setupTargets, technicalLimits, X402_MIN_USDC_GAS } from "../src/setup-policy.ts";
 import { connectionFor, clientConfigPath, mergeConnection, saveClientConfig, connectClient } from "../src/setup-client.ts";
 import { setupWallet, checkRuntime } from "../src/setup.ts";
 import { parseWalletProfileArgs } from "../src/wallet-profile.ts";
@@ -371,4 +371,9 @@ test("setup asks again when a list is longer than the policy allows, instead of 
   const registry = await promptAgentRegistry(MAINNET, async () => { assert.ok(parents.length); return parents.shift(); }, tell);
   assert.equal(parents.length, 0); assert.equal(registry.agentRegistry.parents.length, 3);
   assert.ok(told.some(m => /at most 100 Portal smart-account addresses/.test(m)));
+});
+
+test("kept permissions below the default gas unit cap are flagged when a link is added", () => {
+  assert.match(linkGasWarning({ maxGasUnits: "1000000" }), /1,000,000 is below the 1,500,000.*terminal approval/);
+  assert.equal(linkGasWarning({ maxGasUnits: technicalLimits.maxGasUnits }), undefined);
 });

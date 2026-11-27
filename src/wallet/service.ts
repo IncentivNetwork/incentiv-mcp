@@ -429,10 +429,11 @@ export class WalletService {
         const status = await this.chain.registryStatus(s.envelope);
         const blocked = linkBlocker(status, status.deployed);
         if (blocked) return linkRefusal(status, blocked);
-        await this.linkPolicy(s);
+        const limits = await this.linkPolicy(s);
+        if (!limits.agentRegistry?.parents.length) throw new WalletError("registry_parent_not_allowed", "Local wallet policy allows no Portal account to connect this agent. Add one with incentiv-mcp setup in your local terminal, then call prepare_agent_link again");
         return { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };
       } catch (error) {
-        if (error instanceof WalletError && ["policy_not_configured", "wallet_locked", "policy_expired", "capability_manifest_unapproved"].includes(error.code)) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
+        if (error instanceof WalletError && ["policy_not_configured", "wallet_locked", "policy_expired", "capability_manifest_unapproved", "registry_parent_not_allowed"].includes(error.code)) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
         throw error;
       }
     });
@@ -1224,7 +1225,8 @@ async function pooled(tasks: (() => Promise<void>)[], limit: number): Promise<vo
 const rpcOutage = (error: unknown) => error instanceof RpcDisagreementError || (!(error instanceof WalletError) && (isTransportFailure(error) || error instanceof BundlerUnavailableError))
   ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : error;
 /** Refusals that say nothing about the request itself, so an unsigned request returns to approval_required and keeps its ID. */
-const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable", "registry_factory_not_allowed", "registry_parent_not_eligible"];
+// Renewing the local policy clears registry_approval_outlasts_policy, so the request keeps its ID for that too.
+const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable", "registry_factory_not_allowed", "registry_parent_not_eligible", "registry_approval_outlasts_policy"];
 /** Registry refusals that the same signed bytes can never get past. */
 const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed", "registry_unlink_unsupported",
   // Connections are permanent, so an agent that is already linked, or an account role that forbids the link, does not change.
@@ -1383,5 +1385,6 @@ function result(r: OperationRecord) {
   const eventMissing = r.status === "confirmed" && r.lastError === "registry_event_missing";
   const registryError = eventMissing || (r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_")) ? r.lastError : undefined;
   const interrupted = r.status === "approval_required" && TEMPORARY_ERRORS.includes(r.lastError ?? "");
-  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `${r.lastError === "registry_factory_not_allowed" ? "The Agent Registry does not currently allow this account's factory. Retry with the same request ID once it does, while the Portal approval is still valid" : r.lastError === "registry_parent_not_eligible" ? "The Agent Registry does not currently accept this Portal account as a parent. Retry with the same request ID once it does, while the Portal approval is still valid" : "A temporary RPC failure interrupted this request. Retry with the same request ID"}${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, prior_replacement_user_op_hash: r.priorReplacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
+  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `${r.lastError === "registry_factory_not_allowed" ? "The Agent Registry does not currently allow this account's factory. Retry with the same request ID once it does, while the Portal approval is still valid" : r.lastError === "registry_parent_not_eligible" ? "The Agent Registry does not currently accept this Portal account as a parent. Retry with the same request ID once it does, while the Portal approval is still valid"
+      : r.lastError === "registry_approval_outlasts_policy" ? "The Portal approval lasts past the local wallet policy's expiry. Once the user renews the policy with incentiv-mcp setup, retry with the same request ID while the Portal approval is still valid" : "A temporary RPC failure interrupted this request. Retry with the same request ID"}${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, prior_replacement_user_op_hash: r.priorReplacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }
