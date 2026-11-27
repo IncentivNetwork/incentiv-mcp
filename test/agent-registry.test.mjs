@@ -1388,7 +1388,11 @@ test("a token-paid replacement the bundler keeps refusing can be replaced once m
       // A stale hint for the original or the newer replacement must not hide a verified winner.
       throw new Error("Receipt is not in the canonical chain");
     };
-    assert.equal((await f.service.operation(id)).status, winner === "original" ? "confirmed" : "superseded");
+    const settled = await f.service.operation(id);
+    assert.equal(settled.status, winner === "original" ? "confirmed" : "superseded");
+    for (const hash of [token.userOpHash, token.replacement.userOpHash, native.replacement.userOpHash]) {
+      assert.deepEqual(await f.service.operation(hash), settled);
+    }
     // The original releases both replacements' gas reservations; a replacement consumes only its own gas.
     await f.store.session(async s => assert.deepEqual((await Journal.open(s)).used(), { prior: { [f.token]: "150" }, native: { native: "400" }, original: { [f.token]: "123" } }[winner]));
   }

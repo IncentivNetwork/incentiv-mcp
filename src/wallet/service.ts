@@ -404,7 +404,9 @@ export class WalletService {
   async operation(id: string) {
     return this.store.session(async s => {
       const journal = await Journal.open(s); await this.reconcile(journal);
-      const r = journal.data.records.find(r => r.requestId === id.toLowerCase() || r.userOpHash === id.toLowerCase());
+      const key = id.toLowerCase();
+      const r = journal.data.records.find(r => r.requestId === key || r.userOpHash === key ||
+        r.replacement?.userOpHash === key || r.priorReplacement?.userOpHash === key);
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
       return result(r);
     });
