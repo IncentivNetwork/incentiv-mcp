@@ -66,7 +66,7 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
     if (limits !== review.wallet.policy.limits) tell("Connections are now permanent, so the unlink permission an earlier version saved is left out below. It stays stored, and is never used, until you type ENABLE at the end of setup to save these permissions.");
     if (config.manifest.agentRegistry && !limits.agentRegistry) {
       if (review.wallet.manifest_id === config.manifest.manifestId) {
-        const registry = await promptAgentRegistry(config, ask, tell);
+        const registry = await promptAgentRegistry(config, ask, tell, review.wallet.account);
         if (registry.agentRegistry) limits = withLinkPermission(config, limitsSchema.parse({ ...limits, agentRegistry: registry.agentRegistry }));
         const warning = registry.agentRegistry && linkGasWarning(limits);
         if (warning) tell(warning);
@@ -90,7 +90,7 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
     }
     tokens = await Promise.all(Object.keys(limits.tokens).map(token => service.chain.token(token)));
   } else {
-    ({ limits, tokens } = await promptPolicy(config, ref => service.chain.token(ref), ask, tell, !review || review.wallet.manifest_id === config.manifest.manifestId));
+    ({ limits, tokens } = await promptPolicy(config, ref => service.chain.token(ref), ask, tell, !review || review.wallet.manifest_id === config.manifest.manifestId, review?.wallet.account));
   }
   tell(policySummary(limits, tokens, config.identity.nativeSymbol));
   if (!await yesNo(ask, tell, review ? "Continue with these permissions and create an encrypted backup?" : "Create this wallet DISABLED and make an encrypted backup?")) {

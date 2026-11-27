@@ -377,3 +377,12 @@ test("kept permissions below the default gas unit cap are flagged when a link is
   assert.match(linkGasWarning({ maxGasUnits: "1000000" }), /1,000,000 is below the 1,500,000.*terminal approval/);
   assert.equal(linkGasWarning({ maxGasUnits: technicalLimits.maxGasUnits }), undefined);
 });
+
+test("setup refuses the agent's own account as its Portal parent", async () => {
+  const agent = "0x00000000000000000000000000000000000000a1", other = "0x00000000000000000000000000000000000000b2", told = [];
+  const replies = ["y", `${other},${agent}`, other];
+  const registry = await promptAgentRegistry(MAINNET, async () => replies.shift(), m => told.push(m), agent);
+  assert.equal(replies.length, 0);
+  assert.deepEqual(registry.agentRegistry.parents.map(p => p.toLowerCase()), [other]);
+  assert.ok(told.some(m => /own account, which cannot be its own parent/.test(m)));
+});

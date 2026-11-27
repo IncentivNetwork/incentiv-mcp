@@ -187,8 +187,11 @@ export class WalletService {
     // Reconciliation runs at the start of a locked session, so an x402 payment still preparing was interrupted
     // before it was signed: nothing can send it, so it is closed.
     for (const r of journal.data.records) if (r.intent.kind === "x402_payment" && r.status === "preparing") { r.lastError = "x402_preparation_interrupted"; await journal.transition(r, "failed"); }
+    // Signed payments share one account state read; each reads only its own lane at that block.
+    let shared: Promise<ChainState> | undefined;
+    const state = () => shared ??= this.chain.state(journal.session.envelope);
     for (const r of journal.data.records.filter(r => ownsNonce(r.status))) {
-      if (r.status === "signed" && r.intent.kind === "x402_payment") await this.reconcileSignedX402(journal, r);
+      if (r.status === "signed" && r.intent.kind === "x402_payment") await this.reconcileSignedX402(journal, r, state);
       if (r.status === "signed" || !ownsNonce(r.status)) continue;
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
       try {
@@ -841,8 +844,9 @@ export class WalletService {
    * immediately. An unused lane can expire only after the seller's deadline. Returns whether the payment expired,
    * or undefined when the lane could not be read.
    */
-  private async reconcileSignedX402(journal: Journal, r: OperationRecord): Promise<boolean | undefined> {
-    const lane = await this.chain.stateFor(journal.session.envelope, r).catch(() => undefined);
+  private async reconcileSignedX402(journal: Journal, r: OperationRecord, state?: () => Promise<ChainState>): Promise<boolean | undefined> {
+    const wallet = journal.session.envelope;
+    const lane = await (state ? state().then(async s => ({ ...s, nonce: await this.chain.laneNonce(wallet, BigInt(r.nonce!) >> 64n, s.block) })) : this.chain.stateFor(wallet, r)).catch(() => undefined);
     if (!lane) return undefined;
     if (lane.nonce !== BigInt(r.nonce!)) {
       r.lastError = "submission_unknown";

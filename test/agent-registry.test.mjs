@@ -1729,3 +1729,14 @@ test("a link request that waits on a full parent keeps its request ID", async t 
   assert.equal(waiting.status, "approval_required"); assert.equal(waiting.last_error, "registry_limit_reached");
   assert.match(waiting.next_action, /reached its agent limit.*same request ID/);
 });
+
+test("a bundler's HTTP 400 keeps its RPC error's reason", async t => {
+  const { bundlerRpc, BundlerUnavailableError } = await import("../src/userop.ts");
+  const ctx = new Ctx(MAINNET);
+  t.mock.method(globalThis, "fetch", async () => Response.json({ jsonrpc: "2.0", id: 1, error: { code: -32500, message: "AA21 didn't pay prefund" } }, { status: 400 }));
+  await assert.rejects(bundlerRpc(ctx, "eth_estimateUserOperationGas", []), e => !(e instanceof BundlerUnavailableError) && /AA21 didn't pay prefund/.test(e.message));
+  t.mock.restoreAll();
+  t.mock.method(globalThis, "fetch", async () => new Response("bad request", { status: 400 }));
+  await assert.rejects(bundlerRpc(ctx, "eth_estimateUserOperationGas", []), e => !(e instanceof BundlerUnavailableError) && /Bundler HTTP 400/.test(e.message));
+  t.mock.restoreAll();
+});

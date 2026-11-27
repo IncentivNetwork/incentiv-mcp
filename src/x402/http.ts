@@ -118,12 +118,14 @@ export function checkHeaders(headers: Record<string, string> | undefined): Recor
  */
 export const directAgent = new Agent({ keepAlive: false });
 
+const isJson = (text: string) => { try { JSON.parse(text); return true; } catch { return false; } };
+
 /** The default transport: one HTTPS request, no redirects, public addresses only, bounded size and time. */
 export const httpsTransport: HttpTransport = (req) => new Promise((resolve, reject) => {
   const url = checkResourceUrl(req.url);
   const body = req.body === undefined ? undefined : Buffer.from(req.body, "utf8");
   const headers: Record<string, string> = { "user-agent": "incentiv-mcp", accept: "application/json, text/*;q=0.9, */*;q=0.5", ...req.headers, "accept-encoding": "identity" };
-  if (body) { headers["content-length"] = String(body.length); headers["content-type"] ??= "application/json"; }
+  if (body) { headers["content-length"] = String(body.length); headers["content-type"] ??= isJson(req.body!) ? "application/json" : "text/plain; charset=utf-8"; }
   const timeout = req.timeoutMs ?? 60_000;
   let finishInterrupted: (() => void) | undefined;
   const call = httpsRequest(url, { method: req.method, headers, agent: directAgent, lookup: publicLookup, timeout }, res => {

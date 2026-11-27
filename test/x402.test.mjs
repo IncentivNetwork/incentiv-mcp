@@ -2783,3 +2783,19 @@ test("wallet operation resolve reports a payment its own reconciliation just exp
     await assert.rejects(f.service.reviewReplacement(id), e => e.code === "operation_pending" && /already ended as expired/.test(e.message));
   } finally { Date.now = now; }
 });
+
+test("reconciliation reads account state once for all signed payments", async t => {
+  const f = await x402Fixture(t), http = f.service.http;
+  const { NOT_SENT } = await import("../src/x402/http.ts");
+  f.service.http = async req => { if (!req.headers?.["payment-signature"]) return http(req); throw Object.defineProperty(new Error("x"), NOT_SENT, { value: true }); };
+  const state = f.chain.state;
+  f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true });
+  const ids = [randomUUID(), randomUUID(), randomUUID()];
+  for (const id of ids) await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }).catch(() => undefined);
+  assert.equal((await f.records()).filter(r => r.status === "signed").length, 3);
+  let reads = 0;
+  const counted = f.chain.state;
+  f.chain.state = async (...a) => { reads++; return counted(...a); };
+  assert.equal((await f.service.operation(ids[0])).status, "signed");
+  assert.equal(reads, 1);
+});

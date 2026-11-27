@@ -175,14 +175,16 @@ export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): P
   const busy = res.status === 408 || res.status === 429 || res.status >= 500;
   const unusable = res.status === 401 || res.status === 403 || res.status === 404 || res.status === 407;
   if (unusable) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
-  if (!busy && !res.ok) throw new Error(`Bundler HTTP ${res.status}`);
+  // Another error status is about the request; its body, if it is an RPC error, says why.
+  const refused = !busy && !res.ok;
+  const unreadable = (detail: string) => busy ? new BundlerUnavailableError(`Bundler HTTP ${res.status}`) : refused ? new Error(`Bundler HTTP ${res.status}`) : new BundlerUnavailableError(detail);
   let body: unknown;
-  try { body = await res.json(); } catch { throw new BundlerUnavailableError(busy ? `Bundler HTTP ${res.status}` : "Bundler answer is not valid JSON"); }
-  if (!body || typeof body !== "object" || Array.isArray(body)) throw new BundlerUnavailableError(busy ? `Bundler HTTP ${res.status}` : "Bundler answer is not an RPC response");
+  try { body = await res.json(); } catch { throw unreadable("Bundler answer is not valid JSON"); }
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw unreadable("Bundler answer is not an RPC response");
   // A success may carry "error": null, and an error may carry "result": null.
   const errorOnly = "error" in body && body.error != null && wellFormedRpcError(body.error) && (!("result" in body) || body.result === null);
   // Some bundlers send a rejected operation's RPC error with HTTP 500, so a busy status is an outage only without one.
-  if (busy && !errorOnly) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
+  if ((busy || refused) && !errorOnly) throw unreadable("");
   if ("error" in body && body.error != null) {
     const { error } = body;
     if (!errorOnly || !error || typeof error !== "object" || !("code" in error) || !Number.isInteger(error.code) ||
