@@ -187,7 +187,7 @@ incentiv-mcp wallet recover
 incentiv-mcp wallet approve <request-id>
 incentiv-mcp wallet disable
 incentiv-mcp wallet operation resolve <request-id>
-incentiv-mcp wallet operation resolve <request-id> --replace
+incentiv-mcp wallet operation resolve <request-id> --replace [--native-gas]
 incentiv-mcp wallet backup --out <file>
 incentiv-mcp wallet restore --in <file>
 incentiv-mcp wallet migrate [1]
@@ -241,9 +241,14 @@ exceptions, export an encrypted backup or resolve/rebroadcast a stuck operation.
 Exception approval displays and binds the canonical intent, exact unsigned
 operation/hash, gas/payment limits, and swap minimum/deadline for at most five
 minutes. Retrying the same request ID consumes that exact approval. Replacement
-review builds a zero-value self-transfer at the original nonce with native gas;
+review builds a zero-value self-transfer at the original nonce using the original operation’s gas token,
+or native gas with `--native-gas` when the token balance or paymaster cannot cover it;
 either original or replacement may win. Both reservations remain until a verified
 receipt resolves the nonce. Disabling prevents either from being rebroadcast.
+A signed token-paid replacement can become unsendable when the paymaster's terms
+move, since the bundler then refuses the same bytes. It can be replaced once more
+with `--native-gas`. The token-paid one is kept and may still win, so its hash is
+still checked and all three reservations remain until a verified receipt.
 
 Backup refuses while any operation owns a nonce. The portable bundle encrypts
 the envelope, wrapping key and complete authenticated journal using scrypt

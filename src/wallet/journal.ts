@@ -20,6 +20,9 @@ export type Intent = z.infer<typeof intentSchema>;
 export const statuses = ["preparing", "approval_required", "signed", "submitting", "submitted", "submission_unknown", "superseding", "superseded", "confirmed", "reverted", "failed", "cancelled", "expired"] as const;
 export const ownsNonce = (status: string) => ["signed", "submitting", "submitted", "submission_unknown", "superseding"].includes(status);
 export const terminal = (status: string) => ["confirmed", "reverted", "failed", "cancelled", "expired", "superseded"].includes(status);
+const replacementSchema = z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int() }).superRefine((replacement, ctx) => {
+  if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
+});
 const recordSchema = z.strictObject({
   requestId: z.string().uuid(), intent: intentSchema, intentHash: hash,
   status: z.enum(statuses), createdAt: z.number().int(), updatedAt: z.number().int(),
@@ -35,8 +38,13 @@ const recordSchema = z.strictObject({
     liveTest: z.strictObject({ requestId: z.string().uuid(), policyDigest: hash }).optional(),
   }).optional(),
   transactionHash: hash.optional(),
-  replacement: z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, signed: z.boolean(), expiresAt: z.number().int() }).optional(),
+  replacement: replacementSchema.optional(),
+  // A signed token-paid replacement the bundler kept refusing, kept after a native replacement was reviewed over it:
+  // it may still land, so its hash is still checked and its reservation is still held.
+  priorReplacement: replacementSchema.refine(replacement => replacement.signed && replacement.gasToken !== undefined, "A prior replacement is a signed token-paid one").optional(),
 });
+/** Every signed replacement of an operation; any of them, or the original, may take its nonce. */
+export const signedReplacements = (r: OperationRecord) => [...(r.replacement?.signed ? [r.replacement] : []), ...(r.priorReplacement ? [r.priorReplacement] : [])];
 export type OperationRecord = z.infer<typeof recordSchema>;
 export const journalSchema = z.strictObject({
   schemaVersion: z.literal(1), walletId: z.string().uuid(), networkId: hash, manifestId: hash,

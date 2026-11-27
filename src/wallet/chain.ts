@@ -7,7 +7,7 @@ import { accountAbi, accountFactoryAbi, dexFactoryAbi, dexPoolAbi, entryPointAbi
 import { BundlerUnavailableError, broadcastUserOp, buildUserOpUnsigned, bundlerRpc, estimateUserOpGas, userOpFromJson as userOpFromWire, type UserOp } from "../userop.js";
 import { buildSwapCalls, planRoute, quoteRoute } from "../swap.js";
 import { WalletError, type WalletEnvelope } from "./keystore.js";
-import { type Intent, type OperationRecord } from "./journal.js";
+import { signedReplacements, type Intent, type OperationRecord } from "./journal.js";
 import { type Limits, type Spend } from "./policy.js";
 import type { validateOperation } from "./validate.js";
 
@@ -17,6 +17,20 @@ export const SWAP_DEADLINE_SECONDS = 60;
 export const MIN_SWAP_REMAINING_SECONDS = 10;
 export interface ChainState { nonce: bigint; deployed: boolean; block: bigint; timestamp: number; fees: { baseFeePerGas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } }
 export interface ChainReceipt { success: boolean; actualGasCost: bigint; transactionHash: Hex }
+
+/**
+ * Fees for a same-nonce replacement of `original`: at least 20% above the highest fees among the operations already
+ * signed at that nonce, which bundlers require to replace one in their pool, or the current fees when they are higher.
+ * A native replacement can follow a signed token-paid one that the bundler may still hold, so it must outbid both.
+ */
+export function replacementFees<T extends { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }>(fees: T, original: OperationRecord): T {
+  const signed = [original.operation!, ...signedReplacements(original).map(c => c.operation)].map(userOpFromWire);
+  const above = (current: bigint, values: bigint[]) => {
+    const bumped = values.reduce((max, n) => n > max ? n : max, 0n) * 120n / 100n + 1n;
+    return current > bumped ? current : bumped;
+  };
+  return { ...fees, maxFeePerGas: above(fees.maxFeePerGas, signed.map(o => o.maxFeePerGas)), maxPriorityFeePerGas: above(fees.maxPriorityFeePerGas, signed.map(o => o.maxPriorityFeePerGas)) };
+}
 
 export class WalletChain {
   readonly clients: PublicClient[];
@@ -155,12 +169,11 @@ export class WalletChain {
       throw new WalletError("simulation_failed", "The exact validated operation failed simulation or exceeds its gas allocation");
     }
   }
-  async buildReplacement(wallet: WalletEnvelope, original: OperationRecord, state: ChainState) {
+  async buildReplacement(wallet: WalletEnvelope, original: OperationRecord, state: ChainState, gasToken = original.intent.gasToken) {
     const old = userOpFromWire(original.operation!);
     if (state.nonce !== old.nonce) throw new WalletError("operation_pending", "The original nonce has moved; locate its receipt before resolution");
-    const bump = (n: bigint) => n * 120n / 100n + 1n;
-    const fees = { ...state.fees, maxFeePerGas: state.fees.maxFeePerGas > bump(old.maxFeePerGas) ? state.fees.maxFeePerGas : bump(old.maxFeePerGas), maxPriorityFeePerGas: state.fees.maxPriorityFeePerGas > bump(old.maxPriorityFeePerGas) ? state.fees.maxPriorityFeePerGas : bump(old.maxPriorityFeePerGas) };
-    return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, state: { ...state, fees }, calls: [{ to: wallet.account as Address, value: 0n, data: "0x" }] });
+    const fees = replacementFees(state.fees, original);
+    return buildUserOpUnsigned(this.ctx, { account: wallet.account as Address, owner: wallet.owner as Address, state: { ...state, fees }, calls: [{ to: wallet.account as Address, value: 0n, data: "0x" }], gasToken: await this.token(gasToken) });
   }
   async relay(operation: Record<string, string>, beforeSubmit?: () => Promise<void>): Promise<string> {
     await beforeSubmit?.();
