@@ -164,7 +164,13 @@ test("a registry upgrade stops capability approval but not startup or ordinary w
   const upgraded = (url, method, params) => method === "eth_getStorageAt" ? encodeAbiParameters([{ type: "address" }], [other]) : good(url, method, params);
   await verifyNetwork(cfg, upgraded, "local");
   await verifyNetwork(cfg, upgraded);
-  await assert.rejects(verifyNetwork(cfg, upgraded, "capability"), /Registry implementation or signing domain mismatch/);
+  await assert.rejects(verifyNetwork(cfg, upgraded, "capability"), /Registry implementation mismatch/);
+  // An upgraded implementation that no longer answers eip712Domain is still reported as a registry change.
+  const reverting = (url, method, params) => method === "eth_call" && params[0].to.toLowerCase() === cfg.manifest.agentRegistry.proxy.address.toLowerCase() ? Promise.reject(new Error("execution reverted")) : upgraded(url, method, params);
+  await assert.rejects(verifyNetwork(cfg, reverting, "capability"), /Registry implementation mismatch/);
+  // A pinned implementation whose domain differs is still refused.
+  const domain = (url, method, params) => method === "eth_call" && params[0].to.toLowerCase() === cfg.manifest.agentRegistry.proxy.address.toLowerCase() ? Promise.resolve("0x") : good(url, method, params);
+  await assert.rejects(verifyNetwork(cfg, domain, "capability"));
   await verifyNetwork(cfg, good, "capability");
   const calls = [];
   await verifyNetwork(cfg, mockedRpc(cfg, calls), "local");

@@ -14,9 +14,9 @@ export type Tell = (message: string) => void;
  */
 export const technicalLimits = { maxSlippageBps: 50, maxQuoteDeviationBps: 50, maxFeePerGas: "100000000000000", maxGasUnits: "1500000", maxBatchCalls: 4 };
 /** Kept permissions can predate the default above; say so when a link is added under a lower gas unit cap. */
-export function linkGasWarning(limits: Pick<Limits, "maxGasUnits">): string | undefined {
+export function linkGasWarning(limits: Pick<Limits, "maxGasUnits">, kept = true): string | undefined {
   if (BigInt(limits.maxGasUnits) >= BigInt(technicalLimits.maxGasUnits)) return undefined;
-  return `The kept gas unit cap of ${Number(limits.maxGasUnits).toLocaleString("en-US")} is below the ${Number(technicalLimits.maxGasUnits).toLocaleString("en-US")} a first link that deploys the agent and pays gas in a token can need, so such a link will need terminal approval. To raise it, rerun setup without keeping the current permissions.`;
+  return `The ${kept ? "kept " : ""}gas unit cap of ${Number(limits.maxGasUnits).toLocaleString("en-US")} is below the ${Number(technicalLimits.maxGasUnits).toLocaleString("en-US")} a first link that deploys the agent and pays gas in a token can need, so such a link will need terminal approval. To raise it, rerun setup${kept ? " without keeping the current permissions" : " and edit the advanced limits"}.`;
 }
 
 /** Policy allowances may be zero. Never round or parse amounts through floating point. */
@@ -226,6 +226,8 @@ export async function promptPolicy(config: Config, resolveToken: (ref: string) =
   }
   if (config.manifest.agentRegistry && !registryApproved) tell(REGISTRY_APPROVAL_HINT);
   const { agentRegistry, targets: registryTargets } = registryApproved ? await promptAgentRegistry(config, ask, tell, agent) : {};
+  const gasWarning = agentRegistry && linkGasWarning(technical, false);
+  if (gasWarning) tell(gasWarning);
   const x402 = await promptX402(config, { tokens: amounts }, ask, tell);
   const targets = { ...setupTargets(config, tokens, swaps), ...registryTargets };
   const limits = limitsSchema.parse({ ...(agentRegistry ? { agentRegistry } : {}), ...(x402 ? { x402 } : {}), tokens: amounts, recipients: { mode: "allowlist", addresses: recipients }, targets, swaps, ...technical, independentRpcOrigins: [], ...(swaps ? { trustedRpcOrigins: origins } : {}), maxGasCostWei });

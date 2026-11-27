@@ -376,6 +376,9 @@ test("setup asks again when a list is longer than the policy allows, instead of 
 test("kept permissions below the default gas unit cap are flagged when a link is added", () => {
   assert.match(linkGasWarning({ maxGasUnits: "1000000" }), /1,000,000 is below the 1,500,000.*terminal approval/);
   assert.equal(linkGasWarning({ maxGasUnits: technicalLimits.maxGasUnits }), undefined);
+  // A fresh setup that lowered the cap is told how to raise it there.
+  const fresh = linkGasWarning({ maxGasUnits: "1000000" }, false);
+  assert.match(fresh, /^The gas unit cap of 1,000,000.*edit the advanced limits/); assert.doesNotMatch(fresh, /kept|without keeping/);
 });
 
 test("setup refuses the agent's own account as its Portal parent", async () => {

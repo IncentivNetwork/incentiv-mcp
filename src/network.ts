@@ -118,6 +118,8 @@ export async function verifyNetwork(cfg: Config, request: RpcRequest = rpcReques
         if (checkRegistry) {
           const proxy = cfg.manifest.agentRegistry!.proxy.address;
           const slot = await request(url, "eth_getStorageAt", [proxy, REGISTRY_IMPLEMENTATION_SLOT, block]);
+          // Compared before the domain call: an upgraded implementation may not answer it, which would read as an RPC failure.
+          if (typeof slot !== "string" || !/^0x[0-9a-fA-F]+$/.test(slot) || BigInt(slot) !== BigInt(cfg.manifest.agentRegistry!.implementation.address)) throw new Error("Registry implementation mismatch");
           const data = await call(proxy, encodeFunctionData({ abi: agentRegistryAbi, functionName: "eip712Domain" }));
           const domain = decodeFunctionResult({ abi: agentRegistryAbi, functionName: "eip712Domain", data: data as Hex });
           if (!registryPinsMatch(cfg, slot as string, domain)) throw new Error("Registry implementation or signing domain mismatch");
