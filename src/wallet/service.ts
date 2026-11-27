@@ -1346,7 +1346,9 @@ function sellerSettlement(settled: SettleResponse | undefined, account: string) 
   // A settlement on another network is not this payment's, so none of it is reported as settled.
   const elsewhere = settled.network !== undefined && settled.network !== X402_NETWORK;
   const fields = { transaction: elsewhere ? undefined : match(settled.transaction, /^0x[0-9a-fA-F]{64}$/), network: settled.network === X402_NETWORK ? X402_NETWORK : undefined, payer: payer === account.toLowerCase() ? payer : undefined, error_reason: reason };
-  return { success: settled.success === true && !elsewhere, ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)) } as { success: boolean; transaction?: string; network?: string; payer?: string; error_reason?: string };
+  // A successful SettleResponse names its transaction and network. Without both the report cannot be checked or passed
+  // on as one, so the payment stays unconfirmed until reconciliation finds it on chain.
+  return { success: settled.success === true && !!fields.transaction && fields.network === X402_NETWORK, ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)) } as { success: boolean; transaction?: string; network?: string; payer?: string; error_reason?: string };
 }
 
 /**

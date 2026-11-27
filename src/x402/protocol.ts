@@ -39,7 +39,8 @@ export function paymentNonceKey(paymentId: Hex, validUntil: number): bigint {
  */
 export function parsePaymentRequired(response: HttpResponse): PaymentRequired {
   const header = response.headers["payment-required"];
-  if (!header && response.incomplete) throw new WalletError("x402_invalid_response", "The payment requirements response was interrupted");
+  // A body cut at the size limit can still parse as JSON, so only a complete body can carry the requirements.
+  if (!header && (response.incomplete || response.truncated)) throw new WalletError("x402_invalid_response", response.incomplete ? "The payment requirements response was interrupted" : "The payment requirements response is larger than this wallet reads");
   let parsed: unknown;
   try {
     if (header) parsed = decodePaymentRequiredHeader(header);

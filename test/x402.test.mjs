@@ -82,6 +82,10 @@ test("a 402 is read from its header or body, and only Incentiv USDC through the 
   assert.throws(() => selectRequirements({ ...required, accepts: required.accepts.slice(0, 5) }, MAINNET), { code: "x402_unsupported" });
   assert.throws(() => parsePaymentRequired({ status: 402, headers: {}, body: Buffer.from(JSON.stringify({ ...required, x402Version: 1 })), truncated: false }), { code: "x402_invalid_response" });
   assert.throws(() => parsePaymentRequired({ status: 402, headers: {}, body: Buffer.from("<html>"), truncated: false }), { code: "x402_invalid_response" });
+  // A body cut at the size limit is refused even when what was kept parses; a header stands on its own.
+  const padded = Buffer.from(JSON.stringify(required) + " ".repeat(64));
+  assert.throws(() => parsePaymentRequired({ status: 402, headers: {}, body: padded.subarray(0, padded.length - 8), truncated: true }), e => e.code === "x402_invalid_response" && /larger than this wallet reads/.test(e.message));
+  assert.deepEqual(parsePaymentRequired({ status: 402, headers: { "payment-required": encodePaymentRequiredHeader(required) }, body: Buffer.from("{"), truncated: true }), fromHeader);
 });
 
 test("x402 policy is off by default, bounds sites, sellers and price, and skips the transfer recipient allowlist", () => {
@@ -2746,4 +2750,22 @@ test("a finished transfer replays during an RPC outage even while a recent x402 
   // A new spend still needs the recheck.
   await assert.rejects(f.service.send("transfer", args(randomUUID())), { code: "rpc_unavailable" });
   f.chain.laneNonce = lane;
+});
+
+test("a reported success without a valid transaction or the Incentiv network stays unconfirmed and adds no SettleResponse", async t => {
+  const transaction = `0x${"ab".repeat(32)}`;
+  for (const report of [{ success: true, network: X402_NETWORK }, { success: true, transaction: "0x1234", network: X402_NETWORK }, { success: true, transaction }]) {
+    const f = await x402Fixture(t), http = f.service.http, state = f.chain.state;
+    f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true });
+    f.service.http = async req => req.headers?.["payment-signature"]
+      ? { status: 200, headers: { "content-type": "application/json", "payment-response": encodePaymentResponseHeader(report) }, body: Buffer.from('{"tempC":21}'), truncated: false }
+      : http(req);
+    const tools = {};
+    registerX402Tools({ registerTool: (name, _config, handler) => { tools[name] = handler; } }, f.service);
+    const answer = await tools.pay_x402_resource({ url: URL_, max_amount: "0.05", request_id: randomUUID() });
+    const result = JSON.parse(answer.content[0].text);
+    assert.equal(result.seller_reported_settlement, false, JSON.stringify(report));
+    assert.equal(result.status, "submission_unknown"); assert.equal(result.last_error, "x402_settlement_unconfirmed");
+    assert.equal(answer._meta, undefined);
+  }
 });

@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -331,9 +331,19 @@ async function unlock() {
   const owner = await lockOwner();
   if (!owner) return console.log("No run marker is present.");
   if (running(owner)) throw new Error(`The marker was left ${describe(owner)}, and that run may still be active. Delete ${lock} yourself only once no run is active.`);
+  // Another unlock may have removed it meanwhile and a new run taken the path: remove only the marker checked above.
+  const current = await lockOwner();
+  if (!current || JSON.stringify(current) !== JSON.stringify(owner)) throw new Error(`The marker changed while it was checked. Run unlock again, then status.`);
   await unlink(lock);
   await syncDirectory(directory);
   console.log(`Removed the marker left ${describe(owner)}. Run status to reconcile any funded attempt.`);
+}
+
+/** Paths that differ from HEAD, untracked ones included, outside this run's own records. */
+function dirtyPaths() {
+  const records = relative(root, directory);
+  const inside = records && !records.startsWith("..") && !isAbsolute(records);
+  return execFileSync("git", ["status", "--porcelain", "--untracked-files=all", "--", ".", ...(inside ? [`:(exclude)${records}`] : [])], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean);
 }
 
 async function distDigest() {
@@ -357,11 +367,14 @@ async function freshBuild() {
 
 async function runSuite(run, { retryFailed = false, freeOnly = false, dropResponse = false } = {}) {
   if (!freeOnly) assert.equal(await tokenBalance(run.buyer), budget, "The test buyer must hold exactly 0.05 USDC for this run");
+  // The evidence names a commit, and the package is packed from the working tree, so the two must be the same.
+  const dirty = freeOnly ? [] : dirtyPaths();
+  if (dirty.length) throw new Error(`Funded acceptance evidence needs a clean checkout, but these paths differ from HEAD:\n${dirty.slice(0, 20).join("\n")}${dirty.length > 20 ? `\n… and ${dirty.length - 20} more` : ""}`);
   await preflightSeller();
   // Reserve the suite before enabling the wallet. Only one runner may reach the funded case.
   await acquireLock();
   const store = localWalletStore(MAINNET, run.buyerProfile);
-  let enabled = false, temp;
+  let enabled = false, temp, passed;
   const controller = new AbortController(), { signal } = controller;
   const interrupted = name => {
     process.exitCode = name === "SIGTERM" ? 143 : 130;
@@ -389,9 +402,10 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
       assert.equal(buyerBefore, budget);
       const purchase = { url: seller.url, request_id: randomUUID(), max_amount: PRICE, gas_token: "USDC" };
       const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
-      const walletSourceDirty = Boolean(execFileSync("git", ["status", "--porcelain", "--", "src"], { cwd: root, encoding: "utf8" }).trim());
+      // Checked again here, as the tarball was packed after the first check.
+      if (dirtyPaths().length) throw new Error("The checkout changed during the run, so it cannot be named as this evidence's source. Nothing was paid.");
       const estimatorSha256 = createHash("sha256").update(await readFile(join(dist, "userop.js"))).digest("hex");
-      const build = { commit, walletSourceDirty, distSha256, estimatorSha256, tarballSha256 };
+      const build = { commit, cleanCheckout: true, distSha256, estimatorSha256, tarballSha256 };
       seller.allowPayments();
       const firstPayment = await withBuyer(run.buyerProfile, async call => {
         await save("attempt.json", { ...build, purchase, startedAt: new Date().toISOString() });
@@ -443,12 +457,10 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
         assert.equal(await tokenBalance(run.seller), sellerAfter);
         assert.deepEqual((await call("get_agent_wallet")).result.pending_reservations, {});
 
-        const result = {
+        passed = {
           ...settlement, http: { unpaid: seller.seen.unpaid, paid: seller.seen.paid.length, droppedAfterSettlement: dropResponse },
           replayContentDelivered: replay.content_delivered, passed: true,
         };
-        await save("result.json", result);
-        console.log(JSON.stringify(result, null, 2));
       }, dist, signal);
     }, dropResponse, signal);
   } finally {
@@ -461,6 +473,12 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
       process.off("SIGINT", interrupt);
       process.off("SIGTERM", terminate);
     }
+  }
+  // Reached only once the buyer is disabled and the marker removed: a run whose cleanup failed records no pass,
+  // so status reconciles its attempt instead.
+  if (passed) {
+    await save("result.json", passed);
+    console.log(JSON.stringify(passed, null, 2));
   }
 }
 
