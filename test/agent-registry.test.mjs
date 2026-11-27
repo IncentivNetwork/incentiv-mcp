@@ -957,10 +957,10 @@ async function signedLinkFixture(t, allowed = true, status = {}, policy = {}, op
 }
 
 test("agent links open the configured Portal URL, which an endpoint override changes without re-approval", async t => {
-  const config = loadConfig({ INCENTIV_PORTAL_URL: "https://preview.incentiv.io/agents" });
+  const config = loadConfig({ INCENTIV_PORTAL_URL: "https://portal-override.example.incentiv.io/agents" });
   const f = await signedLinkFixture(t, true, {}, {}, { config });
   const url = new URL((await f.service.signAgentLink(parent)).portal_url);
-  assert.equal(url.origin + url.pathname, "https://preview.incentiv.io/agents");
+  assert.equal(url.origin + url.pathname, "https://portal-override.example.incentiv.io/agents");
   assert.equal(url.searchParams.get("parent"), parent); assert.ok(url.searchParams.get("agent_signature"));
   // Same manifest, so a wallet approved under the default Portal keeps working under the override.
   assert.equal(config.manifest.manifestId, MAINNET.manifest.manifestId);
@@ -1590,6 +1590,15 @@ test("a bundler's internal or limit error during simulation keeps a new request 
     assert.notEqual((await f.service.operation(id).catch(() => ({ status: "none" }))).status, "failed", `${status} ${code}`);
     f.chain.simulate = simulate;
     assert.equal((await f.service.send("transfer", transfer(id))).status, "submitted", `${status} ${code}`);
+  }
+  // A busy HTTP status is an outage unless it carries a rejection: some bundlers answer a revert with HTTP 500.
+  for (const [error, expected] of [[{ code: -32500, message: "AA23 reverted" }, "simulation_failed"], [{ code: -32603, message: "busy" }, "rpc_unavailable"], [undefined, "rpc_unavailable"]]) {
+    const f = await fixture(t), id = randomUUID();
+    f.chain.clients.splice(0, f.chain.clients.length, { readContract: async () => ({ reject: 0 }) });
+    f.chain.simulate = WalletChain.prototype.simulate;
+    const fetch = t.mock.method(globalThis, "fetch", async () => error ? Response.json({ jsonrpc: "2.0", id: 1, error }, { status: 500 }) : new Response("<html>bad gateway</html>", { status: 502 }));
+    await assert.rejects(f.service.send("transfer", transfer(id)), { code: expected }, JSON.stringify(error));
+    fetch.mock.restore();
   }
   // A success that carries "error": null is still a success.
   {

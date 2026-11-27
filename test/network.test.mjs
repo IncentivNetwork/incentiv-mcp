@@ -80,8 +80,8 @@ test("complete custom configuration loads; endpoint changes preserve wallet iden
 test("the Portal URL is an endpoint: overriding it keeps the manifest, and only Incentiv HTTPS hosts are accepted", () => {
   assert.equal(MAINNET.endpoints.portalUrl, "https://portal.incentiv.io/agents");
   assert.equal(loadConfig({}).endpoints.portalUrl, MAINNET.endpoints.portalUrl);
-  const other = loadConfig({ INCENTIV_PORTAL_URL: "https://preview.incentiv.io/agents" });
-  assert.equal(other.endpoints.portalUrl, "https://preview.incentiv.io/agents");
+  const other = loadConfig({ INCENTIV_PORTAL_URL: "https://portal-override.example.incentiv.io/agents" });
+  assert.equal(other.endpoints.portalUrl, "https://portal-override.example.incentiv.io/agents");
   assert.equal(other.manifest.manifestId, MAINNET.manifest.manifestId);
   assert.deepEqual(other.manifest, MAINNET.manifest);
   for (const value of ["http://portal.incentiv.io/agents", "https://portal.incentiv.io.example.test/agents", "https://example.test/agents",

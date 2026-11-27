@@ -159,6 +159,8 @@ const BUNDLER_RETRYABLE_CODES = [-32603, -32005];
 const bundlerRejection = (code: number, message: string, data: unknown) =>
   code === -32603 && ((typeof data === "string" && /^0x[0-9a-f]{8,}$/i.test(data)) || /revert|\bAA\d\d\b/i.test(message));
 
+const wellFormedRpcError = (error: unknown) => !!error && typeof error === "object" && "code" in error && Number.isInteger(error.code) && "message" in error && typeof error.message === "string";
+
 export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): Promise<unknown> {
   let res: Response;
   try {
@@ -169,11 +171,13 @@ export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): P
       signal: AbortSignal.timeout(30_000),
     });
   } catch (error) { throw new BundlerUnavailableError(`Bundler unreachable: ${(error as Error).message}`); }
-  if (res.status === 408 || res.status === 429 || res.status >= 500) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
-  if (!res.ok) throw new Error(`Bundler HTTP ${res.status}`);
+  const busy = res.status === 408 || res.status === 429 || res.status >= 500;
+  if (!busy && !res.ok) throw new Error(`Bundler HTTP ${res.status}`);
   let body: unknown;
-  try { body = await res.json(); } catch { throw new BundlerUnavailableError("Bundler answer is not valid JSON"); }
-  if (!body || typeof body !== "object" || Array.isArray(body)) throw new BundlerUnavailableError("Bundler answer is not an RPC response");
+  try { body = await res.json(); } catch { throw new BundlerUnavailableError(busy ? `Bundler HTTP ${res.status}` : "Bundler answer is not valid JSON"); }
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new BundlerUnavailableError(busy ? `Bundler HTTP ${res.status}` : "Bundler answer is not an RPC response");
+  // Some bundlers send a rejected operation's RPC error with HTTP 500, so a busy status is an outage only without one.
+  if (busy && !("error" in body && wellFormedRpcError(body.error) && !("result" in body))) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
   // A success may carry "error": null.
   if ("error" in body && body.error != null) {
     const { error } = body;

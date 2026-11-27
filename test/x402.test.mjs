@@ -2731,3 +2731,19 @@ test("a conflicting retry of a payment that may still settle says so instead of 
   await f.service.send({ ...args, request_id: transfer }).catch(() => {});
   if ((await f.records()).some(r => r.requestId === transfer)) await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: transfer }), e => e.code === "idempotency_conflict" && /permanently bound/.test(e.message));
 });
+
+test("a finished transfer replays during an RPC outage even while a recent x402 settlement awaits its recheck", async t => {
+  const f = await x402Fixture(t), payment = randomUUID(), transferId = randomUUID(), state = f.chain.state;
+  f.chain.state = async (...a) => ({ ...(await state(...a)), deployed: true });
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: payment });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` });
+  assert.equal((await f.service.operation(payment)).status, "confirmed");
+  assert.equal((await f.service.send("transfer", args(transferId))).status, "submitted");
+  await f.store.session(async s => { const j = await Journal.open(s); j.data.records.find(r => r.requestId === transferId).status = "confirmed"; await j.save(); });
+  const lane = f.chain.laneNonce;
+  f.chain.laneNonce = async () => { throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 }); };
+  assert.equal((await f.service.send("transfer", args(transferId))).status, "confirmed");
+  // A new spend still needs the recheck.
+  await assert.rejects(f.service.send("transfer", args(randomUUID())), { code: "rpc_unavailable" });
+  f.chain.laneNonce = lane;
+});

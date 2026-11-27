@@ -303,8 +303,9 @@ export class WalletService {
       const intent = intentSchema.parse(await this.chain.normalize(kind, args).catch((error: unknown) => { throw rpcOutage(error); }));
       let r = journal.data.records.find(r => r.requestId === requestId);
       if ((r && r.intentHash !== digest(intent)) || (!r && (journal.data.probes?.some(p => p.requestId === requestId) || journal.data.archived?.some(a => a.requestId === requestId)))) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different intent");
-      await this.reconcile(journal, true);
+      // A finished request is returned as it is; only work that can still spend needs the strict settlement recheck.
       if (r && terminal(r.status)) return result(r);
+      await this.reconcile(journal, true);
       if (r && ownsNonce(r.status)) {
         if (prepareOnly) return result(r);
         if (r.status === "superseding") await this.submitReplacement(s, journal, r);
