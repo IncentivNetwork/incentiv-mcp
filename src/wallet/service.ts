@@ -306,6 +306,8 @@ export class WalletService {
       // A finished request is returned as it is; only work that can still spend needs the strict settlement recheck.
       if (r && terminal(r.status)) return result(r);
       await this.reconcile(journal, true);
+      // Reconciliation may have just settled it, so it is returned rather than prepared again.
+      if (r && terminal(r.status)) return result(r);
       if (r && ownsNonce(r.status)) {
         if (prepareOnly) return result(r);
         if (r.status === "superseding") await this.submitReplacement(s, journal, r);
@@ -426,6 +428,7 @@ export class WalletService {
       // A Portal approval for a wallet that cannot sign is unusable, so the user is not asked for one.
       try {
         await this.linkPolicy(s);
+        if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot send link_agent. Use a release with signing enabled to connect this agent");
         const status = await this.chain.registryStatus(s.envelope);
         const blocked = linkBlocker(status, status.deployed);
         if (blocked) return linkRefusal(status, blocked);
@@ -433,7 +436,7 @@ export class WalletService {
         if (!limits.agentRegistry?.parents.length) throw new WalletError("registry_parent_not_allowed", "Local wallet policy allows no Portal account to connect this agent. Add one with incentiv-mcp setup in your local terminal, then call prepare_agent_link again");
         return { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };
       } catch (error) {
-        if (error instanceof WalletError && ["policy_not_configured", "wallet_locked", "policy_expired", "capability_manifest_unapproved", "registry_parent_not_allowed"].includes(error.code)) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
+        if (error instanceof WalletError && ["policy_not_configured", "wallet_locked", "policy_expired", "capability_manifest_unapproved", "registry_parent_not_allowed", "wallet_release_unreviewed"].includes(error.code)) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
         throw error;
       }
     });
@@ -451,7 +454,7 @@ export class WalletService {
   private async linkConsentChecks(s: WalletSession, parent: string) {
     const limits = await this.linkPolicy(s);
     if (!registryParentAllowed(limits, parent)) throw new WalletError("registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call sign_agent_link again");
-    if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent. Use prepare_agent_link and the Portal approval flow");
+    if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent or send link_agent. Use a release with signing enabled to connect this agent");
     assertRegistryApproved(this.ctx.config, s.envelope);
     // Settle requests that already landed, so a confirmed link is not reported as still unresolved.
     const journal = await Journal.open(s); await this.reconcile(journal);

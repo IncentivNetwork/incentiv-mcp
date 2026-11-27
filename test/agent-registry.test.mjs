@@ -1001,7 +1001,11 @@ test("sign_agent_link caps the consent at local policy expiry and refuses a poli
 test("a release with candidate signing disabled refuses to sign link consent before any registry read", async t => {
   const f = await signedLinkFixture(t), service = new WalletService(f.service.ctx, f.store, f.chain, false);
   const refused = await service.signAgentLink(parent);
-  assert.equal(refused.link_blocked, "wallet_release_unreviewed"); assert.match(refused.next_action, /Use prepare_agent_link/); assert.deepEqual(f.calls, []);
+  assert.equal(refused.link_blocked, "wallet_release_unreviewed"); assert.match(refused.next_action, /release with signing enabled/); assert.doesNotMatch(refused.next_action, /prepare_agent_link/); assert.deepEqual(f.calls, []);
+  // link_agent cannot sign in such a release either, so prepare_agent_link does not ask for a Portal approval.
+  f.chain.registryStatus = async () => assert.fail("a release that cannot sign needs no registry read");
+  const prepared = await service.prepareAgentLink();
+  assert.equal(prepared.link_blocked, "wallet_release_unreviewed"); assert.equal(prepared.portal_url, undefined);
 });
 
 test("sign_agent_link signs nothing for a parent that local policy or the registry refuses", async t => {
@@ -1659,4 +1663,18 @@ test("an unsigned link refused because its approval outlasts local policy keeps 
   const waiting = await f.service.operation(id);
   assert.equal(waiting.status, "approval_required"); assert.equal(waiting.last_error, "registry_approval_outlasts_policy");
   assert.match(waiting.next_action, /renews the policy.*same request ID/);
+});
+
+test("a retry whose reconciliation confirms the request returns it instead of preparing it again", async t => {
+  const f = await fixture(t), id = randomUUID();
+  const sent = await f.service.send("transfer", transfer(id));
+  assert.equal(sent.status, "submitted");
+  const [before] = await f.store.session(async s => (await Journal.open(s)).data.records);
+  f.setReceipt({ success: true, actualGasCost: 100n, transactionHash: `0x${"12".repeat(32)}` });
+  const builds = f.builds();
+  const retried = await f.service.send("transfer", transfer(id));
+  assert.equal(retried.status, "confirmed");
+  assert.equal(f.builds(), builds);
+  const [after] = await f.store.session(async s => (await Journal.open(s)).data.records);
+  assert.equal(after.userOpHash, before.userOpHash); assert.deepEqual(after.reservation, before.reservation); assert.equal(after.nonce, before.nonce);
 });
