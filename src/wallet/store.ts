@@ -14,6 +14,18 @@ import { limitsSchema, newAdministration, type Limits, type Policy } from "./pol
 import { Journal, type JournalData } from "./journal.js";
 import { orphanRecovery } from "./recovery.js";
 
+import { rpcOutage } from "./outage.js";
+
+/**
+ * How a failed wallet session is reported. An RPC outage reached from any wallet call says nothing about storage,
+ * so it is rpc_unavailable; an error of any other kind may mean damaged storage, whose evidence is preserved.
+ */
+function sessionFailure(error: unknown, message: string): never {
+  const outage = rpcOutage(error);
+  if (outage !== error || error instanceof WalletError || error instanceof NetworkError) throw outage;
+  throw new WalletError("wallet_recovery_required", message);
+}
+
 export interface WalletSession {
   directory: string;
   envelope: WalletEnvelope;
@@ -59,16 +71,14 @@ export class WalletStore {
 
   async createOrLoad() {
     try { return await this.run(); } catch (error) {
-      if (error instanceof WalletError || error instanceof NetworkError) throw error;
-      throw new WalletError("wallet_recovery_required", "Wallet storage operation failed; existing evidence was preserved");
+      sessionFailure(error, "Wallet storage operation failed; existing evidence was preserved");
     }
   }
 
   async initialize(limits: Limits, passphrase: Buffer) {
     const policy: Policy = { schemaVersion: 1, configured: true, enabled: false, limits: limitsSchema.parse(limits), administration: await newAdministration(passphrase) };
     try { return await this.run(undefined, undefined, undefined, policy); } catch (error) {
-      if (error instanceof WalletError || error instanceof NetworkError) throw error;
-      throw new WalletError("wallet_recovery_required", "Initialization failed; creation evidence was preserved");
+      sessionFailure(error, "Initialization failed; creation evidence was preserved");
     }
   }
 
@@ -78,8 +88,7 @@ export class WalletStore {
   async session<T>(work: (session: WalletSession) => Promise<T>): Promise<T> {
     if (!await exists(join(this.deps.root, "wallet"))) throw new WalletError("keystore_missing", "Create or restore the wallet first");
     try { return await this.run(work) as T; } catch (error) {
-      if (error instanceof WalletError || error instanceof NetworkError) throw error;
-      throw new WalletError("wallet_recovery_required", "Wallet operation failed; existing evidence was preserved");
+      sessionFailure(error, "Wallet operation failed; existing evidence was preserved");
     }
   }
 
@@ -90,8 +99,7 @@ export class WalletStore {
     if (canonicalJson(prior.identity) !== canonicalJson(this.config.identity)) throw new NetworkError("wallet_network_mismatch", "Capability approval cannot change the wallet network identity");
     if (!await exists(join(this.deps.root, "wallet"))) throw new WalletError("keystore_missing", "Create or restore the wallet first");
     try { return await this.run(work, undefined, prior) as T; } catch (error) {
-      if (error instanceof WalletError || error instanceof NetworkError) throw error;
-      throw new WalletError("wallet_recovery_required", "Capability approval failed; existing evidence was preserved");
+      sessionFailure(error, "Capability approval failed; existing evidence was preserved");
     }
   }
 
@@ -101,8 +109,7 @@ export class WalletStore {
     if (canonicalJson(parseConfig(proposed)) !== canonicalJson(this.config)) throw new WalletError("policy_denied", "Proposed configuration does not match the active configuration");
     if (!await exists(join(this.deps.root, "wallet.binding.json"))) throw new WalletError("keystore_missing", "Create or restore the wallet first");
     try { return await this.run(work, undefined, parseConfig(previous), undefined, "local") as T; } catch (error) {
-      if (error instanceof WalletError || error instanceof NetworkError) throw error;
-      throw new WalletError("wallet_recovery_required", "Implementation upgrade failed; existing evidence was preserved");
+      sessionFailure(error, "Implementation upgrade failed; existing evidence was preserved");
     }
   }
 
@@ -120,8 +127,7 @@ export class WalletStore {
   async restore(snapshot: RestoreSnapshot) {
     authenticateWallet(this.config, snapshot.envelope, snapshot.wrappingKey);
     try { return await this.run(undefined, snapshot); } catch (error) {
-      if (error instanceof WalletError || error instanceof NetworkError) throw error;
-      throw new WalletError("wallet_recovery_required", "Restore failed; recovery evidence was preserved");
+      sessionFailure(error, "Restore failed; recovery evidence was preserved");
     }
   }
 

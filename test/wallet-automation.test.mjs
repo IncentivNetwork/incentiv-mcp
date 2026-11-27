@@ -11,6 +11,7 @@ import { authenticateWallet, parseEnvelope, sealWallet, walletAad } from "../src
 import { limitsSchema, newAdministration } from "../src/wallet/policy.ts";
 import { Journal, digest } from "../src/wallet/journal.ts";
 import { WalletService } from "../src/wallet/service.ts";
+import { WalletError } from "../src/wallet/errors.ts";
 import { args, fixture, limits, password, recipient, unsigned } from "../scripts/wallet-pipeline-fixture.mjs";
 
 test("default local candidate signs within policy without implying publication approval", async t => {
@@ -63,11 +64,22 @@ test("the final relay callback prevents a policy change during connection from b
     await f.store.disable();
     return relay(wire, beforeSubmit);
   };
-  assert.equal((await f.service.send("transfer", args(id))).status, "submission_unknown");
+  // Nothing was sent, so the refusal reaches the caller and the request stays signed rather than possibly in flight.
+  await assert.rejects(f.service.send("transfer", args(id)), { code: "wallet_locked" });
   assert.equal(f.submissions.length, 0);
   const record = (await f.service.review(id)).records[0];
+  assert.equal(record.status, "signed"); assert.equal(record.attempts, 0); assert.equal(record.lastError, undefined);
   assert.notEqual(record.operation.signature, "0x");
   assert.deepEqual(record.reservation, { native: "1300" });
+});
+
+test("a gas token the paymaster cannot take reaches the agent with its reason, not a generic failure", async t => {
+  const f = await fixture(t), id = randomUUID();
+  f.chain.build = async () => { throw new WalletError("gas_token_unavailable", "Could not price gas in USDT: no USDT/WCENT pool at the paymaster's 0.3% fee quotes it. Use a new request ID with gas in CENT or USDC"); };
+  await assert.rejects(f.service.send("transfer", args(id)), error => error.code === "gas_token_unavailable" && /Could not price gas in USDT/.test(error.message));
+  assert.equal(f.submissions.length, 0);
+  const record = (await f.service.review(id)).records[0];
+  assert.equal(record.status, "failed"); assert.equal(record.lastError, "gas_token_unavailable");
 });
 
 test("in-policy swaps sign automatically and recheck the route before signing and broadcast", async t => {
@@ -94,10 +106,12 @@ test("in-policy swaps sign automatically and recheck the route before signing an
       await s.savePolicy({ ...s.envelope.policy, limits: { ...limits, swaps: true, tokens: { ...limits.tokens, [input.address]: limits.tokens.native }, targets, maxBatchCalls: 4, trustedRpcOrigins: ["https://rpc.incentiv.io"] } });
     });
     const request = { request_id: id, token_in: "USDC", token_out: "CENT", amount_in: "0.000000000000001", minimum_out: "0.000000000000000995" };
-    if (failAt === 2) await assert.rejects(f.service.send("swap", request));
-    else assert.equal((await f.service.send("swap", request)).status, failAt ? "submission_unknown" : "submitted");
+    if (failAt) await assert.rejects(f.service.send("swap", request));
+    else assert.equal((await f.service.send("swap", request)).status, "submitted");
     assert.equal(f.submissions.length, failAt ? 0 : 1);
     const record = (await f.service.review(id)).records[0];
+    // A route refused at the broadcast boundary sent nothing, so the signed bytes stay signed.
+    if (failAt === 4) assert.equal(record.status, "signed");
     assert.equal(record.approval, undefined, "policy-authorized swaps need no per-operation approval");
     if (!failAt) {
       f.setReceipt({ success: true, actualGasCost: 200n, transactionHash: `0x${"55".repeat(32)}` });
@@ -146,7 +160,7 @@ test("receipt settlement requires canonical confirmed inclusion", async t => {
     const request = JSON.parse(options.body);
     return Response.json({ jsonrpc: "2.0", id: request.id, result: { receipt: { transactionHash: tx } } });
   });
-  const record = { userOpHash: hash, nonce: "0", operation: { sender: recipient } };
+  const record = { intent: { kind: "transfer" }, userOpHash: hash, nonce: "0", operation: { sender: recipient } };
   assert.equal((await chain.receipt(record)).actualGasCost, 200n);
   canonical = `0x${"44".repeat(32)}`;
   await assert.rejects(chain.receipt(record), /canonical/);

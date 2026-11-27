@@ -1,8 +1,10 @@
+import { isTransportFailure } from "../agent-registry.js";
+import { RpcDisagreementError } from "./errors.js";
 import { createPublicClient, decodeEventLog, encodeFunctionData, getAddress, http, isAddress, keccak256, parseAbiItem, parseUnits, type Address, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Ctx, type TokenInfo } from "../context.js";
 import { accountAbi, accountFactoryAbi, dexFactoryAbi, dexPoolAbi, entryPointAbi, erc20Abi, quoterAbi, swapRouterAbi, transferGateAbi } from "../abi.js";
-import { broadcastUserOp, buildUserOpUnsigned, bundlerRpc, userOpFromJson as userOpFromWire, userOpToJson, type UserOp } from "../userop.js";
+import { BundlerUnavailableError, broadcastUserOp, buildUserOpUnsigned, bundlerRpc, estimateUserOpGas, userOpFromJson as userOpFromWire, type UserOp } from "../userop.js";
 import { buildSwapCalls, planRoute, quoteRoute } from "../swap.js";
 import { WalletError, type WalletEnvelope } from "./keystore.js";
 import { type Intent, type OperationRecord } from "./journal.js";
@@ -24,11 +26,11 @@ export class WalletChain {
   async state(wallet: WalletEnvelope): Promise<ChainState> {
     const heads = await Promise.all(this.clients.map(c => c.getBlockNumber({ cacheTime: 0 })));
     const block = heads.reduce((a, b) => a < b ? a : b);
-    if (heads.some(n => n - block > 5n)) throw new WalletError("validation_failed", "RPC chain heads disagree");
+    if (heads.some(n => n - block > 5n)) throw new RpcDisagreementError("RPC chain heads disagree");
     const blocks = await Promise.all(this.clients.map(c => c.getBlock({ blockNumber: block })));
     const nonces = await Promise.all(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "getNonce", args: [wallet.account as Address, 0n], blockNumber: block })));
     const codes = await Promise.all(this.clients.map(c => c.getCode({ address: wallet.account as Address, blockNumber: block })));
-    if (blocks.some(b => !b.hash) || !same(blocks.map(b => b.hash)) || !same(blocks.map(b => b.timestamp)) || !same(blocks.map(b => b.baseFeePerGas)) || !same(nonces) || !same(codes)) throw new WalletError("validation_failed", "RPC nonce, account or fee state disagrees");
+    if (blocks.some(b => !b.hash) || !same(blocks.map(b => b.hash)) || !same(blocks.map(b => b.timestamp)) || !same(blocks.map(b => b.baseFeePerGas)) || !same(nonces) || !same(codes)) throw new RpcDisagreementError("RPC nonce, account or fee state disagrees");
     const deployed = !!codes[0] && codes[0] !== "0x";
     if (deployed) {
       const owners = await Promise.all(this.clients.map(c => c.readContract({ address: wallet.account as Address, abi: accountAbi, functionName: "owner", blockNumber: block })));
@@ -46,7 +48,7 @@ export class WalletChain {
     const entry = Object.entries(tokens).find(([symbol, pin]) => symbol === name.toUpperCase() || pin.address.toLowerCase() === name.toLowerCase());
     if (!entry) throw new WalletError("validation_failed", "Wallet tokens must be pinned in the approved manifest");
     const decimals = await Promise.all(this.clients.map(c => c.readContract({ address: entry[1].address, abi: erc20Abi, functionName: "decimals" })));
-    if (!same(decimals)) throw new WalletError("validation_failed", "Token decimals disagree");
+    if (!same(decimals)) throw new RpcDisagreementError("Token decimals disagree");
     return { address: entry[1].address.toLowerCase() as Address, symbol: entry[0], name: entry[0], decimals: Number(decimals[0]) };
   }
   async normalize(kind: "transfer" | "swap", args: Record<string, unknown>): Promise<Intent> {
@@ -66,14 +68,14 @@ export class WalletChain {
     const result: Spend = {};
     await Promise.all([...new Set(tokens.map(t => t.toLowerCase()))].map(async token => {
       const values = await Promise.all(this.clients.map(c => token === "native" ? c.getBalance({ address: wallet.account as Address }) : c.readContract({ address: token as Address, abi: erc20Abi, functionName: "balanceOf", args: [wallet.account as Address] })));
-      if (!same(values)) throw new WalletError("validation_failed", "RPC balances disagree");
+      if (!same(values)) throw new RpcDisagreementError("RPC balances disagree");
       result[token] = values[0].toString();
     }));
     return result;
   }
   async gasDeposit(wallet: WalletEnvelope): Promise<string> {
     const values = await Promise.all(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "balanceOf", args: [wallet.account as Address] })));
-    if (!same(values)) throw new WalletError("validation_failed", "RPC gas deposits disagree");
+    if (!same(values)) throw new RpcDisagreementError("RPC gas deposits disagree");
     return values[0].toString();
   }
   async quote(intent: Intent, limits: Limits, blockNumber: bigint): Promise<void> {
@@ -89,7 +91,7 @@ export class WalletChain {
       return (await quoteRoute(context, planRoute(context, input, output, intent.feeTier), BigInt(intent.amount), blockNumber)).amountOut;
     }));
     const low = quotes.reduce((a, b) => a < b ? a : b), high = quotes.reduce((a, b) => a > b ? a : b);
-    if (low <= 0n || (high - low) * 10_000n > low * BigInt(limits.maxQuoteDeviationBps)) throw new WalletError("validation_failed", "Configured swap quotes disagree");
+    if (low <= 0n || (high - low) * 10_000n > low * BigInt(limits.maxQuoteDeviationBps)) throw new RpcDisagreementError("Configured swap quotes disagree");
     // Caller minimum is absolute, must also satisfy the authorized slippage bound at every source.
     if (BigInt(intent.minimumOut!) > low || BigInt(intent.minimumOut!) * 10_000n < high * BigInt(10_000 - intent.slippageBps)) throw new WalletError("validation_failed", "Absolute minimum output is incompatible with the quotes and slippage bound");
   }
@@ -113,7 +115,7 @@ export class WalletChain {
         client.readContract({ address: contracts.swapRouter.address, abi: swapRouterAbi, functionName: "factory", blockNumber }),
         client.readContract({ address: contracts.quoter.address, abi: quoterAbi, functionName: "factory", blockNumber }),
       ]);
-      if (!same([factory, quoteFactory]) || /^0x0{40}$/i.test(factory)) throw new WalletError("validation_failed", "Router and quoter factories disagree");
+      if (!same([factory, quoteFactory]) || /^0x0{40}$/i.test(factory)) throw new RpcDisagreementError("Router and quoter factories disagree");
       await Promise.all(route.hops.map(async hop => {
         const pool = await client.readContract({ address: factory, abi: dexFactoryAbi, functionName: "getPool", args: [hop.tokenIn, hop.tokenOut, hop.fee], blockNumber });
         if (/^0x0{40}$/i.test(pool)) throw new WalletError("validation_failed", "Swap pool is missing");
@@ -145,9 +147,13 @@ export class WalletChain {
       }
       const op: UserOp = { ...validated.op };
       op.signature = await privateKeyToAccount(generatePrivateKey()).signMessage({ message: { raw: validated.hash } });
-      const estimate = await bundlerRpc(this.ctx, "eth_estimateUserOperationGas", [userOpToJson(op), this.ctx.config.identity.entryPoint.address]) as Record<string, string>;
-      for (const key of ["callGasLimit", "verificationGasLimit", "preVerificationGas"] as const) if (BigInt(estimate[key]) > op[key] || BigInt(estimate[key]) <= 0n) throw new Error();
-    } catch { throw new WalletError("simulation_failed", "The exact validated operation failed simulation or exceeds its gas allocation"); }
+      const estimate = await estimateUserOpGas(this.ctx, op);
+      for (const key of ["callGasLimit", "verificationGasLimit", "preVerificationGas"] as const) if (estimate[key] > op[key] || estimate[key] <= 0n) throw new Error();
+    } catch (error) {
+      // An outage says nothing about the operation, so the same request stays retryable; only a rejection fails it.
+      if (error instanceof BundlerUnavailableError || isTransportFailure(error)) throw new WalletError("rpc_unavailable", "Could not reach the RPC or bundler to simulate the operation; retry this request");
+      throw new WalletError("simulation_failed", "The exact validated operation failed simulation or exceeds its gas allocation");
+    }
   }
   async buildReplacement(wallet: WalletEnvelope, original: OperationRecord, state: ChainState) {
     const old = userOpFromWire(original.operation!);

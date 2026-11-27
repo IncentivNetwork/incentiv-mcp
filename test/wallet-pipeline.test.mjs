@@ -9,6 +9,8 @@ import { backupWallet, restoreWallet, migrateWallet } from "../src/wallet/backup
 import { WalletStore } from "../src/wallet/store.ts";
 import { MAINNET } from "../src/config.ts";
 import { unlockWallet } from "../src/wallet/keystore.ts";
+import { RpcDisagreementError } from "../src/wallet/errors.ts";
+import { HttpRequestError } from "viem";
 
 test("ambiguous broadcast retries identical signed bytes, preserves reservations and lifetime idempotency", async t => {
   const f = await fixture(t), id = randomUUID();
@@ -62,6 +64,28 @@ test("wallet status exposes reusable EntryPoint gas deposits separately from tra
   assert.equal(status.entrypoint_gas_deposit_wei, "123456");
   assert.equal(status.balances.native, "1000000");
   assert.equal(status.spendable_before_new_gas.native, "1000000");
+});
+
+test("an RPC outage reached from any wallet call is rpc_unavailable, not wallet_recovery_required", async t => {
+  const outage = () => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 503 }); };
+  const disagreement = () => { throw new RpcDisagreementError("Configured RPCs disagree"); };
+  for (const fail of [outage, disagreement]) {
+    const f = await fixture(t), id = randomUUID(), state = f.chain.state, normalize = f.chain.normalize;
+    assert.equal((await f.service.send("transfer", { ...args(id), amount: "0.00000000000002" })).status, "approval_required");
+    const review = await f.service.review(id), before = JSON.stringify(review.records);
+    // get_agent_wallet's gas deposit read, setup's enable step, a local approval and a new request's normalization.
+    f.chain.gasDeposit = async () => fail();
+    await assert.rejects(f.service.get(), { code: "rpc_unavailable" }, fail.name);
+    f.chain.state = async () => fail();
+    await assert.rejects(f.service.configure(limits, password, false, digest([review.records[0]])), { code: "rpc_unavailable" }, fail.name);
+    await assert.rejects(f.service.approve(id, password, digest(review.records[0])), { code: "rpc_unavailable" }, fail.name);
+    f.chain.state = state;
+    f.chain.normalize = async () => fail();
+    await assert.rejects(f.service.send("transfer", args(randomUUID())), { code: "rpc_unavailable" }, fail.name);
+    f.chain.normalize = normalize;
+    assert.equal(JSON.stringify((await f.service.review(id)).records), before);
+    assert.equal(f.submissions.length, 0);
+  }
 });
 
 test("an expired signed deadline requires explicit same-nonce resolution without a fresh signature", async t => {
