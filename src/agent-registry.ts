@@ -183,7 +183,9 @@ export function agentLinkDigest(cfg: Config, agent: Address, parent: Address, no
 }
 /** Why `parent` cannot take this agent right now, read from a registryStatus that named it. */
 export function parentBlocker(status: { agent: string; parent_eligible?: boolean; parent_is_agent?: boolean; parent_agent_count?: string; max_agents: string }, parent: string): [code: string, message: string] | undefined {
-  if (sameAddress(parent, status.agent) || status.parent_is_agent || !status.parent_eligible) return ["registry_ineligible", "Account roles or allowed factories do not permit this link"];
+  if (sameAddress(parent, status.agent) || status.parent_is_agent) return ["registry_ineligible", "Account roles or allowed factories do not permit this link"];
+  // The registry judges a parent through its factory allowlist, which can change, so as for the agent this refusal is temporary.
+  if (!status.parent_eligible) return ["registry_parent_not_eligible", "The Agent Registry does not currently accept this Portal account as a parent, for example while its factory is not allowed; retry once it does"];
   if (BigInt(status.parent_agent_count ?? "0") >= BigInt(status.max_agents)) return ["registry_limit_reached", "This Portal account has reached its agent limit"];
 }
 /**

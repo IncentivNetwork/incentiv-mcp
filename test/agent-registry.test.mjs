@@ -330,7 +330,7 @@ test("an upgraded previous-implementation wallet can still check its pending ope
 test("registry use stays blocked until approval and nothing but approval grants it", async t => {
   const f = await preRegistryWallet(t), wallet = await f.store.createOrLoad(), id = randomUUID(), code = "capability_manifest_unapproved", a = await approval({ agent: wallet.account });
   await assert.rejects(f.service.registryStatus(), { code });
-  await assert.rejects(f.service.prepareAgentLink(), { code });
+  assert.equal((await f.service.prepareAgentLink()).link_blocked, code);
   await assert.rejects(f.service.send("link_agent", { request_id: id, approval: a }), { code });
   // Unlink is refused for every wallet, before the approval check.
   await assert.rejects(f.service.send("unlink_agent", { request_id: id, parent }), { code: "registry_unlink_unsupported" });
@@ -919,6 +919,9 @@ test("a signed unlink from an earlier build is never resent and points to a same
   // with the same guidance rather than a bare policy denial.
   await f.store.session(async s => { const journal = await Journal.open(s), r = journal.data.records.find(r => r.requestId === id); r.approval.expiresAt = 1; await journal.save(); });
   await assert.rejects(f.service.resolve(id, password), e => e.code === "registry_unlink_unsupported" && e.message.includes(`wallet operation resolve ${id} --replace`));
+  // A disabled wallet does not hide that guidance either.
+  await f.store.disable();
+  await assert.rejects(f.service.resolve(id, password), e => e.code === "registry_unlink_unsupported" && e.message.includes(`wallet operation resolve ${id} --replace`));
   assert.equal(f.submissions.length, 0);
 });
 
@@ -1003,7 +1006,7 @@ test("sign_agent_link signs nothing for a parent that local policy or the regist
   assert.equal(refused.link_blocked, "registry_parent_not_allowed"); assert.equal(refused.portal_url, undefined); assert.deepEqual(denied.calls, []);
   // The refusal's code is in link_blocked; next_action is the plain instruction.
   assert.match(refused.next_action, /^Local wallet policy does not allow this parent\./);
-  for (const [status, code] of [[{ parent_agent_count: "5" }, "registry_limit_reached"], [{ parent_eligible: false }, "registry_ineligible"], [{ parent_is_agent: true }, "registry_ineligible"], [{ parent }, "registry_already_linked"]]) {
+  for (const [status, code] of [[{ parent_agent_count: "5" }, "registry_limit_reached"], [{ parent_eligible: false }, "registry_parent_not_eligible"], [{ parent_is_agent: true }, "registry_ineligible"], [{ parent }, "registry_already_linked"]]) {
     const f = await signedLinkFixture(t, true, status);
     const blocked = await f.service.signAgentLink(parent);
     assert.equal(blocked.link_blocked, code); assert.equal(blocked.portal_url, undefined); assert.deepEqual(f.calls, [["consent", parent, undefined]]);
@@ -1087,6 +1090,9 @@ test("sign_agent_link refuses an unapproved registry capability in the same shap
   await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: false } } }));
   const refused = await f.service.signAgentLink(parent);
   assert.equal(refused.link_blocked, "capability_manifest_unapproved"); assert.match(refused.next_action, /Do not ask the user to sign/);
+  // prepare_agent_link answers the same state in the same shape, with no Portal URL.
+  const prepared = await f.service.prepareAgentLink();
+  assert.equal(prepared.link_blocked, "capability_manifest_unapproved"); assert.equal(prepared.portal_url, undefined);
 });
 
 test("an undeployed agent signs nothing and is sent to prepare_agent_link, since the registry cannot check its signature", async t => {
@@ -1604,4 +1610,30 @@ test("a bundler's internal or limit error during simulation keeps a new request 
     await assert.rejects(f.service.send("transfer", transfer(id)), { code: "simulation_failed" }, JSON.stringify(error));
     fetch.mock.restore();
   }
+});
+
+test("a parent the registry does not currently accept keeps a link retryable instead of advising a paid replacement", async t => {
+  const [code, message] = parentBlocker({ agent, parent_eligible: false, parent_is_agent: false, parent_agent_count: "0", max_agents: "5" }, parent);
+  assert.equal(code, "registry_parent_not_eligible");
+  // A self-link, or a parent that is itself an agent, stays permanent.
+  assert.equal(parentBlocker({ agent, parent_eligible: true, parent_is_agent: true, max_agents: "5" }, parent)?.[0], "registry_ineligible");
+  assert.equal(parentBlocker({ agent, parent_eligible: true, max_agents: "5" }, agent)?.[0], "registry_ineligible");
+  // Signed: the same bytes stay sendable.
+  const f = await registryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval }, submit = f.service.submit;
+  f.service.submit = async () => {}; // The process stops between signing and submission.
+  assert.equal((await f.service.send("link_agent", args)).status, "signed");
+  f.service.submit = submit;
+  f.chain.verifyRegistry = async () => { throw new WalletError(code, message); };
+  await assert.rejects(f.service.send("link_agent", args), error => error.code === code && /retry once it does/.test(error.message) && !/--replace/.test(error.message));
+  assert.equal((await f.service.operation(id)).status, "signed");
+  f.chain.verifyRegistry = async () => {};
+  assert.equal((await f.service.send("link_agent", args)).status, "submitted");
+  // Unsigned: an existing request keeps its ID instead of failing.
+  const g = await registryFixture(t, false), other = randomUUID(), retry = { request_id: other, approval: g.approval };
+  assert.equal((await g.service.send("link_agent", retry)).status, "approval_required");
+  g.chain.verifyRegistry = async () => { throw new WalletError(code, message); };
+  await assert.rejects(g.service.send("link_agent", retry), { code });
+  const waiting = await g.service.operation(other);
+  assert.equal(waiting.status, "approval_required"); assert.equal(waiting.last_error, code);
+  assert.match(waiting.next_action, /does not currently accept this Portal account as a parent/);
 });
