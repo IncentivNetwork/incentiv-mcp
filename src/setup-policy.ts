@@ -3,7 +3,7 @@ import { registryCapability } from "./agent-registry.js";
 import type { Config } from "./config.js";
 import type { TokenInfo } from "./context.js";
 import { WalletError } from "./wallet/errors.js";
-import { limitsSchema, type Limits } from "./wallet/policy.js";
+import { httpsOrigin, limitsSchema, type Limits } from "./wallet/policy.js";
 
 export type Ask = (question: string) => Promise<string>;
 export type Tell = (message: string) => void;
@@ -152,6 +152,7 @@ export async function promptX402(config: Config, limits: Pick<Limits, "tokens">,
       let url: URL;
       try { url = new URL(item); } catch { throw new WalletError("validation_failed", "Enter origins such as https://api.example.com"); }
       if (url.protocol !== "https:" || url.pathname !== "/" || url.search || url.hash || url.username || url.password || item.endsWith("?") || item.endsWith("#")) throw new WalletError("validation_failed", "Enter https origins without a path, such as https://api.example.com");
+      if (!httpsOrigin.safeParse(url.origin).success) throw new WalletError("validation_failed", `Origin ${url.origin} is longer than the 256 characters a policy allows`);
       return url.origin;
     }), "origins");
   });

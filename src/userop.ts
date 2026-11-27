@@ -153,8 +153,11 @@ function opToWire(op: UserOp): Record<string, string> {
 
 /** The bundler could not be reached or answered with a server error, so the call says nothing about the operation itself. */
 export class BundlerUnavailableError extends Error {}
-/** JSON-RPC errors that reflect the bundler's own state, not the operation: internal error and limit exceeded. */
-const BUNDLER_RETRYABLE_CODES = [-32603, -32005];
+/**
+ * JSON-RPC errors that reflect the bundler's own state, not the operation: internal error, limit exceeded, and
+ * ERC-4337's -32504, a throttled or banned paymaster, factory or aggregator.
+ */
+const BUNDLER_RETRYABLE_CODES = [-32603, -32005, -32504];
 /** Some bundlers report a validation or execution revert as -32603; one that carries revert data or names a revert is about the operation. */
 const bundlerRejection = (code: number, message: string, data: unknown) =>
   code === -32603 && ((typeof data === "string" && /^0x[0-9a-f]{8,}$/i.test(data)) || /revert|\bAA\d\d\b/i.test(message));

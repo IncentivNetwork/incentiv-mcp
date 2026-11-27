@@ -317,7 +317,7 @@ export class WalletService {
         if (prepareOnly) return result(r);
         if (r.status === "superseding") await this.submitReplacement(s, journal, r);
         else if (r.status === "signed" || r.status === "submission_unknown") await this.submit(s, journal, r);
-        if (args.wait_for_confirmation === true) await this.reconcile(journal);
+        if (args.wait_for_confirmation === true) await confirmationRead(() => this.reconcile(journal));
         return result(r);
       }
       const holder = journal.data.records.find(holdsMainNonce);
@@ -401,7 +401,7 @@ export class WalletService {
         throw new WalletError("validation_failed", "Local operation preparation failed");
       }
       await this.submit(s, journal, r);
-      if (args.wait_for_confirmation === true) await this.reconcile(journal);
+      if (args.wait_for_confirmation === true) await confirmationRead(() => this.reconcile(journal));
       return result(r);
     });
     if (!prepareOnly && args.wait_for_confirmation === true) {
@@ -409,7 +409,9 @@ export class WalletService {
       while (ownsNonce(response.status) && Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 1000));
         // An archived record is an x402 payment, which a request ID bound to this intent never is.
-        response = await this.operation(requestId) as typeof response;
+        const next = await confirmationRead(() => this.operation(requestId) as Promise<typeof response>);
+        if (!next) break;
+        response = next;
       }
     }
     return response;
@@ -1217,6 +1219,18 @@ const rpcFault = (error: unknown) => !(error instanceof WalletError) || error in
 function rethrowX402RecheckError(error: unknown): never {
   if (!rpcFault(error)) throw error;
   throw new WalletError("rpc_unavailable", "Could not recheck recent x402 settlements; retry when RPC is available");
+}
+
+/**
+ * A confirmation read after the operation was sent. The send already happened and is journaled, so a failed read
+ * (an outage, or RPCs that disagree) must not report the call as failed: the result as journaled is returned, and
+ * get_agent_operation reconciles it later. Returns undefined when the read failed that way.
+ */
+async function confirmationRead<T>(read: () => Promise<T>): Promise<T | undefined> {
+  try { return await read(); } catch (error) {
+    if (rpcFault(error) || (error instanceof WalletError && error.code === "rpc_unavailable")) return undefined;
+    throw error;
+  }
 }
 
 const MAX_LINK_ATTEMPTS = 8;

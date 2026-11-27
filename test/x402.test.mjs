@@ -1546,6 +1546,25 @@ test("a recent confirmation with an unreadable lane blocks new spend until the l
   assert.equal((await f.records())[0].settlementFinal, true);
 });
 
+test("a sent transfer that waits for confirmation is reported as sent when the settlement recheck then fails", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), state = f.chain.state;
+  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true, block: 100n });
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  await f.settle({ success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}`, blockNumber: 98n });
+  assert.equal((await f.service.operation(id)).status, "confirmed");
+  // The recent settlement is rechecked on every read; its lane becomes unreadable right after the transfer is relayed.
+  const relay = f.chain.relay, before = f.submissions.length, transfer = randomUUID();
+  f.chain.relay = async (...params) => {
+    const hash = await relay(...params);
+    f.chain.laneNonce = async () => { throw new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 }); };
+    return hash;
+  };
+  const sent = await f.service.send("transfer", { ...args(transfer), wait_for_confirmation: true });
+  assert.equal(sent.status, "submitted");
+  assert.equal(sent.request_id, transfer);
+  assert.equal(f.submissions.length, before + 1);
+});
+
 test("retrying an archived request ID reports how it ended: a payment that never reached the seller is not called paid", async t => {
   const f = await x402Fixture(t), id = randomUUID(), simulate = f.chain.simulate;
   f.chain.simulate = async () => { throw new WalletError("simulation_failed", "The exact validated operation failed simulation"); };

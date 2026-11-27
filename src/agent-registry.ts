@@ -41,10 +41,13 @@ export function registryRevertCode(data: Hex): string | undefined {
     return ({ NotLinked: "registry_link_changed", SelfLink: "registry_ineligible", InvalidAgentSignature: "registry_agent_signature_invalid", InvalidParentSignature: "registry_approval_invalid", SignatureExpired: "registry_approval_expired", AgentLimitReached: "registry_limit_reached", AgentAlreadyHasParent: "registry_already_linked", ParentIsAgent: "registry_ineligible", AgentIsParent: "registry_ineligible", ParentNotIncentivAccount: "registry_ineligible", AgentNotIncentivAccount: "registry_ineligible" } as Record<string, string>)[errorName];
   } catch { return undefined; }
 }
-/** The contract itself refused the call. viem also reports a node's -32603 internal error as a revert, which says nothing about the contract. */
+/**
+ * The contract itself refused the call. viem also reports a node's -32603 internal error as a revert, which says nothing
+ * about the contract. Some nodes report a revert without data as -32000 "execution reverted", which viem does not decode.
+ */
 export function isContractRejection(error: unknown): boolean {
   if (!(error instanceof BaseError)) return false;
-  if (error.walk(cause => cause instanceof ContractFunctionZeroDataError)) return true;
+  if (error.walk(cause => cause instanceof ContractFunctionZeroDataError || (cause instanceof InvalidInputRpcError && /revert/i.test(cause.message)))) return true;
   const reverted = error.walk(cause => cause instanceof ContractFunctionRevertedError) as ContractFunctionRevertedError | null;
   if (!reverted) return false;
   return !error.walk(cause => cause instanceof InternalRpcError) || !!reverted.data || !!reverted.signature || /revert/i.test(reverted.reason ?? "");

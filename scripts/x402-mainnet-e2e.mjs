@@ -283,11 +283,15 @@ async function clearFailedAttempt(run, signal) {
   const id = attempt.purchase.request_id;
   assert.match(id, /^[0-9a-f-]{36}$/i);
   const operation = await withBuyer(run.buyerProfile, async call => (await call("get_agent_operation", { id })).result, undefined, signal);
-  assert.equal(operation.request_id, id);
-  assert.equal(operation.status, "failed", "A retry requires a failed preparation");
-  assert.equal(operation.archived, true, "A retry requires the terminal wallet record");
-  assert.equal(operation.user_op_hash, undefined, "A recorded user operation must be reconciled without another purchase");
-  assert.equal(operation.transaction_hash, undefined, "A recorded transaction must be reconciled without another purchase");
+  // A purchase refused before the wallet journaled it (an outage in its first checks, say) left no record,
+  // and the wallet signs nothing it has not journaled, so nothing was paid.
+  if (operation.code !== "operation_not_found") {
+    assert.equal(operation.request_id, id);
+    assert.equal(operation.status, "failed", "A retry requires a failed preparation");
+    assert.equal(operation.archived, true, "A retry requires the terminal wallet record");
+    assert.equal(operation.user_op_hash, undefined, "A recorded user operation must be reconciled without another purchase");
+    assert.equal(operation.transaction_hash, undefined, "A recorded transaction must be reconciled without another purchase");
+  }
   const history = `attempt-${id}.json`;
   if (!await load(history)) await save(history, { ...attempt, operation });
   await unlink(join(directory, "attempt.json"));

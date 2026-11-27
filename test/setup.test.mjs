@@ -389,3 +389,15 @@ test("setup refuses the agent's own account as its Portal parent", async () => {
   assert.deepEqual(registry.agentRegistry.parents.map(p => p.toLowerCase()), [other]);
   assert.ok(told.some(m => /own account, which cannot be its own parent/.test(m)));
 });
+
+test("setup asks again for an origin longer than the policy allows, instead of failing after every answer", async () => {
+  const told = [], tell = text => told.push(text);
+  const usdc = MAINNET.manifest.canonicalTokens.USDC.address;
+  const limits = { tokens: { [usdc]: { perTransaction: "50000", daily: "1000000", exposure: "1000000", gasPayment: String(X402_MIN_USDC_GAS) } } };
+  const long = `https://${`${"a".repeat(60)}.`.repeat(5)}com`;
+  const answers = ["y", "0.05", long, "https://api.example.com", ""], ask = async () => answers.shift();
+  const x402 = await promptX402(MAINNET, limits, ask, tell);
+  assert.deepEqual(x402.origins, { mode: "allowlist", origins: ["https://api.example.com"] });
+  assert.ok(told.some(text => /longer than the 256 characters/.test(text)));
+  assert.equal(answers.length, 0);
+});

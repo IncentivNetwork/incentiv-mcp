@@ -657,6 +657,8 @@ test("an RPC failure during signature validation is not reported as an invalid s
   await assert.rejects(check(parentCall(() => { throw Object.assign(new Error("execution reverted"), { code: 3, data: "0x" }); })), { code: "registry_approval_invalid" });
   for (const message of ["internal error", "missing trie node"]) await assert.rejects(check(parentCall(() => { throw Object.assign(new Error(message), { code: -32603 }); })), error => !(error instanceof WalletError));
   await assert.rejects(check(parentCall(() => { throw Object.assign(new Error("execution reverted"), { code: -32603 }); })), { code: "registry_approval_invalid" });
+  // Some nodes report a revert without data as -32000; the parent refused the signature, so it is not an outage.
+  for (const data of [undefined, "0x"]) await assert.rejects(check(parentCall(() => { throw Object.assign(new Error("execution reverted"), { code: -32000, data }); })), { code: "registry_approval_invalid" });
   await assert.rejects(check(parentCall(() => "0x")), { code: "registry_approval_invalid" });
   const chain = new WalletChain(new Ctx(MAINNET));
   chain.clients.splice(0, chain.clients.length, parentCall(() => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); }));
@@ -1618,6 +1620,8 @@ test("a bundler's internal or limit error during simulation keeps a new request 
     [rpc({ error: { code: -32500, message: "AA23 reverted" } }, 429), "rpc_unavailable", "429 with a rejection code"],
     [rpc({ error: { code: -32000, message: "server overloaded" } }, 503), "rpc_unavailable", "503 overloaded"],
     [rpc({ error: { code: -32504, message: "paymaster throttled" } }, 503), "rpc_unavailable", "503 throttled"],
+    // A throttled or banned entity is the bundler's state, not the operation's, however the HTTP status reads.
+    [rpc({ error: { code: -32504, message: "paymaster throttled" } }), "rpc_unavailable", "200 throttled"],
     [rpc({ error: { code: -32521, message: "execution reverted" } }, 500), "simulation_failed", "500 execution reverted"],
   ]) {
     const f = await fixture(t), id = randomUUID();
