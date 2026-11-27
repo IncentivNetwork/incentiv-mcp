@@ -66,8 +66,9 @@ export function validateOperation(cfg: Config, wallet: WalletEnvelope, intent: I
       const call = business[0], expectedCall = registryCall(cfg, wallet.account as Address, intent);
       requireValue(equal(call.to, expectedCall.to) && call.value === 0n && equal(call.data, expectedCall.data));
       if (intent.kind === "link_agent") requireValue(expected.deadline === Number(intent.registryApproval!.parent_deadline));
-    } else if (intent.kind === "transfer") {
-      requireValue(business.length === 1 && intent.to);
+    } else if (intent.kind === "transfer" || intent.kind === "x402_payment") {
+      // An x402 payment has exactly a token transfer's calls (the incentiv-userop scheme, SPEC 4.3); only its nonce lane differs.
+      requireValue(business.length === 1 && intent.to && (intent.kind === "transfer" || intent.token !== "native"));
       const call = business[0];
       if (intent.token === "native") requireValue(equal(call.to, intent.to) && call.value === amount && call.data === "0x");
       else {

@@ -194,9 +194,12 @@ test("a stale timestamp does not authorize stealing a live process's creation lo
   await privateDirectory(f.root);
   const lock = await creationLock(f.root);
   try {
+    // A lock its owner keeps fresh means another operation is running.
+    await assert.rejects(creationLock(f.root, 1), e => e.code === "wallet_locked" && /in progress/.test(e.message));
     const old = new Date(Date.now() - 120_000);
     await utimes(join(f.root, "wallet.create.lock"), old, old);
-    await assert.rejects(creationLock(f.root, 1), { code: "wallet_locked" });
+    // A stale lock whose recorded process still runs (hung, or its PID reused) points to recovery, not to a retry.
+    await assert.rejects(creationLock(f.root, 1), e => e.code === "wallet_locked" && /inspect recovery evidence/.test(e.message) && !/retry shortly/.test(e.message));
     await lock.assertOwned();
   } finally { await lock.release(); }
   const path = join(f.root, "wallet.create.lock");

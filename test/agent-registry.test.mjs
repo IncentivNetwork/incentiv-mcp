@@ -1474,6 +1474,43 @@ test("a token-paid replacement the bundler keeps refusing can be replaced once m
   }
 });
 
+test("a receipt lookup error for the native replacement preserves its progress and checks the prior replacement", async t => {
+  const f = await tokenRegistryFixture(t), id = randomUUID(), balances = f.chain.balances;
+  await f.service.send("link_agent", { request_id: id, approval: f.approval, gas_token: "USDC" });
+  f.chain.balances = async (...params) => ({ ...await balances(...params), native: "1000000" });
+  const [token] = (await f.service.reviewReplacement(id)).records;
+  const relay = f.chain.relay;
+  f.chain.relay = async () => { throw new Error("paymaster: insufficient token payment"); };
+  await f.service.replace(id, password, digest(token));
+  f.chain.buildReplacement = (wallet, _original, state) => {
+    const built = unsigned(wallet, { to: wallet.account, amount: "0" }, state);
+    built.op.maxFeePerGas = 2n; built.op.maxPriorityFeePerGas = 2n;
+    built.userOpHash = computeUserOpHash(built.op, MAINNET.identity.entryPoint.address, 24101);
+    return built;
+  };
+  const [native] = (await f.service.reviewReplacement(id, true)).records;
+  f.chain.relay = relay;
+  await f.service.replace(id, password, digest(native));
+
+  const lookups = [];
+  f.chain.receipt = async r => {
+    lookups.push(r.userOpHash);
+    if (r.userOpHash === native.replacement.userOpHash) {
+      r.searchedBlock = "123";
+      throw new Error("receipt lookup unavailable");
+    }
+    if (r.userOpHash === token.replacement.userOpHash) return { success: true, actualGasCost: 400n, transactionHash: `0x${"77".repeat(32)}` };
+  };
+  assert.equal((await f.service.operation(id)).status, "superseded");
+  assert.deepEqual(lookups, [token.userOpHash, native.replacement.userOpHash, token.replacement.userOpHash]);
+  await f.store.session(async s => {
+    const [record] = (await Journal.open(s)).data.records;
+    assert.equal(record.replacement.searchedBlock, "123");
+    assert.equal(record.priorReplacement.searchedBlock, undefined);
+    assert.deepEqual(record.consumed, { [f.token]: "150" });
+  });
+});
+
 test("a native replacement is priced above every operation signed at its nonce", () => {
   const current = { baseFeePerGas: 1n, maxFeePerGas: 10n, maxPriorityFeePerGas: 1n };
   const op = (maxFeePerGas, maxPriorityFeePerGas) => userOpToJson({ sender: `0x${"11".repeat(20)}`, nonce: 0n, callData: "0x", callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas, maxPriorityFeePerGas, signature: "0x" });

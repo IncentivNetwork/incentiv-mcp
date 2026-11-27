@@ -17,13 +17,16 @@ export async function creationLock(root: string, timeoutMs = 10_000) {
   const recovery = join(root, "wallet.create.recover.lock");
   const record = { token: randomUUID(), pid: process.pid, host: await hostIdentity(), startedAt: Date.now() - process.uptime() * 1000 };
   const deadline = Date.now() + timeoutMs;
+  let recovering = false, stale = false;
   for (;;) {
-    if (!await exists(recovery)) {
+    recovering = await exists(recovery); stale = false;
+    if (!recovering) {
       try { await writeNew(path, JSON.stringify(record)); break; } catch (error) { if (!isExists(error)) throw error; }
       // Never infer death merely from an expired heartbeat. PID reuse/live owners
       // remain locked; an unverifiable/foreign host requires explicit recovery.
       const stat = await lstat(path).catch((error) => { if (isMissing(error)) return undefined; throw error; });
-      if (stat && Date.now() - stat.mtimeMs > 60_000) {
+      stale = !!stat && Date.now() - stat.mtimeMs > 60_000;
+      if (stale) {
         const old = lockSchema.safeParse(await readJson(path));
         if (!old.success || old.data.host !== record.host) throw new WalletError("wallet_recovery_required", "Creation lock owner cannot be verified on this host");
         if (gone(old.data.pid)) {
@@ -41,7 +44,11 @@ export async function creationLock(root: string, timeoutMs = 10_000) {
         }
       }
     }
-    if (Date.now() >= deadline) throw new WalletError("wallet_locked", "Another creator or a recovery lock owns the wallet; retry or inspect recovery evidence");
+    if (Date.now() >= deadline) throw new WalletError("wallet_locked", recovering
+      ? "A lock recovery is in progress on this wallet; retry shortly, or inspect recovery evidence if this persists"
+      // Not refreshed for a minute, yet its recorded process is alive: a hung owner, or its PID was reused.
+      : stale ? "The wallet lock has not been refreshed for over a minute, but the process that took it still appears to run. If no wallet process is running, inspect recovery evidence; nothing was changed"
+      : "Another wallet operation is in progress, such as an x402 payment waiting on its seller. Nothing was changed; retry shortly (reusing a request ID is safe)");
     await delay(100);
   }
   let failure = false;

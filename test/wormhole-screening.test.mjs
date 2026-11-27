@@ -333,6 +333,11 @@ test("load imports the user's installed wormhole-x402 only when enabled and repo
   assert.deepEqual(warnings, []);
   const off = await WormholeScreening.load({ mode: "off" });
   assert.deepEqual(off.fields({ name: canaryText }, ["name"]), { name: canaryText });
+  // Several nested fields: each element of a list is screened on its own.
+  const listed = on.fields({ name: "Weather", tags: ["weather", canaryText], input: { city: canaryText } }, ["name"], ["tags", "input"]);
+  assert.deepEqual(listed.tags, ["weather", withheld]);
+  assert.equal(listed.input.city, withheld);
+  assert.equal(listed.name, "Weather");
 });
 
 test("a scanner exception withholds only the affected text", async t => {

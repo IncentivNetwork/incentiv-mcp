@@ -11,13 +11,26 @@ import { address, tokenId, uint, addSpend, type Spend } from "./policy.js";
 import type { WalletSession } from "./store.js";
 
 const hash = z.string().regex(/^0x[0-9a-f]{64}$/);
+/**
+ * What an x402 payment pays for and how it was signed. `accepted` and `resource` are the seller's JSON, kept
+ * exactly so the payment payload repeats them; `request` binds the request UUID to the caller's request.
+ */
+export const x402IntentSchema = z.strictObject({
+  url: z.string().max(2048), origin: z.string().max(256), method: z.enum(["GET", "POST"]), request: hash, maxAmount: uint,
+  accepted: z.string().max(8192), resource: z.string().max(8192).optional(),
+  paymentId: hash, validUntil: z.number().int().positive(),
+});
 export const intentSchema = z.strictObject({
-  intentSchemaVersion: z.literal(1), kind: z.enum(["transfer", "swap", "link_agent", "unlink_agent"]),
+  intentSchemaVersion: z.literal(1), kind: z.enum(["transfer", "swap", "link_agent", "unlink_agent", "x402_payment"]),
   token: tokenId, amount: uint, gasToken: tokenId, to: address.optional(),
   tokenOut: tokenId.optional(), minimumOut: uint.optional(), slippageBps: z.number().int().min(0).max(1000),
   feeTier: z.number().int().min(1).max(1_000_000),
   registryParent: address.optional(), registryApproval: registryApprovalSchema.optional(),
+  x402: x402IntentSchema.optional(),
 }).superRefine((intent, ctx) => {
+  if (intent.kind === "x402_payment" ? (!intent.x402 || !intent.to || intent.token === "native" || intent.tokenOut !== undefined || intent.minimumOut !== undefined || BigInt(intent.amount) > BigInt(intent.x402.maxAmount)) : intent.x402 !== undefined) {
+    ctx.addIssue({ code: "custom", message: "Invalid x402 intent" });
+  }
   const registry = intent.kind === "link_agent" || intent.kind === "unlink_agent";
   if (registry ? (!intent.registryParent || intent.amount !== "0" || intent.token !== intent.gasToken || intent.to !== undefined || intent.tokenOut !== undefined || intent.minimumOut !== undefined || (intent.kind === "link_agent" ? !intent.registryApproval : !!intent.registryApproval)) : (intent.registryParent !== undefined || intent.registryApproval !== undefined)) {
     ctx.addIssue({ code: "custom", message: "Invalid registry intent" });
@@ -26,8 +39,13 @@ export const intentSchema = z.strictObject({
 export type Intent = z.infer<typeof intentSchema>;
 export const statuses = ["preparing", "approval_required", "signed", "submitting", "submitted", "submission_unknown", "superseding", "superseded", "confirmed", "reverted", "failed", "cancelled", "expired"] as const;
 export const ownsNonce = (status: string) => ["signed", "submitting", "submitted", "submission_unknown", "superseding"].includes(status);
+/** x402 payments use their own nonce lane, so only other operations hold the account's main nonce. */
+export const holdsMainNonce = (r: { status: string; intent: { kind: string } }) => ownsNonce(r.status) && r.intent.kind !== "x402_payment";
 export const terminal = (status: string) => ["confirmed", "reverted", "failed", "cancelled", "expired", "superseded"].includes(status);
-const replacementSchema = z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int() }).superRefine((replacement, ctx) => {
+/** x402 only: EntryPoint logs a receipt search found but could not yet verify or rule out, retried on every pass. */
+const retryLogsSchema = z.array(z.strictObject({ transactionHash: hash, blockNumber: uint.optional(), blockHash: hash.optional() })).max(16);
+// fromBlock, searchedBlock, discoveredBlock and retryLogs (x402 only) are the replacement's own receipt search start and progress, as for the original.
+const replacementSchema = z.strictObject({ operation: z.record(z.string(), z.string()), userOpHash: hash, maxGasCost: uint, gasToken: tokenId.optional(), gasCharge: uint.optional(), signed: z.boolean(), expiresAt: z.number().int(), fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional(), retryLogs: retryLogsSchema.optional() }).superRefine((replacement, ctx) => {
   if ((replacement.gasToken === undefined) !== (replacement.gasCharge === undefined)) ctx.addIssue({ code: "custom", message: "Incomplete replacement gas payment" });
 });
 const recordSchema = z.strictObject({
@@ -45,6 +63,12 @@ const recordSchema = z.strictObject({
     liveTest: z.strictObject({ requestId: z.string().uuid(), policyDigest: hash }).optional(),
   }).optional(),
   transactionHash: hash.optional(),
+  // x402 only: the block the payment was signed at, which bounds an on-chain search for it, the last block that
+  // search has covered without finding it (discoveredBlock: the last block only some RPCs could search, while
+  // another RPC's log queries failed), the block and hash it settled in, and whether the seller's answer for it was handed back.
+  fromBlock: uint.optional(), searchedBlock: uint.optional(), discoveredBlock: uint.optional(), retryLogs: retryLogsSchema.optional(), settledBlock: uint.optional(), settledBlockHash: hash.optional(), delivered: z.boolean().optional(),
+  // x402 only: the settlement is past the reorg margin, so reconciliation no longer rechecks it.
+  settlementFinal: z.literal(true).optional(),
   replacement: replacementSchema.optional(),
   // A signed token-paid replacement the bundler kept refusing, kept after a native replacement was reviewed over it:
   // it may still land, so its hash is still checked and its reservation is still held.
@@ -53,12 +77,26 @@ const recordSchema = z.strictObject({
 /** Every signed replacement of an operation; any of them, or the original, may take its nonce. */
 export const signedReplacements = (r: OperationRecord) => [...(r.replacement?.signed ? [r.replacement] : []), ...(r.priorReplacement ? [r.priorReplacement] : [])];
 export type OperationRecord = z.infer<typeof recordSchema>;
+/**
+ * x402 only: an unpaid POST, journaled under its request ID before it is sent. The digest binds any seller-side
+ * Idempotency-Key to the original request. A valid 402 allows the binding to change if no prior POST may have run.
+ */
+export const probeSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, outcome: z.enum(["sending", "payment_required", "not_required"]), at: z.number().int() });
+export type Probe = z.infer<typeof probeSchema>;
+/** x402 only: what is left of an ended payment once its record is archived, so its request ID stays bound and its hashes findable. */
+export const archivedSchema = z.strictObject({
+  requestId: z.string().uuid(), request: hash, status: z.enum(statuses), lastError: z.string().max(64).optional(),
+  userOpHash: hash.optional(), replacementUserOpHash: hash.optional(), priorReplacementUserOpHash: hash.optional(),
+  transactionHash: hash.optional(), at: z.number().int(),
+});
 export const journalSchema = z.strictObject({
   schemaVersion: z.literal(1), walletId: z.string().uuid(), networkId: hash, manifestId: hash,
   approvedManifestIds: z.array(hash).optional(),
   approvedNetworkIds: z.array(hash).optional(),
   implementationUpgrade: z.strictObject({ previousManifestId: hash, manifestId: hash }).optional(),
   sequence: z.number().int().nonnegative(), records: z.array(recordSchema),
+  probes: z.array(probeSchema).optional(),
+  archived: z.array(archivedSchema).optional(),
 });
 export type JournalData = z.infer<typeof journalSchema>;
 export const journalApprovesManifest = (data: JournalData, id: string) => data.manifestId === id || !!data.approvedManifestIds?.includes(id);
@@ -68,25 +106,35 @@ const signedSchema = z.strictObject({ data: journalSchema, mac: z.string().regex
 export const digest = (value: unknown) => keccak256(toHex(canonicalJson(value)));
 const transitions: Record<OperationRecord["status"], string[]> = {
   preparing: ["approval_required", "signed", "failed", "cancelled"],
-  approval_required: ["preparing", "expired", "cancelled"], signed: ["submitting", "superseding"],
-  // Back to signed only when the last check before the broadcast refused, so nothing was sent.
+  approval_required: ["preparing", "expired", "cancelled"],
+  // Only an x402 payment that never left this computer expires from signed: nobody else holds its signature.
+  // An x402 payment whose nonce lane was used needs receipt reconciliation even if it was recorded as unsent.
+  signed: ["submitting", "superseding", "expired", "submission_unknown"],
+  // Back to its earlier status only when the last check before the outbound request or broadcast refused it, so it never left.
   submitting: ["submitted", "submission_unknown", "signed"],
   submitted: ["confirmed", "reverted", "submission_unknown", "superseding"],
   submission_unknown: ["submitting", "submitted", "confirmed", "reverted", "superseding"],
   superseding: ["confirmed", "reverted", "superseded"],
-  confirmed: [], reverted: [], failed: [], cancelled: [], expired: [], superseded: [],
+  // Only x402 operations reopen when a reorg makes their nonce usable again.
+  confirmed: ["submitted", "superseding"], reverted: ["submission_unknown", "superseding"],
+  failed: [], cancelled: [], expired: [], superseded: ["superseding"],
 };
+/** The moves above that only an x402 payment may make. */
+const X402_ONLY_TRANSITIONS = ["signed>expired", "signed>submission_unknown", "confirmed>submitted", "confirmed>superseding", "reverted>submission_unknown", "reverted>superseding", "superseded>superseding"];
 
 /** One atomic authenticated snapshot retains every request for the wallet lifetime.
  * ponytail: linear journal reads; segment with authenticated tombstones when history exceeds 16 MiB.
  */
 export class Journal {
+  /** The size of the journal as last read or written, in bytes. */
+  bytes = 0;
   private constructor(readonly session: WalletSession, readonly data: JournalData) {}
   static async open(session: WalletSession, initialize = false): Promise<Journal> {
     const path = join(session.directory, "operations", "journal.json");
-    let data: JournalData;
+    let data: JournalData, size = 0;
     if (await exists(path)) {
       const bytes = await readPrivate(path, 16 * 1024 * 1024);
+      size = bytes.length;
       try {
         const parsed = signedSchema.parse(JSON.parse(bytes.toString("utf8")));
         const expected = Buffer.from(Journal.mac(session, parsed.data), "hex");
@@ -105,11 +153,17 @@ export class Journal {
     const ids = new Set();
     for (const record of data.records) {
       const manifest = record.manifestId ?? data.manifestId;
-      const compatiblePending = wallet.networkIdentity.networkId === CURRENT_ACCOUNT_NETWORK_ID && upgrade?.manifestId === wallet.approvedCapabilityManifestId && upgrade.previousManifestId === manifest;
+      // An x402 payment can hold its nonce lane again after a capability approval: a reorg can undo its confirmation.
+      // Every send checks it against the current configuration, so an earlier approved manifest is enough.
+      const compatiblePending = (wallet.networkIdentity.networkId === CURRENT_ACCOUNT_NETWORK_ID && upgrade?.manifestId === wallet.approvedCapabilityManifestId && upgrade.previousManifestId === manifest) || record.intent.kind === "x402_payment";
       if (ids.has(record.requestId) || record.intentHash !== digest(record.intent) || record.sequence > data.sequence || !journalApprovesManifest(data, manifest) || (ownsNonce(record.status) && (!record.operation || !record.userOpHash || record.nonce === undefined || (manifest !== wallet.approvedCapabilityManifestId && !compatiblePending)))) throw new WalletError("wallet_recovery_required", "Invalid journal record");
       ids.add(record.requestId);
     }
-    return new Journal(session, data);
+    for (const a of data.archived ?? []) { if (ids.has(a.requestId)) throw new WalletError("wallet_recovery_required", "Invalid journal record"); ids.add(a.requestId); }
+    if (new Set(data.probes?.map(p => p.requestId)).size !== (data.probes?.length ?? 0)) throw new WalletError("wallet_recovery_required", "Invalid journal record");
+    const journal = new Journal(session, data);
+    journal.bytes = size;
+    return journal;
   }
   static mac(session: WalletSession, data: JournalData): string {
     const key = Buffer.from(hkdfSync("sha256", session.wrappingKey, Buffer.from(session.envelope.walletId), "incentiv-mcp/journal/v1", 32));
@@ -120,12 +174,13 @@ export class Journal {
     await this.session.assertOwned();
     journalSchema.parse(this.data);
     const content = canonicalJson({ data: this.data, mac: Journal.mac(this.session, this.data) });
-    if (Buffer.byteLength(content) > 16 * 1024 * 1024) throw new WalletError("wallet_recovery_required", "Journal capacity reached; authenticated migration required");
+    this.bytes = Buffer.byteLength(content);
+    if (this.bytes > 16 * 1024 * 1024) throw new WalletError("wallet_recovery_required", "Journal capacity reached; authenticated migration required");
     await replacePrivate(join(this.session.directory, "operations", "journal.json"), content, point => this.session.checkpoint?.(`journal_${this.data.records.at(-1)?.status ?? "empty"}:${point}`) ?? Promise.resolve());
     await this.session.checkpoint?.(`journal_${this.data.sequence}_${this.data.records.at(-1)?.status ?? "empty"}`);
   }
   async transition(record: OperationRecord, status: OperationRecord["status"]): Promise<void> {
-    if (!transitions[record.status].includes(status)) throw new WalletError("wallet_recovery_required", "Invalid operation transition");
+    if (!transitions[record.status].includes(status) || (record.intent.kind !== "x402_payment" && X402_ONLY_TRANSITIONS.includes(`${record.status}>${status}`))) throw new WalletError("wallet_recovery_required", "Invalid operation transition");
     record.status = status; record.updatedAt = Date.now(); record.sequence = ++this.data.sequence;
     await this.save();
   }

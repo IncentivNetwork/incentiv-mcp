@@ -42,6 +42,7 @@ Chain tools never hold keys. A `build_*` tool returns the fully populated **unsi
 | Bridge | `get_bridge_routes`, `build_bridge_transfer`, `build_bridge_transfer_out`, `get_bridge_status` |
 | Broadcast (signed) | `broadcast_user_operation`, `broadcast_transaction` |
 | Local wallet (stdio only) | `create_agent_wallet`, `get_agent_wallet`, `send_transfer`, `send_swap`, `get_agent_operation`, `get_agent_registry_status`, `prepare_agent_link`, `sign_agent_link`, `link_agent` |
+| x402 payments (stdio only) | `discover_x402_resources`, `get_x402_payment_requirements`, `pay_x402_resource` |
 
 Notable behaviors:
 
@@ -61,6 +62,12 @@ If the agent account is already deployed, call `sign_agent_link` with `parent` s
 Otherwise, call `prepare_agent_link` and open its Portal URL. Check the agent and parent smart-account addresses, approve the connection in Portal, and pass the returned approval JSON to `link_agent` with a fresh `request_id` UUID. Reuse that UUID for identical retries and check `get_agent_operation` for confirmation. The agent pays gas and can deploy in its first linking operation.
 
 Existing wallets must approve the new capability manifest and review their policy before using the registry. Connections are permanent: neither this wallet nor Portal offers a way to disconnect them. See [agent connection and migration](docs/agent-registry.md) for permissions, gas and stale approvals. `get_agent_registry_status` shows the current relationship. A connection does not authorize spending from the parent.
+
+## Pay for x402 resources
+
+The wallet can pay websites and APIs that charge per request with [x402](https://x402.org), in USDC from its smart account, using the `incentiv-userop` scheme of [`@incentiv/x402`](https://github.com/IncentivNetwork/incentiv-x402-public). It is off until you allow it in `incentiv-mcp setup`, which asks for a maximum price per payment and which sites and sellers may be paid.
+
+Call `get_x402_payment_requirements` to see a resource's live price without paying, then `pay_x402_resource` with `max_amount` and a fresh `request_id`. The wallet refuses a price above `max_amount` or outside policy before signing. Payments also count against your USDC limits, and gas (about 0.03 USDC) is paid on top. Only the seller submits a payment; one that was sent but never settled stays reserved until it settles or you cancel it with `wallet operation resolve <request_id> --replace`. `discover_x402_resources` searches the facilitator's catalog. See [x402 payments](docs/x402.md).
 
 ## Optional text screening with Agent Wormhole
 
@@ -82,7 +89,7 @@ If the scanner is missing, throws, or fails its startup self-test (`wormhole can
 
 ## Configuration
 
-The server registers nine wallet tools without touching storage until one is called. `wallet doctor` checks the network and bundler without opening a wallet. `wallet init` creates a disabled wallet, and `wallet policy configure` sets the administration password through a no-echo terminal prompt. `wallet backup --out <file>` writes an encrypted backup, and `wallet restore --in <file>` restores into an empty namespace. `wallet capabilities approve` approves new capabilities, such as the Agent Registry, and keeps the account; a configuration that changes anything else also needs `--previous <config.json>`. See [wallet storage and CLI](https://github.com/IncentivNetwork/incentiv-mcp/blob/main/docs/wallet-storage.md).
+The server registers nine wallet tools and three x402 tools without touching storage until one is called. `wallet doctor` checks the network and bundler without opening a wallet. `wallet init` creates a disabled wallet, and `wallet policy configure` sets the administration password through a no-echo terminal prompt. `wallet backup --out <file>` writes an encrypted backup, and `wallet restore --in <file>` restores into an empty namespace. `wallet capabilities approve` approves new capabilities, such as the Agent Registry, and keeps the account; a configuration that changes anything else also needs `--previous <config.json>`. See [wallet storage and CLI](https://github.com/IncentivNetwork/incentiv-mcp/blob/main/docs/wallet-storage.md).
 
 Runtime dependencies are exact, and the full dependency graph is published in `npm-shrinkwrap.json`. Installation never runs a wallet migration.
 
@@ -97,6 +104,7 @@ Endpoint overrides keep that identity:
 | `INCENTIV_EXPLORER_API_URL` | `https://explorer.incentiv.io/api/v2` | Blockscout v2 REST API. |
 | `INCENTIV_EXPLORER_URL` | `https://explorer.incentiv.io` | Explorer for links. |
 | `INCENTIV_PORTAL_URL` | `https://portal.incentiv.io/agents` | Portal page that agent connection links open. Must be an `https://` URL on `incentiv.io` or one of its subdomains. |
+| `INCENTIV_X402_FACILITATOR_URL` | `https://x402.incentiv.io` | Facilitator whose catalog `discover_x402_resources` reads. Must be an `https` origin. Payments go to each seller, not here. |
 | `INCENTIV_NETWORK_CONFIG` | Built-in mainnet configuration | Absolute path to one complete network JSON file. |
 
 Individual overrides such as `INCENTIV_CHAIN_ID`, `INCENTIV_ENTRY_POINT` or `INCENTIV_ACCOUNT_FACTORY` are rejected. Custom networks need a complete configuration with valid content-derived IDs; see [network configuration](https://github.com/IncentivNetwork/incentiv-mcp/blob/main/docs/network-configuration.md). Setting `manifest.bridge.enabled=false` removes the four bridge tools (20 public tools instead of 24).
