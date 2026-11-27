@@ -315,7 +315,8 @@ export class WalletService {
         if (args.wait_for_confirmation === true) await this.reconcile(journal);
         return result(r);
       }
-      if (journal.data.records.some(holdsMainNonce)) throw new WalletError("operation_pending", "An unresolved operation owns the account nonce; reconcile it first");
+      const holder = journal.data.records.find(holdsMainNonce);
+      if (holder) throw mainNoncePending(holder, "retry this request");
       // Only x402 payments, on their own lanes, can be pending here. Read the chain only when one is.
       if (journal.data.records.some(o => ownsNonce(o.status))) assertDeploysOnce((await this.chain.state(s.envelope).catch((error: unknown) => { throw rpcOutage(error); })).deployed, journal);
       // Rejected new registry requests must not consume journal capacity. An existing record is checked below, where a failure closes it.
@@ -427,16 +428,23 @@ export class WalletService {
       const url = this.agentLinkUrl(s);
       // A Portal approval for a wallet that cannot sign is unusable, so the user is not asked for one.
       try {
-        await this.linkPolicy(s);
+        const limits = await this.linkPolicy(s);
         if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot send link_agent. Use a release with signing enabled to connect this agent");
+        // Local refusals come before any registry read, so they hold whatever the RPC does.
+        assertRegistryApproved(this.ctx.config, s.envelope);
+        if (!limits.agentRegistry?.parents.length) throw new WalletError("registry_parent_not_allowed", "Local wallet policy allows no Portal account to connect this agent. Add one with incentiv-mcp setup in your local terminal, then call prepare_agent_link again");
+        // link_agent refuses a new request while another operation holds the nonce, and a Portal approval lasts minutes.
+        const journal = await Journal.open(s); await this.reconcile(journal);
+        const holder = journal.data.records.find(holdsMainNonce);
+        if (holder) throw mainNoncePending(holder, "call prepare_agent_link again");
         const status = await this.chain.registryStatus(s.envelope);
         const blocked = linkBlocker(status, status.deployed);
         if (blocked) return linkRefusal(status, blocked);
-        const limits = await this.linkPolicy(s);
-        if (!limits.agentRegistry?.parents.length) throw new WalletError("registry_parent_not_allowed", "Local wallet policy allows no Portal account to connect this agent. Add one with incentiv-mcp setup in your local terminal, then call prepare_agent_link again");
+        // The policy can expire during the registry read.
+        await this.linkPolicy(s);
         return { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };
       } catch (error) {
-        if (error instanceof WalletError && ["policy_not_configured", "wallet_locked", "policy_expired", "capability_manifest_unapproved", "registry_parent_not_allowed", "wallet_release_unreviewed"].includes(error.code)) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
+        if (error instanceof WalletError && ["policy_not_configured", "wallet_locked", "policy_expired", "capability_manifest_unapproved", "registry_parent_not_allowed", "wallet_release_unreviewed", "operation_pending"].includes(error.code)) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
         throw error;
       }
     });
@@ -1341,6 +1349,15 @@ function assertDeploysOnce(deployed: boolean, journal: Journal) {
  * dropped, so the result and its x402 MCP metadata never name another chain or account. Its free text is cut short
  * here and screened by the tool.
  */
+/** Why a new request cannot start while `holder` owns the account nonce, with the step that frees it. */
+function mainNoncePending(holder: OperationRecord, next: string) {
+  const id = holder.requestId;
+  // An unlink an earlier build recorded is never sent again, so only a same-nonce replacement frees the nonce.
+  if (holder.intent.kind === "unlink_agent" && holder.status === "signed") return new WalletError("operation_pending", `Request ${id} is an unlink signed by an earlier build, which this wallet no longer sends, and it holds the account nonce. Clear it with wallet operation resolve ${id} --replace in your local terminal, then ${next}`);
+  if (holder.intent.kind === "unlink_agent") return new WalletError("operation_pending", `Request ${id} is an unlink from an earlier build that holds the account nonce. Check it with get_agent_operation; if it does not confirm, clear it with wallet operation resolve ${id} --replace in your local terminal, then ${next}`);
+  return new WalletError("operation_pending", `Request ${id} owns the account nonce; check it with get_agent_operation until it settles, then ${next}`);
+}
+
 function sellerSettlement(settled: SettleResponse | undefined, account: string) {
   if (!settled) return;
   const match = (value: unknown, pattern: RegExp) => typeof value === "string" && pattern.test(value) ? value.toLowerCase() : undefined;

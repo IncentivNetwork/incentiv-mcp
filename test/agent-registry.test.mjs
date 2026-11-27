@@ -600,6 +600,7 @@ test("a temporary RPC error does not outlive the record state it explained", asy
 
 test("registry reads report RPC failures as temporary", async t => {
   const f = await fixture(t), code = "registry_rpc_unavailable";
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: false } } }));
   f.chain.state = async () => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); };
   await assert.rejects(f.service.registryStatus(), { code });
   await assert.rejects(f.service.prepareAgentLink(), { code });
@@ -1401,7 +1402,7 @@ test("prepare_agent_link gives no Portal URL to a wallet that cannot sign the li
 
 test("prepare_agent_link refuses an expired local policy before and after reading the registry", async t => {
   const f = await fixture(t), now = Date.now, expiresAt = now() + 60_000;
-  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt } }));
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt, agentRegistry: { parents: [parent], allowUnlink: false } } }));
   f.chain.registryStatus = async () => {
     t.mock.method(Date, "now", () => expiresAt);
     return { parent: zero, agent_is_parent: false, agent_eligible: false, factory_allowed: true, deployed: false };
@@ -1677,4 +1678,25 @@ test("a retry whose reconciliation confirms the request returns it instead of pr
   assert.equal(f.builds(), builds);
   const [after] = await f.store.session(async s => (await Journal.open(s)).data.records);
   assert.equal(after.userOpHash, before.userOpHash); assert.deepEqual(after.reservation, before.reservation); assert.equal(after.nonce, before.nonce);
+});
+
+test("prepare_agent_link refuses locally, before any registry read, when no parent is allowed or another operation holds the nonce", async t => {
+  const f = await fixture(t);
+  f.chain.registryStatus = async () => assert.fail("a local refusal needs no registry read");
+  const noParent = await f.service.prepareAgentLink();
+  assert.equal(noParent.link_blocked, "registry_parent_not_allowed"); assert.equal(noParent.portal_url, undefined);
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [parent], allowUnlink: false } } }));
+  const id = randomUUID();
+  assert.equal((await f.service.send("transfer", transfer(id))).status, "submitted");
+  const pending = await f.service.prepareAgentLink();
+  assert.equal(pending.link_blocked, "operation_pending"); assert.equal(pending.portal_url, undefined);
+  assert.match(pending.next_action, new RegExp(`Request ${id} owns the account nonce`));
+});
+
+test("a signed unlink from an earlier build names the replacement that frees the nonce to every new request", async t => {
+  const f = await registryFixture(t), id = randomUUID(), relay = f.chain.relay;
+  await legacyUnlink(f, id).catch(() => {});
+  await f.store.session(async s => { const j = await Journal.open(s); j.data.records.find(r => r.requestId === id).status = "signed"; await j.save(); });
+  f.chain.relay = relay;
+  await assert.rejects(f.service.send("transfer", transfer(randomUUID())), e => e.code === "operation_pending" && e.message.includes(`wallet operation resolve ${id} --replace`) && /no longer sends/.test(e.message));
 });
