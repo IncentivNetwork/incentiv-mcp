@@ -11,6 +11,7 @@ import { NetworkError } from "../network.js";
 import { BundlerUnavailableError, userOpToJson } from "../userop.js";
 import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
 import { RpcDisagreementError } from "./errors.js";
+import { rpcOutage } from "./outage.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
 import { archivedSchema, Journal, digest, holdsMainNonce, intentSchema, ownsNonce, signedReplacements, terminal, type Intent, type OperationRecord } from "./journal.js";
 import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, x402QuoteViolations, x402Violations, type Limits, type Spend } from "./policy.js";
@@ -1256,8 +1257,6 @@ async function pooled(tasks: (() => Promise<void>)[], limit: number): Promise<vo
   if (failure) throw failure.error;
 }
 /** An RPC or bundler outage, or configured RPCs that disagree, says nothing about a request, so it becomes a retryable rpc_unavailable; anything else is returned as is. */
-const rpcOutage = (error: unknown) => error instanceof RpcDisagreementError || (!(error instanceof WalletError) && (isTransportFailure(error) || error instanceof BundlerUnavailableError))
-  ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : error;
 /** Refusals that say nothing about the request itself, so an unsigned request returns to approval_required and keeps its ID. */
 // Renewing the local policy clears registry_approval_outlasts_policy, so the request keeps its ID for that too.
 // A full parent stays retryable as for signed bytes: the registry's limit can change.
