@@ -915,8 +915,10 @@ export class WalletService {
   async operation(id: string) {
     return this.store.session(async s => {
       const journal = await Journal.open(s); await this.reconcile(journal);
-      const r = journal.data.records.find(r => r.requestId === id.toLowerCase() || r.userOpHash === id.toLowerCase());
-      const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === id.toLowerCase() || a.userOpHash === id.toLowerCase());
+      const key = id.toLowerCase();
+      const r = journal.data.records.find(r => r.requestId === key || r.userOpHash === key ||
+        r.replacement?.userOpHash === key || r.priorReplacement?.userOpHash === key);
+      const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === key || a.userOpHash === key);
       if (archived) return { request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archivedError(archived), archived: true };
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
       // An x402 payment is shown as pay_x402_resource shows it, in USDC rather than atomic units.
