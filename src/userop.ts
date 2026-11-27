@@ -153,6 +153,8 @@ function opToWire(op: UserOp): Record<string, string> {
 
 /** The bundler could not be reached or answered with a server error, so the call says nothing about the operation itself. */
 export class BundlerUnavailableError extends Error {}
+/** JSON-RPC errors that reflect the bundler's own state, not the operation: internal error and limit exceeded. */
+const BUNDLER_RETRYABLE_CODES = [-32603, -32005];
 
 export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): Promise<unknown> {
   let res: Response;
@@ -164,7 +166,7 @@ export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): P
       signal: AbortSignal.timeout(30_000),
     });
   } catch (error) { throw new BundlerUnavailableError(`Bundler unreachable: ${(error as Error).message}`); }
-  if (res.status === 429 || res.status >= 500) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
+  if (res.status === 408 || res.status === 429 || res.status >= 500) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
   if (!res.ok) throw new Error(`Bundler HTTP ${res.status}`);
   let body: unknown;
   try { body = await res.json(); } catch { throw new BundlerUnavailableError("Bundler answer is not valid JSON"); }
@@ -174,6 +176,8 @@ export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): P
     if ("result" in body || !error || typeof error !== "object" || !("code" in error) || !Number.isInteger(error.code) ||
         !("message" in error) || typeof error.message !== "string") throw new BundlerUnavailableError("Bundler answer has an invalid RPC error");
     const data = "data" in error && error.data ? ` ${JSON.stringify(error.data)}` : "";
+    // An internal error or exceeded limit says nothing about the operation, as for the chain RPC.
+    if (BUNDLER_RETRYABLE_CODES.includes(error.code as number)) throw new BundlerUnavailableError(`Bundler error ${error.code}: ${error.message}${data}`);
     throw new Error(`Bundler error ${error.code}: ${error.message}${data}`);
   }
   if (!("result" in body)) throw new BundlerUnavailableError("Bundler answer omitted its RPC result");
