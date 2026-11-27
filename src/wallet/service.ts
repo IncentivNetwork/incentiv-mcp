@@ -923,8 +923,14 @@ export class WalletService {
       const key = id.toLowerCase();
       const r = journal.data.records.find(r => r.requestId === key || r.userOpHash === key ||
         r.replacement?.userOpHash === key || r.priorReplacement?.userOpHash === key);
-      const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === key || a.userOpHash === key);
-      if (archived) return { request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archivedError(archived), archived: true };
+      const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === key || a.userOpHash === key ||
+        a.replacementUserOpHash === key || a.priorReplacementUserOpHash === key);
+      if (archived) return {
+        request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status,
+        user_op_hash: archived.userOpHash, replacement_user_op_hash: archived.replacementUserOpHash,
+        prior_replacement_user_op_hash: archived.priorReplacementUserOpHash, transaction_hash: archived.transactionHash,
+        last_error: archivedError(archived), archived: true,
+      };
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
       // An x402 payment is shown as pay_x402_resource shows it, in USDC rather than atomic units.
       return operationResult(r);
@@ -1282,7 +1288,14 @@ async function compactX402(journal: Journal, now = Date.now()) {
     }
     // A settled outcome supersedes any earlier delivery error, as the live record shows it.
     const lastError = archivedError(r);
-    archive.push({ requestId: r.requestId, request: r.intent.x402!.request, status: r.status, ...(lastError ? { lastError: lastError.slice(0, 64) } : {}), ...(r.userOpHash ? { userOpHash: r.userOpHash } : {}), ...(r.transactionHash ? { transactionHash: r.transactionHash } : {}), at: r.updatedAt });
+    archive.push({
+      requestId: r.requestId, request: r.intent.x402!.request, status: r.status, at: r.updatedAt,
+      ...(lastError ? { lastError: lastError.slice(0, 64) } : {}),
+      ...(r.userOpHash ? { userOpHash: r.userOpHash } : {}),
+      ...(r.replacement?.signed ? { replacementUserOpHash: r.replacement.userOpHash } : {}),
+      ...(r.priorReplacement ? { priorReplacementUserOpHash: r.priorReplacement.userOpHash } : {}),
+      ...(r.transactionHash ? { transactionHash: r.transactionHash } : {}),
+    });
     return false;
   });
   if (records.length !== journal.data.records.length) changed = true;

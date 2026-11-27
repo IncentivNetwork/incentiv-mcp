@@ -84,7 +84,11 @@ export type OperationRecord = z.infer<typeof recordSchema>;
 export const probeSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, outcome: z.enum(["sending", "payment_required", "not_required"]), at: z.number().int() });
 export type Probe = z.infer<typeof probeSchema>;
 /** x402 only: what is left of an ended payment once its record is archived, so its request ID stays bound and its hashes findable. */
-export const archivedSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, status: z.enum(statuses), lastError: z.string().max(64).optional(), userOpHash: hash.optional(), transactionHash: hash.optional(), at: z.number().int() });
+export const archivedSchema = z.strictObject({
+  requestId: z.string().uuid(), request: hash, status: z.enum(statuses), lastError: z.string().max(64).optional(),
+  userOpHash: hash.optional(), replacementUserOpHash: hash.optional(), priorReplacementUserOpHash: hash.optional(),
+  transactionHash: hash.optional(), at: z.number().int(),
+});
 export const journalSchema = z.strictObject({
   schemaVersion: z.literal(1), walletId: z.string().uuid(), networkId: hash, manifestId: hash,
   approvedManifestIds: z.array(hash).optional(),

@@ -850,6 +850,32 @@ test("ended x402 payments are archived after two days with their hashes, and sta
   assert.equal((await journal()).archived.length, 0);
 });
 
+test("archiving a cancelled payment keeps its signed replacement hash findable", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  const payment = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const review = (await f.service.reviewReplacement(id, true)).records[0];
+  await f.service.replace(id, password, digest(review));
+  const replacementHash = review.replacement.userOpHash, transactionHash = `0x${"ab".repeat(32)}`;
+  const laneNonce = f.chain.laneNonce;
+  f.chain.laneNonce = async (...args) => (await laneNonce(...args)) + 1n;
+  f.chain.receipt = async record => record.userOpHash === replacementHash
+    ? { success: true, actualGasCost: 5n, transactionHash }
+    : undefined;
+  assert.equal((await f.service.operation(replacementHash)).status, "superseded");
+  await f.store.session(async session => {
+    const journal = await Journal.open(session);
+    journal.data.records[0].updatedAt -= 3 * 86_400_000;
+    await journal.save();
+  });
+  const archived = await f.service.operation(replacementHash);
+  assert.equal(archived.request_id, id);
+  assert.equal(archived.status, "superseded");
+  assert.equal(archived.archived, true);
+  assert.equal(archived.transaction_hash, transactionHash);
+  assert.equal(archived.replacement_user_op_hash, replacementHash);
+  assert.deepEqual(await f.service.operation(payment.user_op_hash), archived);
+});
+
 test("a payment the seller may still settle is never archived, however old", async t => {
   const f = await x402Fixture(t), id = randomUUID();
   f.seen.fail = 1; // The seller does not answer: the payment may or may not settle.
