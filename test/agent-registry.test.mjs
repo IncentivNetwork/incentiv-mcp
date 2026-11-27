@@ -562,6 +562,31 @@ test("an agent that is itself a parent is ineligible, judged by its agent count"
   await assert.rejects(verifyRegistryIntent(isParent, MAINNET, { account: agent }, intent(a), state()), { code: "registry_ineligible" });
 });
 
+test("mixed registry verdicts preserve an exact local approval until the RPCs agree", async t => {
+  const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval };
+  const good = client();
+  const stale = client({ readContract: async call => call.functionName === "nonces" ? 1n : good.readContract(call) });
+  f.chain.verifyRegistry = WalletChain.prototype.verifyRegistry;
+  const currentState = f.chain.state.bind(f.chain);
+  f.chain.state = async wallet => ({ ...await currentState(wallet), block: 123n });
+  f.chain.clients.splice(0, f.chain.clients.length, good, good);
+  assert.equal((await f.service.send("link_agent", args)).status, "approval_required");
+  await f.service.approve(id, password, digest((await f.service.review(id)).records[0]));
+  const approved = (await f.service.review(id)).records[0].approval;
+
+  f.chain.clients.splice(0, 2, stale, good);
+  await assert.rejects(f.service.send("link_agent", args), { code: "registry_rpc_unavailable" });
+  const interrupted = (await f.service.review(id)).records[0];
+  assert.equal(interrupted.status, "approval_required");
+  assert.deepEqual(interrupted.approval, approved);
+  assert.equal(f.submissions.length, 0);
+
+  f.chain.clients.splice(0, 2, good, good);
+  assert.equal((await f.service.send("link_agent", args)).status, "submitted");
+  f.chain.clients.splice(0, 2, stale, stale);
+  await assert.rejects(f.store.session(s => f.chain.verifyRegistry(s.envelope, intent(f.approval))), { code: "registry_approval_stale" });
+});
+
 test("a temporary RPC error does not outlive the record state it explained", async t => {
   const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval }, now = Date.now();
   assert.equal((await f.service.send("link_agent", args)).status, "approval_required");
@@ -1124,7 +1149,7 @@ test("the chain signs nothing from a stale block, a blocked parent or disagreein
   // This RPC reports a different agent nonce, and a registry digest consistent with it.
   other.readContract = async args => args.functionName === "nonces" && args.args[0].toLowerCase() === agent.toLowerCase() ? 1n
     : args.functionName === "agentLinkDigest" ? agentLinkDigest(MAINNET, args.args[1], args.args[0], 1n, args.args[2]) : otherRead(args);
-  await assert.rejects(consentChain([deployedAgent(), other]).agentLinkConsent(consentWallet, parent), { code: "validation_failed", message: /disagrees/ });
+  await assert.rejects(consentChain([deployedAgent(), other]).agentLinkConsent(consentWallet, parent), { code: "registry_rpc_unavailable", message: /disagrees/ });
 });
 
 test("a policy that expires during the last registry read stops the broadcast", async t => {

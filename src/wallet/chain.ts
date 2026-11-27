@@ -203,6 +203,7 @@ export class WalletChain {
   private async registryRead<T>(wallet: WalletEnvelope, read: () => Promise<T>): Promise<T> {
     assertRegistryApproved(this.ctx.config, wallet);
     try { return await read(); } catch (error) {
+      if (error instanceof RpcDisagreementError) throw new WalletError("registry_rpc_unavailable", `${error.detail}; retry this request`);
       if (error instanceof WalletError) throw error;
       if (isTransportFailure(error)) throw new WalletError("registry_rpc_unavailable", "Could not read registry state from RPC; retry this request");
       // Reverts, malformed return data and local faults repeat on retry, so they close the request.
@@ -216,7 +217,14 @@ export class WalletChain {
     await this.registryRead(wallet, async () => {
       const current = state ?? await this.state(wallet);
       const expiresAt = wallet.policy?.configured ? wallet.policy.limits.expiresAt : undefined;
-      await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, current, expiresAt === undefined ? undefined : Math.floor(expiresAt / 1000))));
+      const verdicts = await Promise.allSettled(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, current, expiresAt === undefined ? undefined : Math.floor(expiresAt / 1000))));
+      const refusals = verdicts.flatMap(verdict => verdict.status === "rejected" ? [verdict.reason as unknown] : []);
+      if (!refusals.length) return;
+      // A final registry refusal needs a matching verdict from every provider.
+      const codes = refusals.map(error => error instanceof WalletError ? error.code : undefined);
+      if (refusals.length !== verdicts.length || !same(codes)) throw new RpcDisagreementError("Registry verification disagrees across RPCs");
+      const outage = refusals.find(isTransportFailure);
+      throw outage ?? refusals[0];
     });
   }
   async registryStatus(wallet: WalletEnvelope, parent?: Address) {
@@ -228,7 +236,7 @@ export class WalletChain {
       await verifyRegistryDeployment(client, this.ctx.config, state.block);
       return registryStatus(client, this.ctx.config, wallet.account as Address, parent, state.block);
     }));
-    if (!same(results.map(r => JSON.stringify(r)))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+    if (!same(results.map(r => JSON.stringify(r)))) throw new RpcDisagreementError("Registry state disagrees across RPCs");
     return { ...results[0], deployed: state.deployed };
   }
   /**
@@ -247,7 +255,7 @@ export class WalletChain {
       const now = freshBlockTime(state.timestamp), deadline = Math.min(now + AGENT_LINK_REQUEST_SECONDS, notAfter ?? Number.MAX_SAFE_INTEGER);
       if (deadline < now + AGENT_LINK_MIN_SECONDS) return { status, blocked: ["policy_expired", "Local wallet policy has expired or expires too soon. Renew it with incentiv-mcp setup in your local terminal"] as [string, string] };
       const results = await Promise.all(this.clients.map(client => readAgentLinkDigest(client, this.ctx.config, wallet.account as Address, parent, BigInt(deadline), state.block)));
-      if (!same(results.map(r => `${r.nonce}:${r.digest}`))) throw new WalletError("validation_failed", "Registry state disagrees across RPCs");
+      if (!same(results.map(r => `${r.nonce}:${r.digest}`))) throw new RpcDisagreementError("Registry state disagrees across RPCs");
       return { status, blocked, consent: { ...results[0], deadline: BigInt(deadline), block: state.block } };
     });
   }
