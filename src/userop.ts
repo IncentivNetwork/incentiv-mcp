@@ -151,20 +151,73 @@ function opToWire(op: UserOp): Record<string, string> {
   return wire;
 }
 
+/** The bundler could not be reached or answered with a server error, so the call says nothing about the operation itself. */
+export class BundlerUnavailableError extends Error {}
+/**
+ * JSON-RPC errors that reflect the bundler's own state, not the operation: internal error, limit exceeded, and
+ * ERC-4337's -32504, a throttled or banned paymaster, factory or aggregator.
+ */
+const BUNDLER_RETRYABLE_CODES = [-32603, -32005, -32504];
+/** Some bundlers report a validation or execution revert as -32603; one that carries revert data or names a revert is about the operation. */
+const bundlerRejection = (code: number, message: string, data: unknown) =>
+  code === -32603 && ((typeof data === "string" && /^0x[0-9a-f]{8,}$/i.test(data)) || /revert|\bAA\d\d\b/i.test(message));
+
+/** ERC-4337 bundler codes that reject the operation itself; -32504 (a throttled or banned entity) is not one of them. */
+const BUNDLER_REJECTION_CODES = [-32500, -32501, -32502, -32503, -32505, -32506, -32507, -32508, -32521];
+/** Whether a busy status's RPC error still reports the operation's own rejection, rather than the bundler's state. */
+const reportsRejection = (error: { code: number; message: string; data?: unknown }) => BUNDLER_REJECTION_CODES.includes(error.code)
+  || /revert|\bAA\d\d\b/i.test(error.message) || (typeof error.data === "string" && /^0x[0-9a-f]{8,}$/i.test(error.data));
+const wellFormedRpcError = (error: unknown) => !!error && typeof error === "object" && "code" in error && Number.isInteger(error.code) && "message" in error && typeof error.message === "string";
+
 export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): Promise<unknown> {
-  const res = await fetch(ctx.config.endpoints.bundlerUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!res.ok) throw new Error(`Bundler HTTP ${res.status}`);
-  const body = (await res.json()) as { result?: unknown; error?: { code: number; message: string; data?: unknown } };
-  if (body.error) {
-    const data = body.error.data ? ` ${JSON.stringify(body.error.data)}` : "";
-    throw new Error(`Bundler error ${body.error.code}: ${body.error.message}${data}`);
+  let res: Response;
+  try {
+    res = await fetch(ctx.config.endpoints.bundlerUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (error) { throw new BundlerUnavailableError(`Bundler unreachable: ${(error as Error).message}`); }
+  // Busy, or not a usable endpoint at all (a wrong URL or an expired key): neither says anything about the operation.
+  const busy = res.status === 408 || res.status === 429 || res.status >= 500;
+  const unusable = res.status === 401 || res.status === 403 || res.status === 404 || res.status === 407;
+  if (unusable) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
+  // Another error status is about the request; its body, if it is an RPC error, says why.
+  const refused = !busy && !res.ok;
+  const unreadable = (detail: string) => busy ? new BundlerUnavailableError(`Bundler HTTP ${res.status}`) : refused ? new Error(`Bundler HTTP ${res.status}`) : new BundlerUnavailableError(detail);
+  let body: unknown;
+  try { body = await res.json(); } catch { throw unreadable("Bundler answer is not valid JSON"); }
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw unreadable("Bundler answer is not an RPC response");
+  // A success may carry "error": null, and an error may carry "result": null.
+  const errorOnly = "error" in body && body.error != null && wellFormedRpcError(body.error) && (!("result" in body) || body.result === null);
+  // Some bundlers send a rejected operation's RPC error with HTTP 500. Any other busy answer, a rate limiter's own
+  // error code included, and every 408 or 429, is an outage.
+  if (busy && !(errorOnly && res.status >= 500 && reportsRejection((body as { error: { code: number; message: string; data?: unknown } }).error))) throw unreadable("");
+  if (refused && !errorOnly) throw unreadable("");
+  if ("error" in body && body.error != null) {
+    const { error } = body;
+    if (!errorOnly || !error || typeof error !== "object" || !("code" in error) || !Number.isInteger(error.code) ||
+        !("message" in error) || typeof error.message !== "string") throw new BundlerUnavailableError("Bundler answer has an invalid RPC error");
+    const data = "data" in error && error.data ? ` ${JSON.stringify(error.data)}` : "";
+    // An internal error or exceeded limit says nothing about the operation, as for the chain RPC, unless it reports a revert.
+    if (BUNDLER_RETRYABLE_CODES.includes(error.code as number) && !bundlerRejection(error.code as number, error.message, "data" in error ? error.data : undefined)) throw new BundlerUnavailableError(`Bundler error ${error.code}: ${error.message}${data}`);
+    throw new Error(`Bundler error ${error.code}: ${error.message}${data}`);
   }
+  if (!("result" in body)) throw new BundlerUnavailableError("Bundler answer omitted its RPC result");
   return body.result;
+}
+
+export async function estimateUserOpGas(ctx: Ctx, op: UserOp) {
+  const estimate = await bundlerRpc(ctx, "eth_estimateUserOperationGas", [opToWire(op), ctx.config.identity.entryPoint.address]);
+  if (!estimate || typeof estimate !== "object" || Array.isArray(estimate)) throw new BundlerUnavailableError("Bundler answer has no gas estimate");
+  const fields = estimate as Record<string, unknown>;
+  const gas = (value: unknown): bigint => {
+    if (typeof value === "string" && /^(?:[0-9]+|0x[0-9a-f]+)$/i.test(value)) return BigInt(value);
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+    throw new BundlerUnavailableError("Bundler answer has an invalid or missing gas estimate field");
+  };
+  return { callGasLimit: gas(fields.callGasLimit), verificationGasLimit: gas(fields.verificationGasLimit ?? fields.verificationGas), preVerificationGas: gas(fields.preVerificationGas) };
 }
 
 function asBigInt(v: unknown): bigint {
@@ -438,13 +491,10 @@ export async function buildUserOpUnsigned(ctx: Ctx, opts: BuildOptions): Promise
     estOp.signature = await ephemeral.signMessage({
       message: { raw: computeUserOpHash(estOp, ctx.config.identity.entryPoint.address, ctx.config.identity.chainId) },
     });
-    const est = (await bundlerRpc(ctx, "eth_estimateUserOperationGas", [
-      opToWire(estOp),
-      ctx.config.identity.entryPoint.address,
-    ])) as Record<string, unknown>;
-    op.callGasLimit = (asBigInt(est.callGasLimit) * 120n) / 100n;
-    op.verificationGasLimit = (asBigInt(est.verificationGasLimit ?? est.verificationGas) * 110n) / 100n;
-    op.preVerificationGas = (asBigInt(est.preVerificationGas) * 105n) / 100n;
+    const est = await estimateUserOpGas(ctx, estOp);
+    op.callGasLimit = (est.callGasLimit * 120n) / 100n;
+    op.verificationGasLimit = (est.verificationGasLimit * 110n) / 100n;
+    op.preVerificationGas = (est.preVerificationGas * 105n) / 100n;
     if (op.paymaster) {
       // Under the paymaster cap, and excluded from the token charge.
       op.paymasterVerificationGasLimit = 300_000n;

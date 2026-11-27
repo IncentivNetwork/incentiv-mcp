@@ -1,3 +1,5 @@
+import { RpcDisagreementError } from "./errors.js";
+import { rpcOutage } from "./outage.js";
 import { privateKeyToAccount } from "viem/accounts";
 import { type Hex } from "viem";
 import { z } from "zod";
@@ -94,15 +96,23 @@ export class WalletService {
     await this.canSubmit(s, r);
     if (!r.operation || !r.userOpHash) throw new WalletError("wallet_recovery_required", "Signed operation is missing");
     if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", "Signed swap deadline expired; review a same-nonce replacement with wallet operation resolve --replace");
-    await this.revalidate(s, journal, r);
+    // An RPC or bundler outage while rechecking says nothing about the signed bytes, so the same request ID stays usable.
+    const recheck = () => this.revalidate(s, journal, r).catch((error: unknown) => { throw rpcOutage(error); });
+    await recheck();
     // Reconcile happened under the same cross-process lock before this retry.
+    const prior = r.status as "signed" | "submission_unknown";
     r.attempts++;
     await journal.transition(r, "submitting");
-    await this.canSubmit(s, r);
+    // Only a check that refused is known to have sent nothing; any other failure may follow a broadcast.
+    let refusal: { error: unknown } | undefined;
+    const check = async (step: () => Promise<void>) => { try { await step(); } catch (error) { refusal = { error }; throw error; } };
     try {
-      const returned = await this.chain.relay(r.operation, () => this.revalidate(s, journal, r));
+      await check(() => this.canSubmit(s, r));
+      const returned = await this.chain.relay(r.operation, () => check(recheck));
       if (returned !== r.userOpHash) throw new Error();
     } catch {
+      // The request keeps its state, and the refusal keeps its own guidance, such as how to replace bytes that can never land.
+      if (refusal) { r.attempts--; await journal.transition(r, prior); throw refusal.error; }
       r.lastError = "submission_unknown";
       await journal.transition(r, "submission_unknown"); return;
     }
@@ -113,7 +123,7 @@ export class WalletService {
     let response = await this.store.session(async s => {
       const limits = await this.enabled(s);
       const journal = await Journal.open(s);
-      const intent = intentSchema.parse(await this.chain.normalize(kind, args));
+      const intent = intentSchema.parse(await this.chain.normalize(kind, args).catch((error: unknown) => { throw rpcOutage(error); }));
       let r = journal.data.records.find(r => r.requestId === requestId);
       if (r && r.intentHash !== digest(intent)) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different intent");
       await this.reconcile(journal);
@@ -122,11 +132,12 @@ export class WalletService {
         if (prepareOnly) return result(r);
         if (r.status === "superseding") await this.submitReplacement(s, journal, r);
         else if (r.status === "signed" || r.status === "submission_unknown") await this.submit(s, journal, r);
-        if (args.wait_for_confirmation === true) await this.reconcile(journal);
+        if (args.wait_for_confirmation === true) await confirmationRead(() => this.reconcile(journal));
         return result(r);
       }
       if (journal.data.records.some(r => ownsNonce(r.status))) throw new WalletError("operation_pending", "An unresolved operation owns the account nonce; reconcile it first");
       if (r?.status === "approval_required") {
+        if (r.lastError === "rpc_unavailable") delete r.lastError;
         if (r.approval && r.approval.expiresAt <= Date.now()) { await journal.transition(r, "expired"); return result(r); }
         await journal.transition(r, "preparing");
       }
@@ -182,19 +193,23 @@ export class WalletService {
         await this.canSubmit(s, r);
         await journal.transition(r, "signed"); // fsync completes before any submission.
       } catch (error) {
-        if (r.status === "preparing") { r.lastError = error instanceof WalletError ? error.code : "validation_failed"; await journal.transition(r, "failed"); }
-        if (error instanceof WalletError) throw error;
+        const mapped = rpcOutage(error), failure = mapped instanceof WalletError ? mapped : undefined;
+        if (r.status === "preparing" && failure?.code === "rpc_unavailable") { r.lastError = failure.code; if (!r.approval) delete r.reasons; await journal.transition(r, "approval_required"); }
+        else if (r.status === "preparing") { r.lastError = failure?.code ?? "validation_failed"; await journal.transition(r, "failed"); }
+        if (failure) throw failure;
         throw new WalletError("validation_failed", "Local operation preparation failed");
       }
       await this.submit(s, journal, r);
-      if (args.wait_for_confirmation === true) await this.reconcile(journal);
+      if (args.wait_for_confirmation === true) await confirmationRead(() => this.reconcile(journal));
       return result(r);
     });
     if (!prepareOnly && args.wait_for_confirmation === true) {
       const deadline = Date.now() + 30_000;
       while (ownsNonce(response.status) && Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 1000));
-        response = await this.operation(requestId);
+        const next = await confirmationRead(() => this.operation(requestId));
+        if (!next) break;
+        response = next;
       }
     }
     return response;
@@ -343,8 +358,18 @@ export class WalletService {
     r.sequence = ++journal.data.sequence; await journal.save();
   }
 }
+const rpcFault = (error: unknown) => !(error instanceof WalletError) || error instanceof RpcDisagreementError;
+
+async function confirmationRead<T>(read: () => Promise<T>): Promise<T | undefined> {
+  try { return await read(); } catch (error) {
+    if (rpcFault(error) || (error instanceof WalletError && error.code === "rpc_unavailable")) return undefined;
+    throw error;
+  }
+}
+
 function result(r: OperationRecord) {
   const nativeGas = r.intent.gasToken === "native" && (r.status === "confirmed" || r.status === "reverted") && r.consumed?.native !== undefined
     ? (BigInt(r.consumed.native) - (r.status === "confirmed" && r.intent.token === "native" ? BigInt(r.intent.amount) : 0n)).toString() : undefined;
-  return { request_id: r.requestId, intent: r.intent, status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
+  const retry = r.status === "approval_required" && r.lastError === "rpc_unavailable";
+  return { request_id: r.requestId, intent: r.intent, ...(retry ? { next_action: "A temporary RPC failure interrupted this request. Retry with the same request ID." } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }
