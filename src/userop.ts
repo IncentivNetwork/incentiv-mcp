@@ -413,11 +413,11 @@ export async function buildUserOpUnsigned(ctx: Ctx, opts: BuildOptions): Promise
     return encodeExecuteBatch(calls);
   };
 
-  // The paymaster checks the payment during simulation, so seed a realistic
-  // amount rather than a placeholder.
+  // The first estimate executes both transfers without the paymaster. Use its minimum
+  // charge so an inflated provisional transfer cannot exceed a balance that covers the final fee.
   let seedAmount: bigint | undefined;
   if (useGasToken && pmCfg) {
-    const seedUsdc = await requiredPaymentUsdc(ctx, pmCfg, { callGasLimit: 600_000n, preVerificationGas: 100_000n });
+    const seedUsdc = await requiredPaymentUsdc(ctx, pmCfg, { callGasLimit: 0n, preVerificationGas: 0n });
     seedAmount = await computeGasTokenAmount(ctx, pmCfg, opts.gasToken!, seedUsdc);
   }
 

@@ -5,7 +5,7 @@ import { getBridgeConfig } from "./bridge.js";
 import { onboardingHtml, onboardingScript, troubleshootingHtml } from "./onboarding-docs.js";
 import { brandLogo, brandFonts } from "./brand-assets.js";
 import { docsStyles } from "./docs-styles.js";
-import { WALLET_TOOL_NAMES as WALLET_TOOLS } from "./wallet/tool-names.js";
+import { WALLET_TOOL_NAMES as WALLET_TOOLS, X402_TOOL_NAMES as X402_TOOLS } from "./wallet/tool-names.js";
 
 /**
  * Documentation rendered from the tool catalog, so it stays in step with the
@@ -18,6 +18,11 @@ const GROUPS: { title: string; blurb: string; match: (t: ToolDoc) => boolean }[]
     title: "Local wallet",
     blurb: "Configure policy once; permitted transfers and swaps then execute automatically within those limits.",
     match: (t) => WALLET_TOOLS.includes(t.name),
+  },
+  {
+    title: "x402 payments",
+    blurb: "Find, price and pay for x402-protected HTTP resources in USDC from the local wallet, within its x402 policy.",
+    match: (t) => X402_TOOLS.includes(t.name),
   },
   {
     title: "Accounts & balances",
@@ -121,7 +126,7 @@ export function renderMarkdown(cfg: Config, tools: ToolDoc[]): string {
     if (g.blurb) lines.push(g.blurb, ``);
     for (const t of g.tools) {
       const params = t.params.map((p) => (p.required ? p.name : `${p.name}?`)).join(", ") || "—";
-      lines.push(`- **\`${t.name}\`** (${params})${t.readOnly ? "" : t.signs ? " — *signs, never submits*" : " — *changes chain state*"}`);
+      lines.push(`- **\`${t.name}\`** (${params})${t.readOnly ? "" : t.pays ? " — *signs a payment that a third party settles from the wallet*" : t.signs ? " — *signs, never submits*" : t.requests ? " — *sends your request to a third party*" : " — *changes chain state*"}`);
       if (t.description) lines.push(`  ${t.description}`);
     }
     lines.push(``);
@@ -145,7 +150,7 @@ export function renderHtml(cfg: Config, tools: ToolDoc[]): string {
   const bridgeTokens = [...new Set(ROUTES.map((r) => r.token))];
   const chainNames = Object.values(REMOTE_CHAINS).map((c) => c.name);
 
-  const walletNames = new Set(WALLET_TOOLS);
+  const walletNames = new Set([...WALLET_TOOLS, ...X402_TOOLS]);
   const chainTools = tools.filter(tool => !walletNames.has(tool.name));
   const toolHtml = grouped(chainTools)
     .map(
@@ -157,7 +162,7 @@ export function renderHtml(cfg: Config, tools: ToolDoc[]): string {
           ${g.tools
             .map(
               (t) => `<details class="tool-entry">
-            <summary>${esc(t.name)}<span class="tool-kind">${t.readOnly ? "Read / prepare" : "Submit"}</span></summary>
+            <summary>${esc(t.name)}<span class="tool-kind">${t.readOnly ? "Read / prepare" : t.pays ? "Pay" : t.requests ? "Request" : "Submit"}</span></summary>
             <p>${esc(t.description ?? "")}</p>
             <div class="params">${
               t.params.length
@@ -298,7 +303,7 @@ ${cfg.manifest.bridge.enabled ? `<section>
   <h2>${chainTools.length} chain tools.</h2>
   <p class="intro">Expand a tool to see its description and arguments. Optional arguments are labeled. Token arguments accept a symbol (<code>USDC</code>), a contract address, or <code>${esc(cfg.identity.nativeSymbol)}</code> for the native coin.</p>
   ${toolHtml}
-  <aside class="local-tools"><h3>${WALLET_TOOLS.length} wallet tools.</h3><p>These tools operate on the wallet on this computer and are available only in the local server.</p><p>${WALLET_TOOLS.map(name => `<code>${name}</code>`).join(" · ")}</p><a href="#setup">Install and set up →</a></aside>
+  <aside class="local-tools"><h3>${WALLET_TOOLS.length + X402_TOOLS.length} wallet tools.</h3><p>These tools operate on the wallet on this computer, including paying for x402 resources, and are available only in the local server.</p><p>${[...WALLET_TOOLS, ...X402_TOOLS].map(name => `<code>${name}</code>`).join(" · ")}</p><a href="#setup">Install and set up →</a></aside>
 </section>
 
 ${cfg.manifest.bridge.enabled ? `<section>

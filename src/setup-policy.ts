@@ -103,6 +103,56 @@ export function withoutUnlink(_config: Config, limits: Limits): Limits {
   return limitsSchema.parse({ ...limits, ...(limits.agentRegistry ? { agentRegistry: { ...limits.agentRegistry, allowUnlink: false } } : {}), targets });
 }
 
+/** The paymaster's smallest USDC gas charge for a payment, from its fee schedule (0.026 USDC). */
+export const X402_MIN_USDC_GAS = 26_000n;
+
+/**
+ * Offers x402 payments when the policy covers Incentiv USDC. Payments still count against the USDC limits;
+ * this adds the per-payment cap and which sellers may be paid.
+ */
+export async function promptX402(config: Config, limits: Pick<Limits, "tokens">, ask: Ask, tell: Tell): Promise<Limits["x402"]> {
+  const usdc = config.manifest.canonicalTokens.USDC?.address;
+  if (config.identity.chainId !== 24101 || !usdc) { tell("x402 payments are available only on Incentiv Mainnet, so they stay off."); return undefined; }
+  if (!Object.keys(limits.tokens).some(token => token.toLowerCase() === usdc.toLowerCase())) { tell("x402 payments need a USDC limit, so they stay off; add USDC to the token limits to allow them."); return undefined; }
+  tell("x402 lets this agent pay websites and APIs per request in USDC. Each payment also counts against the USDC limits above, and gas (about 0.03 USDC) is paid on top.");
+  // Every payment also has to pass the USDC input limit per operation, so a higher x402 maximum would never apply.
+  const cap = BigInt(Object.entries(limits.tokens).find(([token]) => token.toLowerCase() === usdc.toLowerCase())![1].perTransaction);
+  if (cap === 0n) { tell("USDC input per operation is 0, which refuses every x402 payment; raise it to allow x402."); return undefined; }
+  // The paymaster charges at least X402_MIN_USDC_GAS, and with USDC gas the daily USDC limit also counts it.
+  const usdcLimits = Object.entries(limits.tokens).find(([token]) => token.toLowerCase() === usdc.toLowerCase())![1];
+  const usdcGas = BigInt(usdcLimits.gasPayment) >= X402_MIN_USDC_GAS && BigInt(usdcLimits.daily) > X402_MIN_USDC_GAS;
+  const nativeGas = BigInt(limits.tokens.native?.gasPayment ?? "0") > 0n && BigInt(usdcLimits.daily) > 0n;
+  if (!usdcGas && !nativeGas) { tell(`Every x402 payment would be refused: paying gas in USDC needs a USDC gas allowance of at least ${formatUnits(X402_MIN_USDC_GAS, 6)} and a daily USDC limit above it, and no native gas allowance is set. Raise them to allow x402.`); return undefined; }
+  if (!usdcGas) tell(`The USDC gas allowance or daily limit is below the paymaster's minimum of ${formatUnits(X402_MIN_USDC_GAS, 6)} USDC, so payments must pay gas in native ${config.identity.nativeSymbol} (gas_token native).`);
+  if (!await yesNo(ask, tell, "Allow paying for x402 resources?")) return undefined;
+  const fallback = formatUnits(cap < 100_000n ? cap : 100_000n, 6);
+  const maxPerPayment = await answer(ask, tell, `USDC — maximum price per x402 payment, at most the USDC input limit of ${formatUnits(cap, 6)} [${fallback}]: `, value => {
+    const amount = allowance(value || fallback, 6);
+    if (amount === "0") throw new WalletError("validation_failed", "Set a positive maximum, or answer no to x402");
+    if (BigInt(amount) > cap) throw new WalletError("validation_failed", `The USDC input limit per operation (${formatUnits(cap, 6)} USDC) refuses larger payments; enter at most that`);
+    return amount;
+  });
+  const origins = await answer(ask, tell, "Sites the agent may pay, as https origins separated by commas (blank allows any site): ", value => {
+    const list = value ? [...new Set(value.split(",").map(s => s.trim()))] : [];
+    return list.map(item => {
+      let url: URL;
+      try { url = new URL(item); } catch { throw new WalletError("validation_failed", "Enter origins such as https://api.example.com"); }
+      if (url.protocol !== "https:" || url.pathname !== "/" || url.search || url.hash || url.username || url.password || item.endsWith("?") || item.endsWith("#")) throw new WalletError("validation_failed", "Enter https origins without a path, such as https://api.example.com");
+      return url.origin;
+    });
+  });
+  const payTo = await answer(ask, tell, "Seller payment addresses the agent may pay, separated by commas (blank allows any): ", value => {
+    const addresses = value ? [...new Set(value.split(",").map(s => s.trim()))] : [];
+    if (!addresses.every(a => isAddress(a))) throw new WalletError("validation_failed", "Enter complete valid EVM addresses");
+    return addresses.map(a => getAddress(a));
+  });
+  return {
+    origins: origins.length ? { mode: "allowlist", origins } : { mode: "any" },
+    payTo: payTo.length ? { mode: "allowlist", addresses: payTo } : { mode: "any" },
+    maxPerPayment,
+  };
+}
+
 /** `registryApproved` is false for an existing wallet that has not approved this release's capabilities: it cannot link until it does. */
 export async function promptPolicy(config: Config, resolveToken: (ref: string) => Promise<TokenInfo>, ask: Ask, tell: Tell, registryApproved = true) {
   const available = [config.identity.nativeSymbol, ...Object.keys(config.manifest.canonicalTokens)];
@@ -162,8 +212,9 @@ export async function promptPolicy(config: Config, resolveToken: (ref: string) =
   }
   if (config.manifest.agentRegistry && !registryApproved) tell(REGISTRY_APPROVAL_HINT);
   const { agentRegistry, targets: registryTargets } = registryApproved ? await promptAgentRegistry(config, ask, tell) : {};
+  const x402 = await promptX402(config, { tokens: amounts }, ask, tell);
   const targets = { ...setupTargets(config, tokens, swaps), ...registryTargets };
-  const limits = limitsSchema.parse({ ...(agentRegistry ? { agentRegistry } : {}), tokens: amounts, recipients: { mode: "allowlist", addresses: recipients }, targets, swaps, ...technical, independentRpcOrigins: [], ...(swaps ? { trustedRpcOrigins: origins } : {}), maxGasCostWei });
+  const limits = limitsSchema.parse({ ...(agentRegistry ? { agentRegistry } : {}), ...(x402 ? { x402 } : {}), tokens: amounts, recipients: { mode: "allowlist", addresses: recipients }, targets, swaps, ...technical, independentRpcOrigins: [], ...(swaps ? { trustedRpcOrigins: origins } : {}), maxGasCostWei });
   return { limits, tokens };
 }
 
@@ -176,6 +227,11 @@ export function policySummary(limits: Limits, tokens: TokenInfo[], nativeSymbol 
     lines.push(`  ${token.symbol}: input per operation ${fmt(caps.perTransaction)}; daily INCLUDING gas ${fmt(caps.daily)}; maximum holdings ${fmt(caps.exposure)}; gas per operation ${fmt(caps.gasPayment)}`);
   }
   if (limits.agentRegistry) lines.push(`  Agent Registry parents: ${limits.agentRegistry.parents.join(", ") || "none"}; connections are permanent`);
+  const x402 = limits.x402;
+  // The USDC input limit per operation also bounds each payment, so the effective maximum is the lower of the two.
+  const usdcCap = Object.entries(limits.tokens).find(([address]) => tokens.find(t => t.address.toLowerCase() === address.toLowerCase())?.symbol === "USDC")?.[1].perTransaction;
+  const x402Max = x402 && usdcCap !== undefined && BigInt(usdcCap) < BigInt(x402.maxPerPayment) ? usdcCap : x402?.maxPerPayment;
+  lines.push(`  x402 payments: ${!x402 ? "disabled" : `up to ${formatUnits(BigInt(x402Max!), 6)} USDC each, within the USDC limits; sites ${x402.origins.mode === "any" ? "ANY SITE" : x402.origins.origins.join(", ")}; sellers ${x402.payTo.mode === "any" ? "ANY ADDRESS" : x402.payTo.addresses.join(", ")}`}`);
   lines.push(`  Recipients: ${limits.recipients.mode === "any" ? "ANY ADDRESS" : limits.recipients.addresses.join(", ") || "none (transfers blocked)"}`,
     `  Swaps: ${limits.swaps ? `enabled; ${limits.maxSlippageBps / 100}% maximum slippage, ${limits.maxQuoteDeviationBps / 100}% quote deviation` : "disabled"}`,
     `  Trusted RPCs: ${limits.trustedRpcOrigins?.join(", ") || "none"}; independent RPCs: ${limits.independentRpcOrigins.join(", ") || "none"}`,

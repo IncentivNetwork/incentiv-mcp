@@ -162,7 +162,7 @@ export class WormholeScreening {
     return new WormholeReport(value => this.screen(value), this.state, this.version);
   }
 
-  fields<T extends object>(item: T, fields: readonly (keyof T & string)[], nested?: keyof T & string): T & { wormhole?: WormholeMetadata } {
+  fields<T extends object>(item: T, fields: readonly (keyof T & string)[], nested?: (keyof T & string) | readonly (keyof T & string)[]): T & { wormhole?: WormholeMetadata } {
     if (this.state === "off") return item;
     const report = this.report();
     const output = { ...item };
@@ -171,8 +171,8 @@ export class WormholeScreening {
       if (typeof value === "string") Object.assign(output, { [field]: report.text(value, field) });
       else if (value !== null && typeof value === "object") Object.assign(output, { [field]: report.withhold(field) });
     }
-    if (nested !== undefined) {
-      Object.assign(output, { [nested]: report.tree(item[nested], nested) });
+    for (const field of nested === undefined ? [] : typeof nested === "string" ? [nested] : nested) {
+      Object.assign(output, { [field]: report.tree(item[field], field) });
     }
     return report.output(output);
   }

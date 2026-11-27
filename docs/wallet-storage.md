@@ -190,6 +190,8 @@ incentiv-mcp wallet operation resolve <request-id>
 incentiv-mcp wallet operation resolve <request-id> --replace [--native-gas]
 incentiv-mcp wallet backup --out <file>
 incentiv-mcp wallet restore --in <file>
+incentiv-mcp wallet x402 clear-bindings [--older-than-days <n>]
+incentiv-mcp wallet x402 clear-archive [--older-than-days <n>]
 incentiv-mcp wallet migrate [1]
 ```
 
@@ -245,7 +247,7 @@ minutes. Retrying the same request ID consumes that exact approval. Replacement
 review builds a zero-value self-transfer at the original nonce using the original operation’s gas token,
 or native gas with `--native-gas` when the token balance or paymaster cannot cover it;
 either original or replacement may win. Both reservations remain until a verified
-receipt resolves the nonce. Disabling prevents either from being rebroadcast.
+receipt resolves the nonce. Disabling prevents either from being rebroadcast by this wallet; an x402 payment the seller holds can still be submitted by its facilitator until it is cancelled or expires.
 A signed token-paid replacement can become unsendable when the paymaster's terms
 move, since the bundler then refuses the same bytes. It can be replaced once more
 with `--native-gas`. The token-paid one is kept and may still win, so its hash is
