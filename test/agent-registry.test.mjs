@@ -21,7 +21,7 @@ import { previousImplementationConfig } from "../src/account-upgrade.ts";
 import { approveImplementation, reviewImplementation } from "../src/wallet/implementation.ts";
 import { backupWallet, restoreWallet } from "../src/wallet/backup.ts";
 import { WalletStore } from "../src/wallet/store.ts";
-import { WalletError } from "../src/wallet/errors.ts";
+import { RpcDisagreementError, WalletError } from "../src/wallet/errors.ts";
 import { WalletService } from "../src/wallet/service.ts";
 import { reviewUpgrade } from "../src/wallet/cli.ts";
 
@@ -540,6 +540,16 @@ test("an RPC outage elsewhere in preparation keeps a request retryable; other er
   const sent = await f.service.send("transfer", transfer(id));
   assert.equal(sent.status, "submitted"); assert.equal(sent.last_error, undefined);
 
+  // Configured RPCs that disagree, one lagging behind say, are an outage too.
+  for (const stage of ["state", "balances"]) {
+    const h = await fixture(t), lagging = randomUUID(), original = h.chain[stage];
+    h.chain[stage] = async () => { throw new RpcDisagreementError(`RPC ${stage} disagree`); };
+    await assert.rejects(h.service.send("transfer", transfer(lagging)), { code: "rpc_unavailable" });
+    assert.equal((await h.service.operation(lagging)).status, "approval_required", stage);
+    h.chain[stage] = original;
+    assert.equal((await h.service.send("transfer", transfer(lagging))).status, "submitted", stage);
+  }
+
   const g = await fixture(t), other = randomUUID();
   g.chain.balances = async () => { throw new Error("local bug"); };
   await assert.rejects(g.service.send("transfer", transfer(other)), { code: "validation_failed" });
@@ -627,6 +637,8 @@ test("an RPC failure during signature validation is not reported as an invalid s
   await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_verification_failed" });
   chain.clients.splice(0, 1, domainCall(() => { throw Object.assign(new Error("internal error"), { code: -32603 }); }));
   await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_rpc_unavailable" });
+  chain.clients.splice(0, 1, domainCall(() => { throw Object.assign(new Error("header not found"), { code: -32000 }); }));
+  await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_rpc_unavailable" });
   // Malformed return data repeats on every retry, so it is not reported as temporary.
   chain.clients.splice(0, 1, domainCall(() => "0x01"));
   await assert.rejects(chain.verifyRegistry(approved, intent(a), state()), { code: "registry_verification_failed" });
@@ -638,6 +650,9 @@ test("a revert reported as -32603 is not a transport failure", async () => {
   assert.equal(isTransportFailure(await read(() => { throw Object.assign(new Error("execution reverted"), { code: -32603 }); })), false);
   assert.equal(isTransportFailure(await read(() => { throw Object.assign(new Error("internal error"), { code: -32603 }); })), true);
   assert.equal(isTransportFailure(await read(() => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); })), true);
+  // A lagging node's -32000 is temporary; a -32000 revert without data is the contract's answer.
+  for (const message of ["header not found", "missing trie node"]) assert.equal(isTransportFailure(await read(() => { throw Object.assign(new Error(message), { code: -32000 }); })), true, message);
+  assert.equal(isTransportFailure(await read(() => { throw Object.assign(new Error("execution reverted"), { code: -32000 }); })), false);
 });
 
 test("a link retried near its deadline gets recovery guidance instead of a tampering error", async t => {
@@ -1527,6 +1542,16 @@ test("a bundler's internal or limit error during simulation keeps a new request 
     assert.notEqual((await f.service.operation(id).catch(() => ({ status: "none" }))).status, "failed", `${status} ${code}`);
     f.chain.simulate = simulate;
     assert.equal((await f.service.send("transfer", transfer(id))).status, "submitted", `${status} ${code}`);
+  }
+  // A success that carries "error": null is still a success.
+  {
+    const f = await fixture(t), id = randomUUID(), simulate = f.chain.simulate;
+    f.chain.clients.splice(0, f.chain.clients.length, { readContract: async () => ({ reject: 0 }) });
+    f.chain.simulate = WalletChain.prototype.simulate;
+    const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ jsonrpc: "2.0", id: 1, result: { callGasLimit: "0x1", verificationGasLimit: "0x1", preVerificationGas: "0x1" }, error: null }));
+    assert.equal((await f.service.send("transfer", transfer(id))).status, "submitted");
+    fetch.mock.restore();
+    f.chain.simulate = simulate;
   }
   // A bundler that rejects the operation still fails it, including a revert some bundlers report as -32603.
   for (const error of [{ code: -32500, message: "AA23 reverted" }, { code: -32603, message: "execution reverted" }, { code: -32603, message: "AA23 reverted (or OOG)" }, { code: -32603, message: "internal error", data: "0x08c379a0" }]) {

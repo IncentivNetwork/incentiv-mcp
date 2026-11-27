@@ -1,4 +1,4 @@
-import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, HttpRequestError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError, TimeoutError, decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, hashTypedData, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
+import { BaseError, BlockNotFoundError, ContractFunctionRevertedError, ContractFunctionZeroDataError, HttpRequestError, InternalRpcError, InvalidInputRpcError, LimitExceededRpcError, ResourceUnavailableRpcError, TimeoutError, decodeErrorResult, decodeEventLog, encodeFunctionData, getAddress, getContract, hashTypedData, keccak256, parseAbi, type Address, type Hex, type PublicClient } from "viem";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Intent } from "./wallet/journal.js";
@@ -52,7 +52,11 @@ export function isContractRejection(error: unknown): boolean {
 /** The RPC failed to answer, so the call may succeed on retry. */
 export function isTransportFailure(error: unknown): boolean {
   // Some nodes report contract reverts as -32603; an answer from the contract is never retryable.
-  return error instanceof BaseError && !isContractRejection(error) && !!error.walk(cause => [HttpRequestError, TimeoutError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError].some(type => cause instanceof type));
+  if (!(error instanceof BaseError) || isContractRejection(error)) return false;
+  // A lagging node behind a load-balanced URL misses the pinned block, or answers -32000 ("header not found",
+  // "missing trie node"), as the pin verification transport also retries. Some nodes use -32000 for a revert without data.
+  return !!error.walk(cause => cause instanceof InvalidInputRpcError ? !/revert/i.test(cause.message)
+    : [HttpRequestError, TimeoutError, InternalRpcError, LimitExceededRpcError, ResourceUnavailableRpcError, BlockNotFoundError].some(type => cause instanceof type));
 }
 export const isRegistryIntent = (intent: Intent) => intent.kind === "link_agent" || intent.kind === "unlink_agent";
 export function registryCapability(cfg: Config) {
@@ -203,7 +207,8 @@ export async function assertAgentSignature(client: PublicClient, agent: Address,
 // Only inspect the log interval belonging to this operation within an EntryPoint bundle.
 /**
  * Whether `logs` hold the registry event for this intent, emitted by `proxy`: the registry the operation called, which
- * may differ from the current manifest's after a release moves it.
+ * may differ from the current manifest's after a release moves it. Without one (undefined, including bytes that cannot be
+ * decoded) it falls back to the current manifest's registry; an event from a moved registry is then reported missing.
  */
 export function hasRegistryEvent(cfg: Config, intent: Intent, agent: string, logs: { address: string; data: Hex; topics: readonly Hex[] }[], proxy: string | undefined = cfg.manifest.agentRegistry?.proxy.address) {
   const event = intent.kind === "link_agent" ? "AgentLinked" : "AgentUnlinked";

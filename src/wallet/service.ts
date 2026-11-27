@@ -314,7 +314,7 @@ export class WalletService {
       }
       if (journal.data.records.some(holdsMainNonce)) throw new WalletError("operation_pending", "An unresolved operation owns the account nonce; reconcile it first");
       // Only x402 payments, on their own lanes, can be pending here. Read the chain only when one is.
-      if (journal.data.records.some(o => ownsNonce(o.status))) assertDeploysOnce((await this.chain.state(s.envelope)).deployed, journal);
+      if (journal.data.records.some(o => ownsNonce(o.status))) assertDeploysOnce((await this.chain.state(s.envelope).catch((error: unknown) => { throw rpcOutage(error); })).deployed, journal);
       // Rejected new registry requests must not consume journal capacity. An existing record is checked below, where a failure closes it.
       const existing = !!r;
       if (!existing && intent.kind === "link_agent") {
@@ -1212,8 +1212,8 @@ async function pooled(tasks: (() => Promise<void>)[], limit: number): Promise<vo
   }));
   if (failure) throw failure.error;
 }
-/** An RPC or bundler outage says nothing about a request, so it becomes a retryable rpc_unavailable; anything else is returned as is. */
-const rpcOutage = (error: unknown) => !(error instanceof WalletError) && (isTransportFailure(error) || error instanceof BundlerUnavailableError)
+/** An RPC or bundler outage, or configured RPCs that disagree, says nothing about a request, so it becomes a retryable rpc_unavailable; anything else is returned as is. */
+const rpcOutage = (error: unknown) => error instanceof RpcDisagreementError || (!(error instanceof WalletError) && (isTransportFailure(error) || error instanceof BundlerUnavailableError))
   ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : error;
 /** Refusals that say nothing about the request itself, so an unsigned request returns to approval_required and keeps its ID. */
 const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable", "registry_factory_not_allowed"];

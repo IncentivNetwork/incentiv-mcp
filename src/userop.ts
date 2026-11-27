@@ -174,7 +174,8 @@ export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): P
   let body: unknown;
   try { body = await res.json(); } catch { throw new BundlerUnavailableError("Bundler answer is not valid JSON"); }
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new BundlerUnavailableError("Bundler answer is not an RPC response");
-  if ("error" in body) {
+  // A success may carry "error": null.
+  if ("error" in body && body.error != null) {
     const { error } = body;
     if ("result" in body || !error || typeof error !== "object" || !("code" in error) || !Number.isInteger(error.code) ||
         !("message" in error) || typeof error.message !== "string") throw new BundlerUnavailableError("Bundler answer has an invalid RPC error");

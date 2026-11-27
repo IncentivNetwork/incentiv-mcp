@@ -107,7 +107,7 @@ export class WalletChain {
     const entry = Object.entries(tokens).find(([symbol, pin]) => symbol === name.toUpperCase() || pin.address.toLowerCase() === name.toLowerCase());
     if (!entry) throw new WalletError("validation_failed", "Wallet tokens must be pinned in the approved manifest");
     const decimals = await Promise.all(this.clients.map(c => c.readContract({ address: entry[1].address, abi: erc20Abi, functionName: "decimals" })));
-    if (!same(decimals)) throw new WalletError("validation_failed", "Token decimals disagree");
+    if (!same(decimals)) throw new RpcDisagreementError("Token decimals disagree");
     return { address: entry[1].address.toLowerCase() as Address, symbol: entry[0], name: entry[0], decimals: Number(decimals[0]) };
   }
   async normalize(kind: Intent["kind"], args: Record<string, unknown>): Promise<Intent> {
@@ -135,14 +135,14 @@ export class WalletChain {
     const result: Spend = {};
     await Promise.all([...new Set(tokens.map(t => t.toLowerCase()))].map(async token => {
       const values = await Promise.all(this.clients.map(c => token === "native" ? c.getBalance({ address: wallet.account as Address, blockNumber }) : c.readContract({ address: token as Address, abi: erc20Abi, functionName: "balanceOf", args: [wallet.account as Address], blockNumber })));
-      if (!same(values)) throw new WalletError("validation_failed", "RPC balances disagree");
+      if (!same(values)) throw new RpcDisagreementError("RPC balances disagree");
       result[token] = values[0].toString();
     }));
     return result;
   }
   async gasDeposit(wallet: WalletEnvelope): Promise<string> {
     const values = await Promise.all(this.clients.map(c => c.readContract({ address: this.ctx.config.identity.entryPoint.address, abi: entryPointAbi, functionName: "balanceOf", args: [wallet.account as Address] })));
-    if (!same(values)) throw new WalletError("validation_failed", "RPC gas deposits disagree");
+    if (!same(values)) throw new RpcDisagreementError("RPC gas deposits disagree");
     return values[0].toString();
   }
   async quote(intent: Intent, limits: Limits, blockNumber: bigint): Promise<void> {
