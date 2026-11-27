@@ -1,7 +1,7 @@
 import { isRegistryIntent } from "../agent-registry.js";
 import type { Config } from "../config.js";
 import { publicWallet, WalletError } from "./keystore.js";
-import { digest, ownsNonce, Journal } from "./journal.js";
+import { digest, holdsMainNonce, Journal } from "./journal.js";
 import { authorize } from "./policy.js";
 import type { WalletSession, WalletStore } from "./store.js";
 
@@ -27,7 +27,7 @@ export function approveCapabilities(store: WalletStore, previous: Config, propos
     if (session.envelope.approvedCapabilityManifestId === proposed.manifest.manifestId) return { ...publicWallet(session.envelope), approval: "already_current" };
     const journal = await Journal.open(session);
     // x402 payments hold their own nonce lanes, and Journal.open accepts them pending under an earlier manifest.
-    const owning = journal.data.records.filter(r => ownsNonce(r.status));
+    const owning = journal.data.records.filter(holdsMainNonce);
     if (owning.length) {
       // A registry request signed under earlier pins cannot be resent before this approval, so only a replacement clears it.
       const stuck = owning.find(r => isRegistryIntent(r.intent) && (r.status === "signed" || r.status === "submission_unknown"));

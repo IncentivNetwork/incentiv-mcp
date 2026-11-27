@@ -58,6 +58,7 @@ export async function createLocalStdioMcpServer(ctx: Ctx, profile = "default"): 
   const { WalletService } = await import("./wallet/service.js");
   const { localWalletStore } = await import("./wallet/store.js");
   const { registerWalletTools } = await import("./wallet/tools.js");
+  const { registerX402Tools } = await import("./x402/tools.js");
   const wallet = new WalletService(ctx, localWalletStore(ctx.config, profile));
-  return makeServer(ctx, (server, screening) => registerWalletTools(server, wallet, screening));
+  return makeServer(ctx, (server, screening) => [...registerWalletTools(server, wallet, screening), ...registerX402Tools(server, wallet, screening)]);
 }

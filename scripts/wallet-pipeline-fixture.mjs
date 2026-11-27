@@ -33,7 +33,8 @@ export async function fixture(t, options = {}) {
   const store = new WalletStore(config, deps), chain = new WalletChain(context);
   let builds = 0, submissions = [], receipt;
   chain.token = async ref => ({ address: "native", symbol: "CENT", decimals: 18, name: "CENT" });
-  chain.state = async () => ({ deployed: false, nonce: 0n, block: 1n, timestamp: Math.floor(Date.now() / 1000), fees: { baseFeePerGas: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n } });
+  chain.state = async () => ({ deployed: false, nonce: 0n, block: 1n, blockHash: `0x${"00".repeat(32)}`, timestamp: Math.floor(Date.now() / 1000), fees: { baseFeePerGas: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n } });
+  chain.assertCanonicalSnapshot = async () => {};
   chain.balances = async (_wallet, tokens) => Object.fromEntries(tokens.map(token => [token.toLowerCase(), token === "native" ? "1000000" : "0"]));
   chain.gasDeposit = async () => "0";
   chain.build = async (wallet, intent, state) => { builds++; return unsigned(wallet, intent, state); };

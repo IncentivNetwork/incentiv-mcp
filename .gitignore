@@ -5,3 +5,4 @@ coverage/
 .cache/
 *.tgz
 .DS_Store
+.x402-mainnet-e2e/

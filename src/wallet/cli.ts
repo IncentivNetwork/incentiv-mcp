@@ -127,6 +127,35 @@ async function testTransfer(service: WalletService, path: string) {
   } finally { administration?.fill(0); }
 }
 
+/** Clears saved bindings of unpaid x402 POSTs older than the given number of days (30 by default) after review. */
+async function clearX402Bindings(service: WalletService, days = "30") {
+  if (!/^[0-9]{1,5}$/.test(days)) throw new WalletError("validation_failed", "--older-than-days takes a whole number of days");
+  const cutoff = Date.now() - Number(days) * 86_400_000;
+  const review = await service.x402Bindings(cutoff);
+  const { request_ids: ids, ...shown } = review;
+  console.error(JSON.stringify(shown, null, 2));
+  if (!ids.length) { console.error("No saved bindings are that old; nothing to clear."); return; }
+  console.error("Each binding stops a retry under its request ID from sending that POST again. Once cleared, an agent that retries one of these request IDs sends its POST once more, and the resource may act on it twice.");
+  if (await textPrompt("Type CLEAR BINDINGS to clear these bindings: ") !== "CLEAR BINDINGS") throw new WalletError("policy_denied", "Action cancelled");
+  const administration = await secretPrompt("Administration passphrase: ");
+  try { console.error(JSON.stringify(await service.clearX402Bindings(cutoff, administration, digest(ids)), null, 2)); }
+  finally { administration.fill(0); }
+}
+
+async function clearX402Archive(service: WalletService, days = "90") {
+  if (!/^[0-9]{1,5}$/.test(days)) throw new WalletError("validation_failed", "--older-than-days takes a whole number of days");
+  const cutoff = Date.now() - Number(days) * 86_400_000;
+  const review = await service.x402Archive(cutoff);
+  const { request_ids: ids, ...shown } = review;
+  console.error(JSON.stringify(shown, null, 2));
+  if (!ids.length) { console.error("No archived payments are that old; nothing to clear."); return; }
+  console.error("Each archived payment keeps its request ID from paying again. Once cleared, an agent that retries one of these request IDs pays again, and get_agent_operation no longer finds them.");
+  if (await textPrompt("Type CLEAR ARCHIVE to clear these archived payments: ") !== "CLEAR ARCHIVE") throw new WalletError("policy_denied", "Action cancelled");
+  const administration = await secretPrompt("Administration passphrase: ");
+  try { console.error(JSON.stringify(await service.clearX402Archive(cutoff, administration, ids), null, 2)); }
+  finally { administration.fill(0); }
+}
+
 export async function runWalletCli(args: string[], profile = "default"): Promise<void> {
   const config = loadConfig(), service = new WalletService(new Ctx(config), localWalletStore(config, profile));
   if (args.length === 1 && args[0] === "doctor") {
@@ -139,6 +168,10 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   }
   if (args.length === 1 && args[0] === "disable") { await service.store.disable(); console.error("Wallet disabled. Already-submitted signatures cannot be revoked."); return; }
   if (args.length === 3 && args[0] === "test-transfer" && args[1] === "--request") { requireTerminal(); await testTransfer(service, args[2]); return; }
+  if (args[0] === "x402" && (args[1] === "clear-bindings" || args[1] === "clear-archive") && (args.length === 2 || (args.length === 4 && args[2] === "--older-than-days"))) {
+    requireTerminal();
+    await (args[1] === "clear-bindings" ? clearX402Bindings : clearX402Archive)(service, args[3]); return;
+  }
   if (args[0] === "migrate" && args.length <= 2) { console.error(JSON.stringify(await migrateWallet(service.store, Number(args[1] ?? 1)))); return; }
   const configure = args.join(" ") === "policy configure";
   const approve = args[0] === "approve" && args.length === 2;
@@ -152,7 +185,7 @@ export async function runWalletCli(args: string[], profile = "default"): Promise
   const recover = args.length === 1 && args[0] === "recover";
   const capabilities = args[0] === "capabilities" && args[1] === "approve" && (args.length === 2 || (args.length === 4 && args[2] === "--previous"));
   const implementation = args.length === 1 && args[0] === "upgrade-implementation";
-  if (!configure && !approve && !resolveOperation && !backup && !restore && !initialize && !recover && !capabilities && !implementation) throw new WalletError("validation_failed", "Commands: wallet doctor | init | policy configure | test-transfer --request <file> | capabilities approve [--previous <config.json>] | upgrade-implementation | recover | approve <uuid> | disable | operation resolve <uuid> [--replace [--native-gas]] | backup --out <file> | restore --in <file> [--upgrade-implementation] | migrate [1]");
+  if (!configure && !approve && !resolveOperation && !backup && !restore && !initialize && !recover && !capabilities && !implementation) throw new WalletError("validation_failed", "Commands: wallet doctor | init | policy configure | test-transfer --request <file> | capabilities approve [--previous <config.json>] | upgrade-implementation | recover | approve <uuid> | disable | operation resolve <uuid> [--replace [--native-gas]] | backup --out <file> | restore --in <file> [--upgrade-implementation] | x402 clear-bindings [--older-than-days <n>] | x402 clear-archive [--older-than-days <n>] | migrate [1]");
   requireTerminal();
   if (initialize) {
     console.error(`Wallet profile: ${profile}; directory: ${walletProfile(profile).root}`);

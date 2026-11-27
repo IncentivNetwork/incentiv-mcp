@@ -7,7 +7,7 @@ import { encodeFunctionData, toFunctionSelector } from "viem";
 import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
-import { linkGasWarning, promptAgentRegistry, allowance, answer, promptPolicy, setupTargets, technicalLimits } from "../src/setup-policy.ts";
+import { allowance, answer, linkGasWarning, MAX_POLICY_LIST, policySummary, promptAgentRegistry, promptPolicy, promptX402, setupTargets, technicalLimits, X402_MIN_USDC_GAS } from "../src/setup-policy.ts";
 import { connectionFor, clientConfigPath, mergeConnection, saveClientConfig, connectClient } from "../src/setup-client.ts";
 import { setupWallet, checkRuntime } from "../src/setup.ts";
 import { parseWalletProfileArgs } from "../src/wallet-profile.ts";
@@ -63,7 +63,7 @@ test("generated permissions match real transfer, paymaster, wrap and swap select
 });
 
 test("guided policy requires RPC trust, corrects invalid input and includes gas in user-entered daily budgets", async () => {
-  const replies = ["", "bad-address", recipient, "y", "y", "1", "0.5", "100", "1000", "20", "10.1234567", "10", "11", "100", "1", "20", "n", "n"];
+  const replies = ["", "bad-address", recipient, "y", "y", "1", "0.5", "100", "1000", "20", "10.1234567", "10", "11", "100", "1", "20", "n", "n", "n"];
   const messages = [];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, message => messages.push(message));
   assert.equal(policy.tokens[usdc.address].daily, "11000000");
@@ -268,9 +268,30 @@ test("saving disabled policy preserves restored-copy acknowledgement and existin
 
 test("registry setup deduplicates parent addresses after case normalization", async () => {
   const parent = "0x16e43840d8D79896A389a3De85aB0B0210C05685";
-  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "y", `${parent.toLowerCase()},${parent}`, "y"];
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "y", `${parent.toLowerCase()},${parent}`, "n"];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, () => {});
   assert.deepEqual(policy.agentRegistry.parents, [parent]);
+});
+
+test("guided policy offers x402 only with USDC, and records its cap, sites and sellers", async () => {
+  const seller = "0x16e43840d8D79896A389a3De85aB0B0210C05685";
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "n", "y", "0", "20", "0.05", "http://api.example.com", "https://api.example.com/path", "https://API.Example.com:443, https://data.example.org/", seller.toLowerCase()];
+  const messages = [];
+  const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, message => messages.push(message));
+  assert.deepEqual(policy.x402, { origins: { mode: "allowlist", origins: ["https://api.example.com", "https://data.example.org"] }, payTo: { mode: "allowlist", addresses: [seller] }, maxPerPayment: "50000" });
+  assert.equal(replies.length, 0);
+  assert.match(policySummary(policy, [native, usdc]), /x402 payments: up to 0\.05 USDC each/);
+  // A maximum above the USDC input limit per operation is refused: that limit would refuse every such payment.
+  assert.ok(messages.some(m => /USDC input limit per operation \(10 USDC\) refuses larger payments/.test(m)));
+  // The summary shows the lower of the two caps.
+  const usdcKey = Object.keys(policy.tokens).find(k => k.toLowerCase() === usdc.address.toLowerCase());
+  const tighter = { ...policy, tokens: { ...policy.tokens, [usdcKey]: { ...policy.tokens[usdcKey], perTransaction: "10000" } } };
+  assert.match(policySummary(tighter, [native, usdc]), /x402 payments: up to 0\.01 USDC each/);
+  // Without USDC in the policy the question is never asked.
+  const nativeOnly = ["CENT", recipient, "n", "1", "100", "1000", "20", "20", "n", "n"];
+  const { limits: plain } = await promptPolicy(MAINNET, async () => native, async () => { assert.ok(nativeOnly.length); return nativeOnly.shift(); }, () => {});
+  assert.equal(plain.x402, undefined);
+  assert.match(policySummary(plain, [native]), /x402 payments: disabled/);
 });
 
 test("setup's default gas-unit limit admits a token-paid first operation that deploys and links an agent", async () => {
@@ -285,13 +306,71 @@ test("setup's default gas-unit limit admits a token-paid first operation that de
   assert.ok(told.some(m => m.includes("1,500,000 gas units") && m.includes("100,000 gwei fee ceiling")), "setup states the defaults it applies");
 });
 
+test("keeping current permissions lets the user keep, change or turn off x402 payments", async t => {
+  const old = await fixture(t), f = await fixture(t, { root: old.root, existing: true }), portal = "0x0000000000000000000000000000000000000002";
+  const registry = MAINNET.manifest.agentRegistry.proxy.address.toLowerCase(), link = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)");
+  const usdcLimits = { perTransaction: "1000000", daily: "2000000", exposure: "100000000", gasPayment: "100000" };
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false, limits: { ...s.envelope.policy.limits, tokens: { ...s.envelope.policy.limits.tokens, [usdc.address]: usdcLimits }, agentRegistry: { parents: [portal], allowUnlink: false }, targets: { ...s.envelope.policy.limits.targets, [registry]: [link] }, x402: { origins: { mode: "any" }, payTo: { mode: "any" }, maxPerPayment: "100000" } } }));
+  f.chain.token = async ref => ref.toLowerCase() === usdc.address ? usdc : native;
+  // Change: from any site to one site, at a lower maximum.
+  const changed = interaction(["", "y", "n", "y", "0.05", "https://api.example.com", "", "y", "y", "ENABLE"], join(old.parent, "changed.json"));
+  await setupWallet(f.service, f.root, changed.io);
+  assert.deepEqual((await f.service.review()).wallet.policy.limits.x402, { origins: { mode: "allowlist", origins: ["https://api.example.com"] }, payTo: { mode: "any" }, maxPerPayment: "50000" });
+  // Off: answering no to allowing x402 removes it.
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false }));
+  const off = interaction(["", "y", "n", "n", "y", "y", "ENABLE"], join(old.parent, "off.json"));
+  await setupWallet(f.service, f.root, off.io);
+  assert.equal((await f.service.review()).wallet.policy.limits.x402, undefined);
+});
+
 test("setup does not ask for Portal accounts on a wallet that has not approved the registry yet", async () => {
-  // The same answers as the registry case above, without the registry prompt: nothing is left unanswered or saved.
-  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n"], asked = [], told = [];
+  // The same answers as the registry case above (declining x402), without the registry prompt: nothing is left unanswered or saved.
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "n"], asked = [], told = [];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async q => { asked.push(q); assert.ok(replies.length); return replies.shift(); }, m => told.push(m), false);
   assert.equal(policy.agentRegistry, undefined); assert.equal(replies.length, 0);
   assert.ok(!asked.some(q => /Portal accounts/.test(q)));
   assert.ok(told.some(m => /run wallet capabilities approve, then rerun setup/.test(m)));
+});
+
+test("setup says why x402 stays off instead of skipping it silently", async () => {
+  const told = [], tell = text => told.push(text), ask = async () => { throw new Error("must not ask"); };
+  const usdc = MAINNET.manifest.canonicalTokens.USDC.address;
+  assert.equal(await promptX402({ ...MAINNET, identity: { ...MAINNET.identity, chainId: 1 } }, { tokens: { [usdc]: { perTransaction: "1" } } }, ask, tell), undefined);
+  assert.match(told.pop(), /only on Incentiv Mainnet/);
+  assert.equal(await promptX402(MAINNET, { tokens: {} }, ask, tell), undefined);
+  assert.match(told.pop(), /need a USDC limit/);
+});
+
+test("setup keeps x402 off when its limits would refuse every payment, and warns when only native gas can pay", async () => {
+  const told = [], tell = text => told.push(text), refuse = async () => { throw new Error("must not ask"); };
+  const usdc = MAINNET.manifest.canonicalTokens.USDC.address;
+  const limits = (u, native) => ({ tokens: { [usdc]: { perTransaction: "50000", daily: "1000000", exposure: "1000000", gasPayment: String(X402_MIN_USDC_GAS), ...u }, ...(native ? { native: { perTransaction: "0", daily: "0", exposure: "0", gasPayment: native } } : {}) } });
+  for (const u of [{ gasPayment: "20000" }, { perTransaction: "10000", daily: "20000" }]) {
+    assert.equal(await promptX402(MAINNET, limits(u, "0"), refuse, tell), undefined, JSON.stringify(u));
+    assert.match(told.pop(), /Every x402 payment would be refused/);
+  }
+  // With a native gas allowance, x402 is still offered, with a warning that USDC can't pay its gas.
+  const answers = ["n"], ask = async () => answers.shift();
+  assert.equal(await promptX402(MAINNET, limits({ gasPayment: "20000" }, "1000000000000000000"), ask, tell), undefined);
+  assert.ok(told.some(text => /must pay gas in native/.test(text)));
+});
+
+test("setup asks again when a list is longer than the policy allows, instead of failing after every answer", async () => {
+  const many = n => Array.from({ length: n }, (_, i) => `0x${(i + 1).toString(16).padStart(40, "0")}`);
+  const sites = n => Array.from({ length: n }, (_, i) => `https://s${i}.example.com`);
+  const usdc = MAINNET.manifest.canonicalTokens.USDC.address;
+  const limits = { tokens: { [usdc]: { perTransaction: "1000000", daily: "10000000", exposure: "10000000", gasPayment: "1000000" } } };
+  const told = [], tell = text => told.push(text);
+  const replies = ["y", "", sites(MAX_POLICY_LIST + 1).join(","), sites(2).join(","), many(MAX_POLICY_LIST + 1).join(","), many(MAX_POLICY_LIST).join(",")];
+  const x402 = await promptX402(MAINNET, limits, async () => { assert.ok(replies.length); return replies.shift(); }, tell);
+  assert.equal(replies.length, 0);
+  assert.equal(x402.origins.origins.length, 2); assert.equal(x402.payTo.addresses.length, MAX_POLICY_LIST);
+  assert.equal(told.filter(m => /at most 100 origins/.test(m)).length, 1);
+  assert.equal(told.filter(m => /at most 100 seller payment addresses/.test(m)).length, 1);
+  const parents = ["y", many(MAX_POLICY_LIST + 1).join(","), many(3).join(",")];
+  const registry = await promptAgentRegistry(MAINNET, async () => { assert.ok(parents.length); return parents.shift(); }, tell);
+  assert.equal(parents.length, 0); assert.equal(registry.agentRegistry.parents.length, 3);
+  assert.ok(told.some(m => /at most 100 Portal smart-account addresses/.test(m)));
 });
 
 test("kept permissions below the default gas unit cap are flagged when a link is added", () => {
@@ -309,4 +388,16 @@ test("setup refuses the agent's own account as its Portal parent", async () => {
   assert.equal(replies.length, 0);
   assert.deepEqual(registry.agentRegistry.parents.map(p => p.toLowerCase()), [other]);
   assert.ok(told.some(m => /own account, which cannot be its own parent/.test(m)));
+});
+
+test("setup asks again for an origin longer than the policy allows, instead of failing after every answer", async () => {
+  const told = [], tell = text => told.push(text);
+  const usdc = MAINNET.manifest.canonicalTokens.USDC.address;
+  const limits = { tokens: { [usdc]: { perTransaction: "50000", daily: "1000000", exposure: "1000000", gasPayment: String(X402_MIN_USDC_GAS) } } };
+  const long = `https://${`${"a".repeat(60)}.`.repeat(5)}com`;
+  const answers = ["y", "0.05", long, "https://api.example.com", ""], ask = async () => answers.shift();
+  const x402 = await promptX402(MAINNET, limits, ask, tell);
+  assert.deepEqual(x402.origins, { mode: "allowlist", origins: ["https://api.example.com"] });
+  assert.ok(told.some(text => /longer than the 256 characters/.test(text)));
+  assert.equal(answers.length, 0);
 });
