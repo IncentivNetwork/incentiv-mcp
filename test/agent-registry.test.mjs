@@ -1401,7 +1401,7 @@ test("prepare_agent_link gives no Portal URL to a wallet that cannot sign the li
 });
 
 test("prepare_agent_link refuses an expired local policy before and after reading the registry", async t => {
-  const f = await fixture(t), now = Date.now, expiresAt = now() + 60_000;
+  const f = await fixture(t), now = Date.now, expiresAt = now() + 16 * 60_000;
   await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt, agentRegistry: { parents: [parent], allowUnlink: false } } }));
   f.chain.registryStatus = async () => {
     t.mock.method(Date, "now", () => expiresAt);
@@ -1699,4 +1699,23 @@ test("a signed unlink from an earlier build names the replacement that frees the
   await f.store.session(async s => { const j = await Journal.open(s); j.data.records.find(r => r.requestId === id).status = "signed"; await j.save(); });
   f.chain.relay = relay;
   await assert.rejects(f.service.send("transfer", transfer(randomUUID())), e => e.code === "operation_pending" && e.message.includes(`wallet operation resolve ${id} --replace`) && /no longer sends/.test(e.message));
+});
+
+test("prepare_agent_link refuses a policy that ends before a Portal approval would", async t => {
+  const f = await fixture(t), expiresAt = Date.now() + 10 * 60_000;
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt, agentRegistry: { parents: [parent], allowUnlink: false } } }));
+  f.chain.registryStatus = async () => assert.fail("a policy that ends too soon needs no registry read");
+  const refused = await f.service.prepareAgentLink();
+  assert.equal(refused.link_blocked, "policy_expired"); assert.equal(refused.portal_url, undefined);
+  assert.match(refused.next_action, /expires within 15 minutes.*Renew it with incentiv-mcp setup/);
+});
+
+test("a link request that waits on a full parent keeps its request ID", async t => {
+  const f = await registryFixture(t, false), id = randomUUID(), args = { request_id: id, approval: f.approval };
+  assert.equal((await f.service.send("link_agent", args)).status, "approval_required");
+  f.chain.verifyRegistry = async () => { throw new WalletError("registry_limit_reached", "This Portal account has reached its agent limit"); };
+  await assert.rejects(f.service.send("link_agent", args), { code: "registry_limit_reached" });
+  const waiting = await f.service.operation(id);
+  assert.equal(waiting.status, "approval_required"); assert.equal(waiting.last_error, "registry_limit_reached");
+  assert.match(waiting.next_action, /reached its agent limit.*same request ID/);
 });

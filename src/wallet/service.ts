@@ -1,4 +1,4 @@
-import { assertRegistryApproved, isRegistryIntent, registryCapability, linkBlocker } from "../agent-registry.js";
+import { AGENT_LINK_MIN_SECONDS, assertRegistryApproved, isRegistryIntent, registryCapability, linkBlocker } from "../agent-registry.js";
 import { randomBytes } from "node:crypto";
 import { formatUnits, getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -429,6 +429,7 @@ export class WalletService {
       // A Portal approval for a wallet that cannot sign is unusable, so the user is not asked for one.
       try {
         const limits = await this.linkPolicy(s);
+        assertOutlastsApproval(limits);
         if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot send link_agent. Use a release with signing enabled to connect this agent");
         // Local refusals come before any registry read, so they hold whatever the RPC does.
         assertRegistryApproved(this.ctx.config, s.envelope);
@@ -441,7 +442,7 @@ export class WalletService {
         const blocked = linkBlocker(status, status.deployed);
         if (blocked) return linkRefusal(status, blocked);
         // The policy can expire during the registry read.
-        await this.linkPolicy(s);
+        assertOutlastsApproval(await this.linkPolicy(s));
         return { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };
       } catch (error) {
         if (error instanceof WalletError && ["policy_not_configured", "wallet_locked", "policy_expired", "capability_manifest_unapproved", "registry_parent_not_allowed", "wallet_release_unreviewed", "operation_pending"].includes(error.code)) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
@@ -1237,7 +1238,8 @@ const rpcOutage = (error: unknown) => error instanceof RpcDisagreementError || (
   ? new WalletError("rpc_unavailable", "Could not read chain state from RPC; retry this request") : error;
 /** Refusals that say nothing about the request itself, so an unsigned request returns to approval_required and keeps its ID. */
 // Renewing the local policy clears registry_approval_outlasts_policy, so the request keeps its ID for that too.
-const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable", "registry_factory_not_allowed", "registry_parent_not_eligible", "registry_approval_outlasts_policy"];
+// A full parent stays retryable as for signed bytes: the registry's limit can change.
+const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable", "registry_factory_not_allowed", "registry_parent_not_eligible", "registry_approval_outlasts_policy", "registry_limit_reached"];
 /** Registry refusals that the same signed bytes can never get past. */
 const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed", "registry_unlink_unsupported",
   // Connections are permanent, so an agent that is already linked, or an account role that forbids the link, does not change.
@@ -1344,11 +1346,11 @@ function assertDeploysOnce(deployed: boolean, journal: Journal) {
   if (pending) throw new WalletError("operation_pending", `This account is not deployed yet and pending request ${pending.requestId} deploys it; retry once get_agent_operation shows it settled`);
 }
 
-/**
- * The seller's settlement report with only well-formed values. A network or payer other than this payment's own is
- * dropped, so the result and its x402 MCP metadata never name another chain or account. Its free text is cut short
- * here and screened by the tool.
- */
+/** A Portal approval lasts AGENT_LINK_MIN_SECONDS, and link_agent refuses one that outlasts local policy. */
+function assertOutlastsApproval(limits: Limits) {
+  if (limits.expiresAt && limits.expiresAt < Date.now() + AGENT_LINK_MIN_SECONDS * 1000) throw new WalletError("policy_expired", `Local wallet policy expires within ${AGENT_LINK_MIN_SECONDS / 60} minutes, before a Portal approval would, so link_agent could not use one. Renew it with incentiv-mcp setup in your local terminal`);
+}
+
 /** Why a new request cannot start while `holder` owns the account nonce, with the step that frees it. */
 function mainNoncePending(holder: OperationRecord, next: string) {
   const id = holder.requestId;
@@ -1358,6 +1360,11 @@ function mainNoncePending(holder: OperationRecord, next: string) {
   return new WalletError("operation_pending", `Request ${id} owns the account nonce; check it with get_agent_operation until it settles, then ${next}`);
 }
 
+/**
+ * The seller's settlement report with only well-formed values. A network or payer other than this payment's own is
+ * dropped, so the result and its x402 MCP metadata never name another chain or account. Its free text is cut short
+ * here and screened by the tool.
+ */
 function sellerSettlement(settled: SettleResponse | undefined, account: string) {
   if (!settled) return;
   const match = (value: unknown, pattern: RegExp) => typeof value === "string" && pattern.test(value) ? value.toLowerCase() : undefined;
@@ -1408,5 +1415,6 @@ function result(r: OperationRecord) {
   const registryError = eventMissing || (r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_")) ? r.lastError : undefined;
   const interrupted = r.status === "approval_required" && TEMPORARY_ERRORS.includes(r.lastError ?? "");
   return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `${r.lastError === "registry_factory_not_allowed" ? "The Agent Registry does not currently allow this account's factory. Retry with the same request ID once it does, while the Portal approval is still valid" : r.lastError === "registry_parent_not_eligible" ? "The Agent Registry does not currently accept this Portal account as a parent. Retry with the same request ID once it does, while the Portal approval is still valid"
+      : r.lastError === "registry_limit_reached" ? "This Portal account has reached its agent limit. Retry with the same request ID if the limit changes, while the Portal approval is still valid"
       : r.lastError === "registry_approval_outlasts_policy" ? "The Portal approval lasts past the local wallet policy's expiry. Once the user renews the policy with incentiv-mcp setup, retry with the same request ID while the Portal approval is still valid" : "A temporary RPC failure interrupted this request. Retry with the same request ID"}${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, prior_replacement_user_op_hash: r.priorReplacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }
