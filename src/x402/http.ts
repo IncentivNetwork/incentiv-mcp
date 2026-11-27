@@ -61,6 +61,8 @@ export function isPublicAddress(address: string): boolean {
   return v6Global.check(address, "ipv6") && !v6.check(address, "ipv6");
 }
 
+/** The longest origin a payment record (`journal.ts`) and x402 policy (`policy.ts`) can hold. */
+export const MAX_ORIGIN_CHARS = 256;
 const PRIVATE_NAMES = /(^|\.)(localhost|local|internal|home\.arpa|lan|intranet|corp)$/i;
 
 /** Parses and checks a resource URL before any network use; returns it normalised. */
@@ -72,6 +74,8 @@ export function checkResourceUrl(value: string): URL {
   const host = url.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "");
   if (!host || PRIVATE_NAMES.test(host) || !host.includes(".") && !isIP(host)) throw new WalletError("validation_failed", "The resource host must be a public domain name or address");
   if (isIP(host) && !isPublicAddress(host)) throw new WalletError("validation_failed", "The resource address is not public");
+  // A payment record and x402 policy keep the origin in at most 256 characters, so a longer one could be quoted but not paid.
+  if (url.origin.length > MAX_ORIGIN_CHARS) throw new WalletError("validation_failed", `The resource origin is limited to ${MAX_ORIGIN_CHARS} characters`);
   url.hash = "";
   return url;
 }

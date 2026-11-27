@@ -2497,3 +2497,34 @@ test("past the unresolved-log cap the receipt search cursors wait, so the next p
   verifiable = true;
   assert.deepEqual(await chain.searchOperation(record), receipt);
 });
+
+test("an RPC fault in the check before a signed payment is sent leaves it signed and retryable under its request ID", async t => {
+  const faults = [() => new BlockNotFoundError({ blockNumber: 5n }), () => new RpcRequestError({ body: {}, url: "https://rpc.incentiv.io", error: { code: -32000, message: "header not found" } }), () => new RpcDisagreementError("RPC chain heads disagree")];
+  for (const fault of faults) {
+    const f = await x402Fixture(t), id = randomUUID(), stateFor = f.chain.stateFor;
+    f.chain.stateFor = async () => { throw fault(); };
+    await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), e => e.code === "rpc_unavailable" && /did not send it; retry with the same request ID/.test(e.message));
+    assert.equal((await f.records())[0].status, "signed");
+    assert.equal(f.seen.payments.length, 0);
+    f.chain.stateFor = stateFor;
+    assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submitted");
+    assert.equal(f.seen.payments.length, 1);
+    // A retry for the answer reads the lane the same way, and a fault there is an outage too.
+    f.chain.stateFor = async () => { throw fault(); };
+    await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }), { code: "rpc_unavailable" });
+    assert.equal(f.seen.payments.length, 1);
+  }
+});
+
+test("an origin longer than a payment record holds is refused before any request", async t => {
+  const label = n => "a".repeat(n);
+  const fits = `https://${label(63)}.${label(63)}.${label(63)}.${label(52)}.com`;
+  assert.equal(new URL(fits).origin.length, 256);
+  assert.equal(checkResourceUrl(`${fits}/x`).origin, fits);
+  const long = `https://${label(63)}.${label(63)}.${label(63)}.${label(55)}.com/x`;
+  assert.throws(() => checkResourceUrl(long), e => e.code === "validation_failed" && /limited to 256 characters/.test(e.message));
+  const f = await x402Fixture(t, { policy: { ...x402Policy, origins: { mode: "any" } } });
+  await assert.rejects(f.service.x402Requirements({ url: long }), { code: "validation_failed" });
+  await assert.rejects(f.service.payX402({ url: long, max_amount: "0.05", request_id: randomUUID() }), { code: "validation_failed" });
+  assert.equal(f.seen.unpaid, 0);
+});

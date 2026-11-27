@@ -2,9 +2,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -329,6 +329,23 @@ async function unlock() {
   console.log(`Removed the marker left ${describe(owner)}. Run status to reconcile any funded attempt.`);
 }
 
+async function distDigest() {
+  const hash = createHash("sha256");
+  const files = (await readdir(join(root, "dist"), { recursive: true, withFileTypes: true })).filter(entry => entry.isFile()).map(entry => join(entry.parentPath, entry.name)).sort();
+  for (const file of files) hash.update(relative(root, file)).update("\0").update(await readFile(file)).update("\0");
+  return hash.digest("hex");
+}
+
+// The tarball is packed from dist/ and this runner loads it too, so both must be what the checkout's source builds.
+async function freshBuild() {
+  const npm = process.env.npm_execpath;
+  assert.ok(npm, "Run this suite through npm");
+  const before = await distDigest();
+  execFileSync(process.execPath, [npm, "run", "build"], { cwd: root, stdio: ["ignore", "ignore", "inherit"] });
+  if (await distDigest() !== before) throw new Error("dist/ did not match the source, so it was rebuilt. Run the same command again to test the current build.");
+  return before;
+}
+
 async function runSuite(run, { retryFailed = false, freeOnly = false, dropResponse = false } = {}) {
   if (!freeOnly) assert.equal(await tokenBalance(run.buyer), budget, "The test buyer must hold exactly 0.05 USDC for this run");
   await preflightSeller();
@@ -336,7 +353,20 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
   await acquireLock();
   const store = localWalletStore(MAINNET, run.buyerProfile);
   let enabled = false, temp;
+  // An interrupt skips the finally below, so it disables the buyer and releases the marker itself.
+  const interrupted = signal => {
+    console.error(`Stopped by ${signal}. Run status before running again.`);
+    (enabled ? store.disable() : Promise.resolve()).catch(error => console.error(`Could not disable the test buyer: ${error.message}`))
+      .finally(async () => {
+        if (temp) await rm(temp, { recursive: true, force: true }).catch(() => {});
+        await unlink(lock).catch(() => {});
+        process.exit(130);
+      });
+  };
+  process.once("SIGINT", interrupted);
+  process.once("SIGTERM", interrupted);
   try {
+    const distSha256 = await freshBuild();
     if (retryFailed) await clearFailedAttempt(run);
     else assert.equal(await load("attempt.json"), undefined, "A funded attempt was already recorded. Use status.");
     temp = await mkdtemp(join(tmpdir(), "incentiv-x402-package-"));
@@ -355,7 +385,7 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
       const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
       const walletSourceDirty = Boolean(execFileSync("git", ["status", "--porcelain", "--", "src"], { cwd: root, encoding: "utf8" }).trim());
       const estimatorSha256 = createHash("sha256").update(await readFile(join(dist, "userop.js"))).digest("hex");
-      const build = { commit, walletSourceDirty, estimatorSha256, tarballSha256 };
+      const build = { commit, walletSourceDirty, distSha256, estimatorSha256, tarballSha256 };
       seller.allowPayments();
       const firstPayment = await withBuyer(run.buyerProfile, async call => {
         await save("attempt.json", { ...build, purchase, startedAt: new Date().toISOString() });
@@ -416,6 +446,8 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
       }, dist);
     }, dropResponse);
   } finally {
+    process.off("SIGINT", interrupted);
+    process.off("SIGTERM", interrupted);
     try { if (enabled) await store.disable(); }
     finally {
       try { if (temp) await rm(temp, { recursive: true, force: true }); }

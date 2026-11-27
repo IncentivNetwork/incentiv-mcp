@@ -728,11 +728,11 @@ export class WalletService {
    * reservation is excluded from what is already used. A refusal sends nothing and keeps the record as it was.
    */
   private async recheckX402(s: WalletSession, journal: Journal, r: OperationRecord, limits: Limits, consequence: string, freshlySimulated: boolean): Promise<ChainState> {
-    const state = await this.chain.stateFor(s.envelope, r);
+    const state = await this.chain.stateFor(s.envelope, r).catch(rethrowSendCheckError);
     if (state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "This payment's nonce lane has moved; check get_agent_operation");
     const validated = validateOperation(this.ctx.config, s.envelope, r.intent, { ...r.operation!, signature: "0x" }, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash! });
     if (digest(validated.spend) !== digest(r.reservation)) throw new WalletError("wallet_recovery_required", "Operation reservation does not match the signed spend");
-    const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state), used = journal.used();
+    const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state).catch(rethrowSendCheckError), used = journal.used();
     for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
     const violations = policyViolations(limits, { token: r.intent.token, amount: r.intent.amount, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls, x402: { origin: r.intent.x402!.origin, payTo: r.intent.to! } });
     if (violations.length) throw new WalletError("policy_denied", `Local wallet policy no longer allows this payment: ${violations.join(", ")}; ${consequence}`);
@@ -758,7 +758,7 @@ export class WalletService {
     let response: Awaited<ReturnType<typeof this.http>> | undefined;
     // Neither a seller's report nor a confirmation the chain later drops is proof: while the nonce is unused, the
     // seller could still submit the payment, so sending it again would be a send under no current policy.
-    const state = await this.chain.stateFor(s.envelope, r);
+    const state = await this.chain.stateFor(s.envelope, r).catch(rethrowSnapshotError);
     if (state.nonce === BigInt(r.nonce!)) {
       if (r.status === "confirmed") {
         await this.chain.assertCanonicalSnapshot(state).catch(rethrowSnapshotError);
@@ -1159,6 +1159,11 @@ function rethrowX402RecheckError(error: unknown): never {
 
 const MAX_LINK_ATTEMPTS = 8;
 /** A chain read for an ordinary spend that failed, or whose block was replaced; retrying reads a new snapshot. */
+/** A failed read in the checks before a signed payment is sent or resent: this call sends nothing, and the record keeps its request ID. */
+function rethrowSendCheckError(error: unknown): never {
+  if (!rpcFault(error)) throw error;
+  throw new WalletError("rpc_unavailable", "Could not read chain state from RPC before sending this payment, so this call did not send it; retry with the same request ID");
+}
 function rethrowSnapshotError(error: unknown): never {
   if (!rpcFault(error)) throw error;
   throw new WalletError("rpc_unavailable", "Chain state changed or RPC is unavailable during the wallet check; retry this request");
