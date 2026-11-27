@@ -74,6 +74,7 @@ export class WalletService {
     const validated = validateOperation(this.ctx.config, s.envelope, r.intent, { ...r.operation, signature: "0x" }, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash, deadline: r.deadline });
     if (digest(validated.spend) !== digest(r.reservation)) throw new WalletError("wallet_recovery_required", "Operation reservation does not match the signed spend");
     const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state), used = journal.used();
+    assertDeploysOnce(state.deployed, journal, r);
     if (ownsNonce(r.status)) for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
     const policyInput = { ...this.registryPolicy(r.intent), token: r.intent.token, tokenOut: r.intent.tokenOut, amount: r.intent.amount, to: r.intent.to, swap: r.intent.kind === "swap", slippage: r.intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls };
     const permitted = () => {
@@ -347,6 +348,7 @@ export class WalletService {
         if (existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
         const state = await this.chain.state(s.envelope);
         const balances = await this.spendingBalances(journal, this.balanceTokens(limits), state);
+        assertDeploysOnce(state.deployed, journal);
         const used = journal.used();
         // First policy evaluation precedes building; violations may build an unsigned review candidate.
         const initialSpend: Spend = {}; addSpend(initialSpend, intent.token, BigInt(intent.amount));
@@ -378,6 +380,7 @@ export class WalletService {
         if (isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent, fresh);
         if (kind === "swap") await this.chain.verifySwap(s.envelope, intent, limits, fresh);
         const freshBalances = await this.spendingBalances(journal, this.balanceTokens(limits), fresh);
+        assertDeploysOnce(fresh.deployed, journal);
         const finalViolations = policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used: journal.used(), balances: freshBalances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
         if (finalViolations.includes("exposure_limit") || (finalViolations.length && (!r.approval || r.approval.liveTest))) {
           r.reasons = finalViolations; delete r.approval; await journal.transition(r, "approval_required"); return result(r);
@@ -1024,7 +1027,7 @@ export class WalletService {
       if (r.status === "superseding") await this.submitReplacement(s, journal, r);
       // Only the seller submits an x402 payment; this wallet never relays it, and cancels it only by replacement.
       else if (r.intent.kind !== "x402_payment" && (r.status === "signed" || r.status === "submission_unknown")) await this.submit(s, journal, r);
-      return result(r);
+      return operationResult(r);
     });
   }
 
@@ -1109,13 +1112,13 @@ export class WalletService {
   /** A stuck nonce is urgent: say what to do next rather than suggesting storage damage. */
   private async replacementStep<T>(id: string, gasToken: string, step: () => Promise<T> | T): Promise<T> {
     try { return await step(); } catch (error) {
+      // An outage says nothing about the gas token, so paying in native gas would not help.
+      if (rpcOutage(error) !== error) throw new WalletError("rpc_unavailable", "Could not reach the RPC or bundler to prepare this replacement; retry");
       // The paymaster's refusal suggests a new request ID, but this request still holds the nonce, so only native gas can replace it.
       if (error instanceof WalletError && error.code === "gas_token_unavailable" && gasToken !== "native") throw new WalletError(error.code, `${error.detail.replace(/\s*Use a new request ID\b.*$/s, "")} Request ${id} still holds the account nonce, so a new request ID would be refused. To pay this replacement's gas in ${this.ctx.config.identity.nativeSymbol}, run wallet operation resolve ${id} --replace --native-gas in your local terminal.`);
       // Only gas payment problems can be cleared by paying in native gas; other errors keep their own guidance.
       if (error instanceof WalletError) throw GAS_FIXABLE_ERRORS.includes(error.code) ? new WalletError(error.code, `${error.message.slice(error.code.length + 2)}.${nativeGasHint(this.ctx.config, gasToken)}`) : error;
       if (error instanceof NetworkError) throw error;
-      // An outage says nothing about the gas token, so paying in native gas would not help.
-      if (rpcOutage(error) !== error) throw new WalletError("rpc_unavailable", "Could not reach the RPC or bundler to prepare this replacement; retry");
       throw new WalletError("validation_failed", `Could not prepare this replacement; retry.${nativeGasHint(this.ctx.config, gasToken)}`);
     }
   }
@@ -1146,7 +1149,7 @@ export class WalletService {
       if (r.status === "superseding") { r.sequence = ++journal.data.sequence; await journal.save(); }
       else await journal.transition(r, "superseding");
       await this.submitReplacement(s, journal, r);
-      return result(r);
+      return operationResult(r);
     });
   }
   private async checkReplacementBalance(journal: Journal, r: OperationRecord, gasToken: string, gasCharge: string, state?: ChainState) {
@@ -1260,7 +1263,7 @@ async function pooled(tasks: (() => Promise<void>)[], limit: number): Promise<vo
 /** Refusals that say nothing about the request itself, so an unsigned request returns to approval_required and keeps its ID. */
 // Renewing the local policy clears registry_approval_outlasts_policy, so the request keeps its ID for that too.
 // A full parent stays retryable as for signed bytes: the registry's limit can change.
-const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable", "registry_factory_not_allowed", "registry_parent_not_eligible", "registry_approval_outlasts_policy", "registry_limit_reached"];
+const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable", "registry_factory_not_allowed", "registry_parent_not_eligible", "registry_approval_outlasts_policy", "registry_limit_reached", "operation_pending"];
 /** Registry refusals that the same signed bytes can never get past. */
 const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed", "registry_unlink_unsupported",
   // Connections are permanent, so an agent that is already linked, or an account role that forbids the link, does not change.
@@ -1371,8 +1374,8 @@ function covers(balances: Spend, journal: Journal, spend: Spend, except?: Operat
 }
 
 /** An undeployed account is created by the first operation that lands; another signed to create it too would then fail. */
-function assertDeploysOnce(deployed: boolean, journal: Journal) {
-  const pending = deployed ? undefined : journal.data.records.find(o => ownsNonce(o.status));
+function assertDeploysOnce(deployed: boolean, journal: Journal, current?: OperationRecord) {
+  const pending = deployed ? undefined : journal.data.records.find(o => o !== current && ownsNonce(o.status));
   if (pending) throw new WalletError("operation_pending", `This account is not deployed yet and pending request ${pending.requestId} deploys it; retry once get_agent_operation shows it settled`);
 }
 
@@ -1450,5 +1453,6 @@ function result(r: OperationRecord) {
   const interrupted = r.status === "approval_required" && TEMPORARY_ERRORS.includes(r.lastError ?? "");
   return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `${r.lastError === "registry_factory_not_allowed" ? "The Agent Registry does not currently allow this account's factory. Retry with the same request ID once it does, while the Portal approval is still valid" : r.lastError === "registry_parent_not_eligible" ? "The Agent Registry does not currently accept this Portal account as a parent. Retry with the same request ID once it does, while the Portal approval is still valid"
       : r.lastError === "registry_limit_reached" ? "This Portal account has reached its agent limit. Retry with the same request ID if the limit changes, while the Portal approval is still valid"
+      : r.lastError === "operation_pending" ? "Check the pending operation with get_agent_operation and retry with the same request ID once it settles"
       : r.lastError === "registry_approval_outlasts_policy" ? "The Portal approval lasts past the local wallet policy's expiry. Once the user renews the policy with incentiv-mcp setup, retry with the same request ID while the Portal approval is still valid" : "A temporary RPC failure interrupted this request. Retry with the same request ID"}${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, prior_replacement_user_op_hash: r.priorReplacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }

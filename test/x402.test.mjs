@@ -326,11 +326,19 @@ test("an unsettled payment is cancelled by a replacement on its own nonce lane",
   const f = await x402Fixture(t), id = randomUUID();
   f.seen.refuse = true;
   await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const lookup = await f.service.operation(id);
+  const resolved = await f.service.resolve(id, password);
   const review = await f.service.reviewReplacement(id, true);
   const lane = BigInt(review.records[0].nonce);
   assert.equal(lane >> 64n, paymentNonceKey(f.seen.payments[0].payload.paymentId, f.seen.payments[0].payload.validUntil));
   const replaced = await f.service.replace(id, password, digest(review.records[0]));
   assert.equal(replaced.status, "superseding");
+  for (const output of [resolved, replaced]) {
+    assert.deepEqual(output.intent, lookup.intent);
+    assert.equal(output.intent.amount, "0.05");
+    assert.equal(output.intent.asset, "USDC");
+    for (const field of ["accepted", "resource", "request"]) assert.ok(!(field in output.intent));
+  }
   assert.equal(BigInt(f.submissions.at(-1).nonce), lane);
   // The payment can still win its lane, so a retry says to wait rather than buy again on another lane.
   const retry = await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
@@ -1938,6 +1946,36 @@ test("a transfer does not use funds an x402 settlement rolled back during its si
   await assert.rejects(f.service.send("transfer", args(randomUUID())), e => e.code === "policy_denied" && /Balance changed before signing/.test(e.message));
   assert.equal(f.submissions.length, 0, "the transfer was neither signed nor relayed");
   assert.equal((await f.service.operation(id)).status, "submitted");
+});
+
+test("a transfer waits when a reorg reopens the payment deploying its wallet", async t => {
+  const f = await x402Fixture(t), payment = randomUUID(), transfer = randomUUID(), state = f.chain.state;
+  const receipt = { success: true, actualGasCost: 1n, transactionHash: `0x${"ab".repeat(32)}` };
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: payment });
+  await f.settle(receipt);
+  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true });
+  assert.equal((await f.service.operation(payment)).status, "confirmed");
+
+  let reads = 0;
+  f.chain.state = async (...args) => {
+    const snapshot = await state(...args);
+    // The opening reconciliation still sees the deployment. The spending recheck sees the rolled-back chain.
+    if (++reads === 2) f.unsettle();
+    return { ...snapshot, deployed: reads === 1 };
+  };
+  const builds = f.builds();
+  await assert.rejects(f.service.send("transfer", args(transfer)), e => e.code === "operation_pending" && e.message.includes(payment));
+  assert.equal(f.builds(), builds);
+  assert.equal(f.submissions.length, 0);
+  assert.equal((await f.service.operation(payment)).status, "submitted");
+  const waiting = await f.service.operation(transfer);
+  assert.equal(waiting.status, "approval_required");
+  assert.match(waiting.next_action, /retry with the same request ID/);
+
+  await f.settle(receipt);
+  f.chain.state = async (...args) => ({ ...(await state(...args)), deployed: true });
+  assert.equal((await f.service.send("transfer", args(transfer))).status, "submitted");
+  assert.equal(userOpFromJson(f.submissions[0]).factory, undefined);
 });
 
 test("an unresolvable old log does not keep the receipt search from a later verifiable receipt", async () => {

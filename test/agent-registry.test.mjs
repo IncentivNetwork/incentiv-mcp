@@ -1579,8 +1579,10 @@ test("an RPC or bundler outage while replacing reports rpc_unavailable and keeps
   f.chain.state = async () => { throw outage(); };
   await assert.rejects(f.service.reviewReplacement(id), { code: "rpc_unavailable" });
   f.chain.state = state;
-  f.chain.buildReplacement = async () => { throw outage(); };
-  await assert.rejects(f.service.reviewReplacement(id), e => e.code === "rpc_unavailable" && !/native-gas|CENT/.test(e.message));
+  for (const failure of [outage(), new RpcDisagreementError("Token decimals disagree")]) {
+    f.chain.buildReplacement = async () => { throw failure; };
+    await assert.rejects(f.service.reviewReplacement(id), e => e.code === "rpc_unavailable" && !/native-gas|CENT/.test(e.message));
+  }
   f.chain.buildReplacement = build;
   const review = await f.service.reviewReplacement(id);
   f.chain.state = async () => { throw outage(); };
