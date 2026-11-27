@@ -909,7 +909,7 @@ export class WalletService {
       const gasDeposit = await this.chain.gasDeposit(s.envelope);
       // release_approved is retained as a legacy alias for the local signing gate.
       // It never attests to public release review or npm publication.
-      return { ...publicWallet(s.envelope), reason: !policy.configured ? "policy_not_configured" : disabled ? "wallet_disabled" : "operation_required_for_gas_estimate", deployed: state.deployed, balances, entrypoint_gas_deposit_wei: gasDeposit, pending_reservations: reserved, spendable_before_new_gas: spendable, gas_options: policy.configured ? Object.keys(policy.limits.tokens) : [], estimated_max_gas_payment: null, pending_operations: journal.data.records.filter(r => !terminal(r.status)).map(result), candidate_signing_enabled: this.signingEnabled, release_approved: this.signingEnabled, next_action: !policy.configured ? "Run incentiv-mcp setup in your own terminal" : disabled ? "Run incentiv-mcp setup to review permissions, back up and re-enable" : "Provide a transfer or swap intent to check exact transfer-plus-gas readiness" };
+      return { ...publicWallet(s.envelope), reason: !policy.configured ? "policy_not_configured" : disabled ? "wallet_disabled" : "operation_required_for_gas_estimate", deployed: state.deployed, balances, entrypoint_gas_deposit_wei: gasDeposit, pending_reservations: reserved, spendable_before_new_gas: spendable, gas_options: policy.configured ? Object.keys(policy.limits.tokens) : [], estimated_max_gas_payment: null, pending_operations: journal.data.records.filter(r => !terminal(r.status)).map(operationResult), candidate_signing_enabled: this.signingEnabled, release_approved: this.signingEnabled, next_action: !policy.configured ? "Run incentiv-mcp setup in your own terminal" : disabled ? "Run incentiv-mcp setup to review permissions, back up and re-enable" : "Provide a transfer or swap intent to check exact transfer-plus-gas readiness" };
     });
   }
   async operation(id: string) {
@@ -922,7 +922,7 @@ export class WalletService {
       if (archived) return { request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archivedError(archived), archived: true };
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
       // An x402 payment is shown as pay_x402_resource shows it, in USDC rather than atomic units.
-      return r.intent.kind === "x402_payment" ? x402Result(r) : result(r);
+      return operationResult(r);
     });
   }
   async review(id?: string) {
@@ -1311,8 +1311,10 @@ function sellerSettlement(settled: SettleResponse | undefined, account: string) 
   const match = (value: unknown, pattern: RegExp) => typeof value === "string" && pattern.test(value) ? value.toLowerCase() : undefined;
   const reason = typeof settled.errorReason === "string" ? settled.errorReason.slice(0, 300) || undefined : undefined;
   const payer = match(settled.payer, /^0x[0-9a-fA-F]{40}$/);
-  const fields = { transaction: match(settled.transaction, /^0x[0-9a-fA-F]{64}$/), network: settled.network === X402_NETWORK ? X402_NETWORK : undefined, payer: payer === account.toLowerCase() ? payer : undefined, error_reason: reason };
-  return { success: settled.success === true, ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)) } as { success: boolean; transaction?: string; network?: string; payer?: string; error_reason?: string };
+  // A settlement on another network is not this payment's, so none of it is reported as settled.
+  const elsewhere = settled.network !== undefined && settled.network !== X402_NETWORK;
+  const fields = { transaction: elsewhere ? undefined : match(settled.transaction, /^0x[0-9a-fA-F]{64}$/), network: settled.network === X402_NETWORK ? X402_NETWORK : undefined, payer: payer === account.toLowerCase() ? payer : undefined, error_reason: reason };
+  return { success: settled.success === true && !elsewhere, ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)) } as { success: boolean; transaction?: string; network?: string; payer?: string; error_reason?: string };
 }
 
 /**
@@ -1331,6 +1333,9 @@ function assertPolicyLive(limits: Limits, consequence: string) {
 }
 
 const X402_UNKNOWN_ACTION = (id: string) => `Its amount stays reserved until the payment settles or is cancelled. Check get_agent_operation; to cancel it, the user runs incentiv-mcp wallet operation resolve ${id} --replace in their own terminal.`;
+
+/** An operation as the wallet tools show it: an x402 payment in USDC as pay_x402_resource shows it, anything else as recorded. */
+const operationResult = (r: OperationRecord) => r.intent.kind === "x402_payment" ? x402Result(r) : result(r);
 
 /** An x402 record for the agent: the request and payment, without the seller's raw JSON. */
 function x402Result(r: OperationRecord) {

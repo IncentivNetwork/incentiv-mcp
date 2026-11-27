@@ -7,7 +7,7 @@ import { encodeFunctionData, toFunctionSelector } from "viem";
 import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
-import { allowance, answer, policySummary, promptPolicy, promptX402, setupTargets, technicalLimits } from "../src/setup-policy.ts";
+import { allowance, answer, policySummary, promptPolicy, promptX402, setupTargets, technicalLimits, X402_MIN_USDC_GAS } from "../src/setup-policy.ts";
 import { connectionFor, clientConfigPath, mergeConnection, saveClientConfig, connectClient } from "../src/setup-client.ts";
 import { setupWallet, checkRuntime } from "../src/setup.ts";
 import { parseWalletProfileArgs } from "../src/wallet-profile.ts";
@@ -339,4 +339,18 @@ test("setup says why x402 stays off instead of skipping it silently", async () =
   assert.match(told.pop(), /only on Incentiv Mainnet/);
   assert.equal(await promptX402(MAINNET, { tokens: {} }, ask, tell), undefined);
   assert.match(told.pop(), /need a USDC limit/);
+});
+
+test("setup keeps x402 off when its limits would refuse every payment, and warns when only native gas can pay", async () => {
+  const told = [], tell = text => told.push(text), refuse = async () => { throw new Error("must not ask"); };
+  const usdc = MAINNET.manifest.canonicalTokens.USDC.address;
+  const limits = (u, native) => ({ tokens: { [usdc]: { perTransaction: "50000", daily: "1000000", exposure: "1000000", gasPayment: String(X402_MIN_USDC_GAS), ...u }, ...(native ? { native: { perTransaction: "0", daily: "0", exposure: "0", gasPayment: native } } : {}) } });
+  for (const u of [{ gasPayment: "20000" }, { perTransaction: "10000", daily: "20000" }]) {
+    assert.equal(await promptX402(MAINNET, limits(u, "0"), refuse, tell), undefined, JSON.stringify(u));
+    assert.match(told.pop(), /Every x402 payment would be refused/);
+  }
+  // With a native gas allowance, x402 is still offered, with a warning that USDC can't pay its gas.
+  const answers = ["n"], ask = async () => answers.shift();
+  assert.equal(await promptX402(MAINNET, limits({ gasPayment: "20000" }, "1000000000000000000"), ask, tell), undefined);
+  assert.ok(told.some(text => /must pay gas in native/.test(text)));
 });

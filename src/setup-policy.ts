@@ -103,6 +103,9 @@ export function withoutUnlink(_config: Config, limits: Limits): Limits {
   return limitsSchema.parse({ ...limits, ...(limits.agentRegistry ? { agentRegistry: { ...limits.agentRegistry, allowUnlink: false } } : {}), targets });
 }
 
+/** The paymaster's smallest USDC gas charge for a payment, from its fee schedule (0.026 USDC). */
+export const X402_MIN_USDC_GAS = 26_000n;
+
 /**
  * Offers x402 payments when the policy covers Incentiv USDC. Payments still count against the USDC limits;
  * this adds the per-payment cap and which sellers may be paid.
@@ -115,6 +118,12 @@ export async function promptX402(config: Config, limits: Pick<Limits, "tokens">,
   // Every payment also has to pass the USDC input limit per operation, so a higher x402 maximum would never apply.
   const cap = BigInt(Object.entries(limits.tokens).find(([token]) => token.toLowerCase() === usdc.toLowerCase())![1].perTransaction);
   if (cap === 0n) { tell("USDC input per operation is 0, which refuses every x402 payment; raise it to allow x402."); return undefined; }
+  // The paymaster charges at least X402_MIN_USDC_GAS, and with USDC gas the daily USDC limit also counts it.
+  const usdcLimits = Object.entries(limits.tokens).find(([token]) => token.toLowerCase() === usdc.toLowerCase())![1];
+  const usdcGas = BigInt(usdcLimits.gasPayment) >= X402_MIN_USDC_GAS && BigInt(usdcLimits.daily) > X402_MIN_USDC_GAS;
+  const nativeGas = BigInt(limits.tokens.native?.gasPayment ?? "0") > 0n && BigInt(usdcLimits.daily) > 0n;
+  if (!usdcGas && !nativeGas) { tell(`Every x402 payment would be refused: paying gas in USDC needs a USDC gas allowance of at least ${formatUnits(X402_MIN_USDC_GAS, 6)} and a daily USDC limit above it, and no native gas allowance is set. Raise them to allow x402.`); return undefined; }
+  if (!usdcGas) tell(`The USDC gas allowance or daily limit is below the paymaster's minimum of ${formatUnits(X402_MIN_USDC_GAS, 6)} USDC, so payments must pay gas in native ${config.identity.nativeSymbol} (gas_token native).`);
   if (!await yesNo(ask, tell, "Allow paying for x402 resources?")) return undefined;
   const fallback = formatUnits(cap < 100_000n ? cap : 100_000n, 6);
   const maxPerPayment = await answer(ask, tell, `USDC — maximum price per x402 payment, at most the USDC input limit of ${formatUnits(cap, 6)} [${fallback}]: `, value => {

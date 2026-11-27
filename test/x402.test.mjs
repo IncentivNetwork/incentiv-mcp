@@ -2551,19 +2551,38 @@ test("an unpaid error answer's content type is screened and a non-text body is o
   }
 });
 
-test("a settlement naming another network or payer keeps neither, in the result or in _meta", async t => {
-  const f = await x402Fixture(t), http = f.service.http;
-  f.service.http = async req => req.headers?.["payment-signature"]
-    ? { status: 200, headers: { "content-type": "application/json", "payment-response": encodePaymentResponseHeader({ success: true, transaction: `0x${"cd".repeat(32)}`, network: "eip155:8453", payer: "0x000000000000000000000000000000000000dEaD" }) }, body: Buffer.from("{}"), truncated: false }
-    : http(req);
-  const tools = {};
-  registerX402Tools({ registerTool: (name, _config, handler) => { tools[name] = handler; } }, f.service, { fields: item => item });
-  const answer = await tools.pay_x402_resource({ url: URL_, max_amount: "0.05", request_id: randomUUID() });
-  const result = JSON.parse(answer.content[0].text);
-  assert.equal(result.status, "submitted");
-  assert.equal(result.settlement.network, undefined);
-  assert.equal(result.settlement.payer, undefined);
-  assert.deepEqual(answer._meta["x402/payment-response"], { success: true, transaction: `0x${"cd".repeat(32)}` });
+test("a settlement on another network is not reported as settled, and a foreign payer is dropped", async t => {
+  const dead = "0x000000000000000000000000000000000000dEaD";
+  const pay = async network => {
+    const f = await x402Fixture(t), http = f.service.http;
+    f.service.http = async req => req.headers?.["payment-signature"]
+      ? { status: 200, headers: { "content-type": "application/json", "payment-response": encodePaymentResponseHeader({ success: true, transaction: `0x${"cd".repeat(32)}`, network, payer: dead }) }, body: Buffer.from("{}"), truncated: false }
+      : http(req);
+    const tools = {};
+    registerX402Tools({ registerTool: (name, _config, handler) => { tools[name] = handler; } }, f.service, { fields: item => item });
+    const answer = await tools.pay_x402_resource({ url: URL_, max_amount: "0.05", request_id: randomUUID() });
+    return { answer, result: JSON.parse(answer.content[0].text), records: await f.records() };
+  };
+  const elsewhere = await pay("eip155:8453");
+  assert.equal(elsewhere.result.status, "submission_unknown");
+  assert.equal(elsewhere.result.settlement.success, false);
+  assert.equal(elsewhere.result.settlement.transaction, undefined); assert.equal(elsewhere.result.settlement.network, undefined); assert.equal(elsewhere.result.settlement.payer, undefined);
+  assert.equal(elsewhere.answer._meta, undefined);
+  assert.equal(elsewhere.records[0].transactionHash, undefined);
+  // On this network the report counts, but a payer other than this account is still dropped.
+  const here = await pay(X402_NETWORK);
+  assert.equal(here.result.status, "submitted");
+  assert.equal(here.result.settlement.payer, undefined);
+  assert.deepEqual(here.answer._meta["x402/payment-response"], { success: true, transaction: `0x${"cd".repeat(32)}`, network: X402_NETWORK });
+});
+
+test("get_agent_wallet lists a pending payment as the payment tools show it", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  const pending = (await f.service.get()).pending_operations.find(o => o.request_id === id);
+  assert.equal(pending.intent.amount, "0.05");
+  assert.ok(pending.intent.pay_to);
+  assert.equal(pending.intent.request, undefined);
 });
 
 test("a final settlement is not reopened when one lane read shows its nonce unused", async t => {

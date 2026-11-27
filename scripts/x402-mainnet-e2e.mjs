@@ -79,11 +79,14 @@ async function withBuyer(profile, work, dist = join(root, "dist")) {
   } finally { await client.close(); }
 }
 
+// The open seller tunnel, so a signal handler can close it: only close() stops its ssh process.
+let openTunnel;
+
 async function withSeller(run, work, dropFirstSettlement = false) {
   const seller = await startSeller({ payTo: run.seller, runId: run.id, dropFirstSettlement, acceptPayments: false });
   let tunnel;
   try {
-    tunnel = await startTunnel(seller.internal);
+    tunnel = openTunnel = await startTunnel(seller.internal);
     const url = tunnel.origin + seller.resource;
     const deadline = Date.now() + 65_000;
     for (;;) {
@@ -106,7 +109,7 @@ async function withSeller(run, work, dropFirstSettlement = false) {
     }
     return await work({ ...seller, origin: tunnel.origin, url });
   } finally {
-    try { await tunnel?.close(); }
+    try { openTunnel = undefined; await tunnel?.close(); }
     finally { await seller.close(); }
   }
 }
@@ -341,6 +344,8 @@ async function freshBuild() {
   const npm = process.env.npm_execpath;
   assert.ok(npm, "Run this suite through npm");
   const before = await distDigest();
+  // tsc never deletes outputs, so a file whose source was removed would survive a rebuild in place.
+  await rm(join(root, "dist"), { recursive: true, force: true });
   execFileSync(process.execPath, [npm, "run", "build"], { cwd: root, stdio: ["ignore", "ignore", "inherit"] });
   if (await distDigest() !== before) throw new Error("dist/ did not match the source, so it was rebuilt. Run the same command again to test the current build.");
   return before;
@@ -357,10 +362,12 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
   // running meanwhile and may configure the buyer again, so disabling comes last and the process exits right after it.
   const interrupted = async signal => {
     console.error(`Stopped by ${signal}. Run status before running again.`);
+    // SIGTERM reaches only this process, so the tunnel's ssh child is stopped here.
+    await openTunnel?.close().catch(() => {});
     if (temp) await rm(temp, { recursive: true, force: true }).catch(() => {});
     await unlink(lock).catch(() => {});
     if (enabled) await store.disable().catch(error => console.error(`Could not disable the test buyer: ${error.message}`));
-    process.exit(130);
+    process.exit(signal === "SIGTERM" ? 143 : 130);
   };
   process.once("SIGINT", interrupted);
   process.once("SIGTERM", interrupted);
