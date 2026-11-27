@@ -2769,3 +2769,17 @@ test("a reported success without a valid transaction or the Incentiv network sta
     assert.equal(answer._meta, undefined);
   }
 });
+
+test("wallet operation resolve reports a payment its own reconciliation just expired and archived", async t => {
+  const f = await x402Fixture(t), id = randomUUID(), http = f.service.http;
+  const { NOT_SENT } = await import("../src/x402/http.ts");
+  f.service.http = async req => { if (!req.headers?.["payment-signature"]) return http(req); throw Object.defineProperty(new Error("x"), NOT_SENT, { value: true }); };
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id }).catch(() => undefined);
+  const deadline = (await f.records())[0].deadline, now = Date.now;
+  Date.now = () => (deadline + 1) * 1000;
+  try {
+    const resolved = await f.service.resolve(id, password);
+    assert.equal(resolved.status, "expired"); assert.equal(resolved.archived, true);
+    await assert.rejects(f.service.reviewReplacement(id), e => e.code === "operation_pending" && /already ended as expired/.test(e.message));
+  } finally { Date.now = now; }
+});

@@ -171,17 +171,21 @@ export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): P
       signal: AbortSignal.timeout(30_000),
     });
   } catch (error) { throw new BundlerUnavailableError(`Bundler unreachable: ${(error as Error).message}`); }
+  // Busy, or not a usable endpoint at all (a wrong URL or an expired key): neither says anything about the operation.
   const busy = res.status === 408 || res.status === 429 || res.status >= 500;
+  const unusable = res.status === 401 || res.status === 403 || res.status === 404 || res.status === 407;
+  if (unusable) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
   if (!busy && !res.ok) throw new Error(`Bundler HTTP ${res.status}`);
   let body: unknown;
   try { body = await res.json(); } catch { throw new BundlerUnavailableError(busy ? `Bundler HTTP ${res.status}` : "Bundler answer is not valid JSON"); }
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new BundlerUnavailableError(busy ? `Bundler HTTP ${res.status}` : "Bundler answer is not an RPC response");
+  // A success may carry "error": null, and an error may carry "result": null.
+  const errorOnly = "error" in body && body.error != null && wellFormedRpcError(body.error) && (!("result" in body) || body.result === null);
   // Some bundlers send a rejected operation's RPC error with HTTP 500, so a busy status is an outage only without one.
-  if (busy && !("error" in body && wellFormedRpcError(body.error) && !("result" in body))) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
-  // A success may carry "error": null.
+  if (busy && !errorOnly) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
   if ("error" in body && body.error != null) {
     const { error } = body;
-    if ("result" in body || !error || typeof error !== "object" || !("code" in error) || !Number.isInteger(error.code) ||
+    if (!errorOnly || !error || typeof error !== "object" || !("code" in error) || !Number.isInteger(error.code) ||
         !("message" in error) || typeof error.message !== "string") throw new BundlerUnavailableError("Bundler answer has an invalid RPC error");
     const data = "data" in error && error.data ? ` ${JSON.stringify(error.data)}` : "";
     // An internal error or exceeded limit says nothing about the operation, as for the chain RPC, unless it reports a revert.

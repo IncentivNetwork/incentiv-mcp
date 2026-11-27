@@ -1601,12 +1601,22 @@ test("a bundler's internal or limit error during simulation keeps a new request 
     assert.equal((await f.service.send("transfer", transfer(id))).status, "submitted", `${status} ${code}`);
   }
   // A busy HTTP status is an outage unless it carries a rejection: some bundlers answer a revert with HTTP 500.
-  for (const [error, expected] of [[{ code: -32500, message: "AA23 reverted" }, "simulation_failed"], [{ code: -32603, message: "busy" }, "rpc_unavailable"], [undefined, "rpc_unavailable"]]) {
+  // An endpoint that is unusable (a wrong URL or an expired key) is an outage too, with or without an RPC error,
+  // and a rejection that carries "result": null is still a rejection.
+  const rpc = (body, status = 200) => () => Response.json({ jsonrpc: "2.0", id: 1, ...body }, { status });
+  for (const [answer, expected, label] of [
+    [rpc({ error: { code: -32500, message: "AA23 reverted" } }, 500), "simulation_failed", "500 rejection"],
+    [rpc({ error: { code: -32603, message: "busy" } }, 500), "rpc_unavailable", "500 busy"],
+    [() => new Response("<html>bad gateway</html>", { status: 502 }), "rpc_unavailable", "502 html"],
+    [() => new Response("not found", { status: 404 }), "rpc_unavailable", "404"],
+    [rpc({ error: { code: -32001, message: "unauthorized" } }, 401), "rpc_unavailable", "401 rpc error"],
+    [rpc({ result: null, error: { code: -32500, message: "AA23 reverted" } }), "simulation_failed", "result null"],
+  ]) {
     const f = await fixture(t), id = randomUUID();
     f.chain.clients.splice(0, f.chain.clients.length, { readContract: async () => ({ reject: 0 }) });
     f.chain.simulate = WalletChain.prototype.simulate;
-    const fetch = t.mock.method(globalThis, "fetch", async () => error ? Response.json({ jsonrpc: "2.0", id: 1, error }, { status: 500 }) : new Response("<html>bad gateway</html>", { status: 502 }));
-    await assert.rejects(f.service.send("transfer", transfer(id)), { code: expected }, JSON.stringify(error));
+    const fetch = t.mock.method(globalThis, "fetch", async () => answer());
+    await assert.rejects(f.service.send("transfer", transfer(id)), { code: expected }, label);
     fetch.mock.restore();
   }
   // A success that carries "error": null is still a success.

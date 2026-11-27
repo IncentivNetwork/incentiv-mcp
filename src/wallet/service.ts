@@ -4,6 +4,7 @@ import { formatUnits, getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { type Hex } from "viem";
 import { z } from "zod";
+import { X402_MIN_USDC_GAS } from "../setup-policy.js";
 import { type Config } from "../config.js";
 import { Ctx } from "../context.js";
 import { NetworkError } from "../network.js";
@@ -11,7 +12,7 @@ import { BundlerUnavailableError, userOpToJson } from "../userop.js";
 import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
 import { RpcDisagreementError } from "./errors.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
-import { Journal, digest, holdsMainNonce, intentSchema, ownsNonce, signedReplacements, terminal, type Intent, type OperationRecord } from "./journal.js";
+import { archivedSchema, Journal, digest, holdsMainNonce, intentSchema, ownsNonce, signedReplacements, terminal, type Intent, type OperationRecord } from "./journal.js";
 import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, x402QuoteViolations, x402Violations, type Limits, type Spend } from "./policy.js";
 import { MIN_SWAP_REMAINING_SECONDS, REORG_MARGIN_BLOCKS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure, type ChainState } from "./chain.js";
 import { validateOperation } from "./validate.js";
@@ -558,7 +559,7 @@ export class WalletService {
     return {
       url: req.url, payment_required: true, payable: !!accepted, ...(unsupported ? { unsupported } : {}),
       ...(accepted ? { price: { amount: formatUnits(BigInt(accepted.amount), USDC_DECIMALS), amount_atomic: accepted.amount, asset: "USDC", pay_to: getAddress(accepted.payTo), scheme: accepted.scheme, network: accepted.network, max_timeout_seconds: accepted.maxTimeoutSeconds, settles_before_handler: accepted.extra?.paymentFlow === "upfront" } } : {}),
-      gas: "Paid on top of the price: about 0.03 USDC through the paymaster (minimum 0.026), or CENT with gas_token native.",
+      gas: `Paid on top of the price: about 0.03 USDC through the paymaster (minimum ${formatUnits(X402_MIN_USDC_GAS, USDC_DECIMALS)}), or CENT with gas_token native.`,
       description: typeof required.resource?.description === "string" ? required.resource.description.slice(0, 1024) : undefined,
       ...(reasons ? { policy: { allowed: reasons.length === 0, reasons } } : {}),
       next_action: !accepted ? "This wallet cannot pay this resource." : reasons?.length ? "Local wallet policy would refuse this payment; the user can change it with incentiv-mcp setup." : "To pay, call pay_x402_resource with the same request and max_amount set to at most the price you accept.",
@@ -946,12 +947,7 @@ export class WalletService {
         r.replacement?.userOpHash === key || r.priorReplacement?.userOpHash === key);
       const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === key || a.userOpHash === key ||
         a.replacementUserOpHash === key || a.priorReplacementUserOpHash === key);
-      if (archived) return {
-        request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status,
-        user_op_hash: archived.userOpHash, replacement_user_op_hash: archived.replacementUserOpHash,
-        prior_replacement_user_op_hash: archived.priorReplacementUserOpHash, transaction_hash: archived.transactionHash,
-        last_error: archivedError(archived), archived: true,
-      };
+      if (archived) return archivedResult(archived);
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
       // An x402 payment is shown as pay_x402_resource shows it, in USDC rather than atomic units.
       return operationResult(r);
@@ -1011,6 +1007,9 @@ export class WalletService {
       await authorize(s.envelope.policy, passphrase);
       const journal = await Journal.open(s); await this.reconcile(journal, true);
       const r = journal.data.records.find(r => r.requestId === id);
+      // Reconciliation archives a payment that ended without reaching a seller, possibly in this same pass.
+      const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === id);
+      if (archived) return archivedResult(archived);
       if (!r) throw new WalletError("operation_not_found", "Unknown request ID");
       if (r.status === "superseding") await this.submitReplacement(s, journal, r);
       // Only the seller submits an x402 payment; this wallet never relays it, and cancels it only by replacement.
@@ -1079,6 +1078,8 @@ export class WalletService {
       // A signed token-paid replacement can become unsendable: the bundler refuses the same bytes once the paymaster's
       // terms move. It may still land, so it is kept, but a native replacement may be reviewed over it, once.
       const overToken = !!r?.replacement?.signed && r.replacement.gasToken !== undefined && !r.priorReplacement;
+      const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === id);
+      if (archived) throw new WalletError("operation_pending", `Request ${id} already ended as ${archived.status} and is archived; it holds no nonce, so there is nothing to replace`);
       if (!r || !ownsNonce(r.status) || (r.replacement?.signed && !(overToken && nativeGas))) throw new WalletError("operation_pending", `Replacement requires an unresolved original operation without a signed replacement${overToken ? `; a signed replacement that pays gas in a token can be replaced once more with wallet operation resolve ${id} --replace --native-gas` : ""}`);
       if (r.priorReplacement && !nativeGas) throw new WalletError("operation_pending", `Request ${id} already has a signed token-paid replacement, so only a native one can follow it: run wallet operation resolve ${id} --replace --native-gas`);
       // For an x402 payment this cancels it: any operation on its nonce lane makes the payment unusable (SPEC 6).
@@ -1290,6 +1291,15 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const UNSENT_TERMINAL = ["failed", "expired", "cancelled"];
 /** Outcomes a receipt settled: an earlier delivery error no longer describes them. */
 const SETTLED_STATUSES = ["confirmed", "reverted", "superseded"];
+/** An archived x402 payment as get_agent_operation and wallet operation resolve show it: it has ended, so nothing remains to do. */
+function archivedResult(archived: z.infer<typeof archivedSchema>) {
+  return {
+    request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status,
+    user_op_hash: archived.userOpHash, replacement_user_op_hash: archived.replacementUserOpHash,
+    prior_replacement_user_op_hash: archived.priorReplacementUserOpHash, transaction_hash: archived.transactionHash,
+    last_error: archivedError(archived), archived: true,
+  };
+}
 const archivedError = (archived: { status: string; lastError?: string }) => SETTLED_STATUSES.includes(archived.status) ? undefined : archived.lastError;
 /** A refused unpaid request needs its binding only while a retry with its request ID is likely. */
 const REFUSED_PROBE_MS = 86_400_000;
