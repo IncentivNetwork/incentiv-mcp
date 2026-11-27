@@ -171,7 +171,7 @@ waiting for this lock; sign and relay paths recheck it.
 | `unsupported_wallet_version` | An explicit format migration is required. |
 | `keystore_authentication_failed` | Authentication tag or locally rederived addresses disagree. |
 | `wallet_network_mismatch` | Wallet identity differs from configured/pinned identity. |
-| `capability_manifest_unapproved` | Capabilities differ from the wallet's approved manifest. |
+| `capability_manifest_unapproved` | Capabilities differ from the wallet's approved manifest. A wallet that only lacks approval of the current Agent Registry pins opens normally and gets this error from registry tools only. The authenticated `registryFreeManifestId` records what an approval covers apart from the registry. |
 | `wallet_recovery_required` | Other malformed, conflicting, incomplete, or inaccessible evidence. |
 
 Storage errors do not include raw credential-provider or filesystem error payloads.
@@ -182,7 +182,7 @@ Storage errors do not include raw credential-provider or filesystem error payloa
 incentiv-mcp wallet policy configure
 incentiv-mcp wallet doctor
 incentiv-mcp wallet init
-incentiv-mcp wallet capabilities approve --previous <config.json>
+incentiv-mcp wallet capabilities approve [--previous <config.json>]
 incentiv-mcp wallet recover
 incentiv-mcp wallet approve <request-id>
 incentiv-mcp wallet disable
@@ -221,8 +221,9 @@ commit evidence or complete staged keystore. Legacy/MCP-created orphan bindings
 have no such proof and remain preserved. Complete staged keystores resume with
 their original keys through `create_agent_wallet`.
 
-Capability approval takes the previous complete configuration and compares it to
-the currently configured proposal. It verifies all proposed pins/handshake before
+Capability approval compares the previous complete configuration to the currently
+configured proposal. When the only change is the Agent Registry, it derives the
+previous one by removing the registry; otherwise pass it with `--previous`. It verifies all proposed pins/handshake before
 unlocking, requires the administration factor and unchanged displayed review,
 rejects pending signatures and any immutable identity change, and preserves all
 history and consumed spend. The journal records an approved manifest before the

@@ -3,10 +3,11 @@ import test from "node:test";
 import { mkdtemp, readFile, realpath, rm, writeFile, mkdir, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { encodeFunctionData } from "viem";
-import { MAINNET } from "../src/config.ts";
+import { encodeFunctionData, toFunctionSelector } from "viem";
+import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
+import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
-import { allowance, answer, promptPolicy, setupTargets } from "../src/setup-policy.ts";
+import { linkGasWarning, promptAgentRegistry, allowance, answer, promptPolicy, setupTargets, technicalLimits } from "../src/setup-policy.ts";
 import { connectionFor, clientConfigPath, mergeConnection, saveClientConfig, connectClient } from "../src/setup-client.ts";
 import { setupWallet, checkRuntime } from "../src/setup.ts";
 import { parseWalletProfileArgs } from "../src/wallet-profile.ts";
@@ -35,7 +36,7 @@ function interaction(responses, out) {
   };
   return { io, output, secrets, questions };
 }
-const freshAnswers = () => ["CENT", recipient, "n", "0.01", "100", "1000", "20", "20", "n", "y", "y", "ENABLE"];
+const freshAnswers = () => ["CENT", recipient, "n", "0.01", "100", "1000", "20", "20", "n", "n", "y", "y", "ENABLE"];
 
 test("setup amounts are exact, support zero allowances and reject lossy or ambiguous input", () => {
   assert.equal(allowance("0", 6), "0");
@@ -62,7 +63,7 @@ test("generated permissions match real transfer, paymaster, wrap and swap select
 });
 
 test("guided policy requires RPC trust, corrects invalid input and includes gas in user-entered daily budgets", async () => {
-  const replies = ["", "bad-address", recipient, "y", "y", "1", "0.5", "100", "1000", "20", "10.1234567", "10", "11", "100", "1", "20", "n"];
+  const replies = ["", "bad-address", recipient, "y", "y", "1", "0.5", "100", "1000", "20", "10.1234567", "10", "11", "100", "1", "20", "n", "n"];
   const messages = [];
   const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, message => messages.push(message));
   assert.equal(policy.tokens[usdc.address].daily, "11000000");
@@ -153,14 +154,89 @@ test("failed backup and interrupted activation leave new wallets disabled; resum
   await assert.rejects(setupWallet(f.service, f.root, broken.io));
   const before = (await f.service.review()).wallet;
   assert.equal(before.policy.enabled, false);
-  const resumed = interaction(["", "y", "y", "y", ""], join(f.parent, "resumed.json"));
+  const resumed = interaction(["", "y", "", "y", "y", ""], join(f.parent, "resumed.json"));
   const result = await setupWallet(f.service, f.root, resumed.io);
   assert.equal(result.account, before.account); assert.equal(result.activated, false);
   assert.equal((await f.service.review()).wallet.policy.enabled, false);
   assert.equal(f.submissions.length, 0);
-  const finish = interaction(["", "y", "y", "y", "ENABLE"], join(f.parent, "finished.json"));
+  const finish = interaction(["", "y", "", "y", "y", "ENABLE"], join(f.parent, "finished.json"));
   assert.equal((await setupWallet(f.service, f.root, finish.io)).account, before.account);
   assert.equal((await f.service.review()).wallet.policy.enabled, true);
+});
+
+test("keeping current permissions still offers the registry once approved, and only points to approval before that", async t => {
+  const base = withoutAgentRegistry(MAINNET), old = await fixture(t, { config: base }), f = await fixture(t, { root: old.root, existing: true }), portal = "0x0000000000000000000000000000000000000002";
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false }));
+  const pending = interaction(["", "y", "y", "y", ""], join(old.parent, "unapproved.json"));
+  await setupWallet(f.service, f.root, pending.io);
+  assert.ok(!pending.questions.some(q => q.startsWith("Allow this agent")));
+  assert.ok(pending.output.some(line => line.includes("wallet capabilities approve")));
+  assert.equal((await f.service.review()).wallet.manifest_id, base.manifest.manifestId);
+
+  await approveCapabilities(f.store, base, MAINNET, password, digest(await reviewCapabilities(f.store, base, MAINNET)));
+  const approved = interaction(["", "y", "y", portal, "y", "y", "ENABLE"], join(old.parent, "approved.json"));
+  await setupWallet(f.service, f.root, approved.io);
+  const { limits: saved, enabled } = (await f.service.review()).wallet.policy;
+  assert.equal(enabled, true);
+  assert.deepEqual(saved.agentRegistry, { parents: [portal], allowUnlink: false });
+  assert.equal(saved.targets[MAINNET.manifest.agentRegistry.proxy.address.toLowerCase()].length, 1, "link only: connections are permanent");
+  assert.deepEqual(saved.tokens, limits.tokens);
+});
+
+test("replacing permissions on a wallet that has not approved the registry does not ask for Portal accounts", async t => {
+  const base = withoutAgentRegistry(MAINNET), old = await fixture(t, { config: base }), f = await fixture(t, { root: old.root, existing: true });
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false }));
+  const replaced = interaction(["", "n", "CENT", recipient, "n", "0.01", "100", "1000", "20", "20", "n", "y", "y", ""], join(old.parent, "replaced.json"));
+  await setupWallet(f.service, f.root, replaced.io);
+  assert.ok(!replaced.questions.some(q => /Portal accounts/.test(q)), "setup passes the wallet's approval state to promptPolicy");
+  assert.ok(replaced.output.some(line => line.includes("run wallet capabilities approve, then rerun setup")));
+  assert.equal((await f.service.review()).wallet.policy.limits.agentRegistry, undefined);
+});
+
+test("keeping a policy from an earlier build drops its unlink permission before the review", async t => {
+  const old = await fixture(t), f = await fixture(t, { root: old.root, existing: true }), portal = "0x0000000000000000000000000000000000000002";
+  const registry = MAINNET.manifest.agentRegistry.proxy.address.toLowerCase(), link = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)"), unlink = toFunctionSelector("unlink()");
+  await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [portal], allowUnlink: true }, targets: { ...s.envelope.policy.limits.targets, [registry]: [link, unlink] } } }));
+  const kept = interaction(["", "y", "y", "y", "ENABLE"], join(old.parent, "kept.json"));
+  await setupWallet(f.service, f.root, kept.io);
+  assert.ok(kept.output.some(line => line.includes("unlink permission an earlier version saved is left out below")));
+  const summary = kept.output.find(line => line.includes("Contract permissions"));
+  assert.ok(summary && !summary.includes(unlink), "the reviewed summary no longer lists unlink()");
+  const { limits: saved } = (await f.service.review()).wallet.policy;
+  assert.deepEqual(saved.agentRegistry, { parents: [portal], allowUnlink: false });
+  assert.deepEqual(saved.targets[registry], [link]);
+});
+
+test("keeping permissions after the registry moves offers its link permission, keeping parents and limits", async t => {
+  const registry = MAINNET.manifest.agentRegistry.proxy.address.toLowerCase(), link = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)");
+  const earlier = "0x00000000000000000000000000000000000000aa", portal = "0x0000000000000000000000000000000000000002";
+  for (const accept of [true, false]) {
+    const old = await fixture(t), f = await fixture(t, { root: old.root, existing: true });
+    // The policy was saved when the approved registry lived at an earlier proxy.
+    await f.store.session(async s => s.savePolicy({ ...s.envelope.policy, enabled: false, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: [portal], allowUnlink: false }, targets: { ...s.envelope.policy.limits.targets, [earlier]: [link] } } }));
+    const kept = interaction(["", "y", accept ? "y" : "n", "y", "y", "ENABLE"], join(old.parent, `moved-${accept}.json`));
+    await setupWallet(f.service, f.root, kept.io);
+    assert.ok(kept.questions.some(q => q.includes(`Agent Registry is now at ${registry}`) && q.includes(portal)));
+    assert.ok(!kept.questions.some(q => q.startsWith("Allow this agent")), "the parent list is kept, not asked again");
+    const { limits: saved } = (await f.service.review()).wallet.policy;
+    assert.deepEqual(saved.agentRegistry, { parents: [portal], allowUnlink: false });
+    assert.deepEqual(saved.tokens, limits.tokens);
+    assert.deepEqual(saved.targets[earlier], [link]);
+    if (accept) assert.deepEqual(saved.targets[registry], [link]);
+    else { assert.equal(saved.targets[registry], undefined); assert.ok(kept.output.some(line => line.includes("terminal approval"))); }
+  }
+});
+
+test("registry permission merges with a differently cased target, and unlink is dropped from a moved registry", async t => {
+  const { withLinkPermission, withoutUnlink } = await import("../src/setup-policy.ts");
+  const registry = MAINNET.manifest.agentRegistry.proxy.address, link = toFunctionSelector("link(address,address,uint256,bytes,uint256,bytes)"), unlink = toFunctionSelector("unlink()");
+  const merged = withLinkPermission(MAINNET, { ...limits, targets: { ...limits.targets, [registry]: [] } });
+  assert.deepEqual(Object.keys(merged.targets).filter(key => key.toLowerCase() === registry.toLowerCase()), [registry]);
+  assert.deepEqual(merged.targets[registry], [link]);
+  assert.equal(withLinkPermission(MAINNET, merged), merged);
+  const earlier = "0x00000000000000000000000000000000000000aa";
+  const cleaned = withoutUnlink(MAINNET, { ...limits, agentRegistry: { parents: [], allowUnlink: true }, targets: { ...limits.targets, [earlier]: [link, unlink] } });
+  assert.deepEqual(cleaned.targets[earlier], [link]); assert.equal(cleaned.agentRegistry.allowUnlink, false);
 });
 
 test("MCP-created wallet can establish disabled administration before backup, and cancellation never enables it", async t => {
@@ -187,4 +263,50 @@ test("saving disabled policy preserves restored-copy acknowledgement and existin
   await assert.rejects(service.configure(limits, password, false, digest(review.records)), { code: "policy_denied" });
   await service.configure(limits, password, true, digest(review.records));
   assert.equal((await service.review()).wallet.policy.enabled, true);
+});
+
+
+test("registry setup deduplicates parent addresses after case normalization", async () => {
+  const parent = "0x16e43840d8D79896A389a3De85aB0B0210C05685";
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n", "y", `${parent.toLowerCase()},${parent}`, "y"];
+  const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async () => { assert.ok(replies.length); return replies.shift(); }, () => {});
+  assert.deepEqual(policy.agentRegistry.parents, [parent]);
+});
+
+test("setup's default gas-unit limit admits a token-paid first operation that deploys and links an agent", async () => {
+  // Declared on mainnet by a USDC-paid deploy + link (2026-11-10, tx 0x3a6e14f9…): 382,120 verification, 327,100 call,
+  // 55,717 pre-verification, and the paymaster's 300,000 verification and 50,000 post-operation limits.
+  const firstLink = 382_120n + 327_100n + 55_717n + 300_000n + 50_000n;
+  assert.ok(BigInt(technicalLimits.maxGasUnits) >= firstLink * 13n / 10n, "the default keeps at least 30% headroom over a measured first link");
+  const told = [];
+  const asked = [];
+  const answers = ["", "", "n", "1", "1", "1", "1", "1", "1", "1", "1", "1", "n", "n"];
+  await promptPolicy(MAINNET, async ref => ({ address: ref === "CENT" ? "native" : MAINNET.manifest.canonicalTokens.USDC.address, symbol: ref, name: ref, decimals: ref === "CENT" ? 18 : 6 }), async q => { asked.push(q); return answers.shift() ?? "n"; }, m => told.push(m)).catch(() => {});
+  assert.ok(told.some(m => m.includes("1,500,000 gas units") && m.includes("100,000 gwei fee ceiling")), "setup states the defaults it applies");
+});
+
+test("setup does not ask for Portal accounts on a wallet that has not approved the registry yet", async () => {
+  // The same answers as the registry case above, without the registry prompt: nothing is left unanswered or saved.
+  const replies = ["", recipient, "y", "y", "1", "100", "1000", "20", "10", "100", "1000", "20", "20", "n"], asked = [], told = [];
+  const { limits: policy } = await promptPolicy(MAINNET, async ref => ref === "CENT" ? native : usdc, async q => { asked.push(q); assert.ok(replies.length); return replies.shift(); }, m => told.push(m), false);
+  assert.equal(policy.agentRegistry, undefined); assert.equal(replies.length, 0);
+  assert.ok(!asked.some(q => /Portal accounts/.test(q)));
+  assert.ok(told.some(m => /run wallet capabilities approve, then rerun setup/.test(m)));
+});
+
+test("kept permissions below the default gas unit cap are flagged when a link is added", () => {
+  assert.match(linkGasWarning({ maxGasUnits: "1000000" }), /1,000,000 is below the 1,500,000.*terminal approval/);
+  assert.equal(linkGasWarning({ maxGasUnits: technicalLimits.maxGasUnits }), undefined);
+  // A fresh setup that lowered the cap is told how to raise it there.
+  const fresh = linkGasWarning({ maxGasUnits: "1000000" }, false);
+  assert.match(fresh, /^The gas unit cap of 1,000,000.*edit the advanced limits/); assert.doesNotMatch(fresh, /kept|without keeping/);
+});
+
+test("setup refuses the agent's own account as its Portal parent", async () => {
+  const agent = "0x00000000000000000000000000000000000000a1", other = "0x00000000000000000000000000000000000000b2", told = [];
+  const replies = ["y", `${other},${agent}`, other];
+  const registry = await promptAgentRegistry(MAINNET, async () => replies.shift(), m => told.push(m), agent);
+  assert.equal(replies.length, 0);
+  assert.deepEqual(registry.agentRegistry.parents.map(p => p.toLowerCase()), [other]);
+  assert.ok(told.some(m => /own account, which cannot be its own parent/.test(m)));
 });

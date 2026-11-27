@@ -15,6 +15,6 @@
   "independentRpcOrigins": [],
   "maxGasCostWei": "1000000000000000000",
   "maxFeePerGas": "100000000000000",
-  "maxGasUnits": "1000000",
+  "maxGasUnits": "1500000",
   "maxBatchCalls": 4
 }

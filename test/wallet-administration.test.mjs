@@ -35,7 +35,7 @@ test("capability approval preserves identity, ledger and request IDs, cancels un
   assert.equal(result.account, before.account); assert.equal(result.owner, before.owner);
   assert.equal(result.wallet_id, before.wallet_id); assert.equal(result.manifest_id, config.manifest.manifestId);
   assert.equal(result.policy.enabled, false);
-  assert.deepEqual(scopes, ["local", "all", "all", "all", "all"]);
+  assert.deepEqual(scopes, ["local", "capability", "capability", "capability", "capability"]);
   await store.session(async s => {
     const journal = await Journal.open(s);
     assert.deepEqual(journal.used(), { native: "1200" });

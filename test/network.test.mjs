@@ -3,11 +3,12 @@ import test from "node:test";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
-import { encodeAbiParameters, keccak256, toHex, decodeFunctionData, parseAbi } from "viem";
+import { encodeAbiParameters, keccak256, toHex, decodeFunctionData, parseAbi, encodeFunctionResult } from "viem";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { MAINNET, canonicalJson, configurationId, loadConfig, parseConfig, localContractPins, remoteContractPins } from "../src/config.ts";
+import { agentRegistryAbi } from "../src/agent-registry.ts";
+import { MAINNET, canonicalJson, configurationId, loadConfig, parseConfig, localContractPins, registryContractPins, remoteContractPins } from "../src/config.ts";
 import { assertWalletNetwork, deriveSmartAccount, networkStatusFields, verifyNetwork, walletDirectory } from "../src/network.ts";
 import { Ctx } from "../src/context.ts";
 import { makeServer, createLocalStdioMcpServer } from "../src/server.ts";
@@ -25,7 +26,7 @@ function identify(cfg) {
 
 function fixture() {
   const cfg = structuredClone(MAINNET);
-  for (const pin of [...localContractPins(cfg), ...Object.keys(cfg.manifest.bridge.remoteChains).flatMap((chain) => remoteContractPins(cfg, chain))]) {
+  for (const pin of [...localContractPins(cfg), ...registryContractPins(cfg), ...Object.keys(cfg.manifest.bridge.remoteChains).flatMap((chain) => remoteContractPins(cfg, chain))]) {
     pin.codeHash = keccak256("0x60006000");
   }
   cfg.endpoints.rpcUrls = ["https://rpc-a.example.test", "https://rpc-b.example.test"];
@@ -42,7 +43,9 @@ function mockedRpc(cfg, calls = []) {
     if (method === "eth_getBlockByNumber") return { hash: cfg.identity.genesisHash };
     if (method === "eth_blockNumber") return "0x123";
     if (method === "eth_getCode") return "0x60006000";
+    if (method === "eth_getStorageAt") return encoded(cfg.manifest.agentRegistry.implementation.address);
     if (method === "eth_call") {
+      if (params[0].to === cfg.manifest.agentRegistry?.proxy.address) return encodeFunctionResult({ abi: agentRegistryAbi, functionName: "eip712Domain", result: ["0x0f", "Incentiv Agent Registry", "1", BigInt(cfg.identity.chainId), cfg.manifest.agentRegistry.proxy.address, `0x${"00".repeat(32)}`, []] });
       if (params[0].to === cfg.identity.accountBeacon.address) return encoded(cfg.identity.accountImplementation.address);
       if (params[0].data.length === 10) return encoded(cfg.identity.accountBeacon.address);
       return encoded(deriveSmartAccount(cfg, "0x0000000000000000000000000000000000000001"));
@@ -72,6 +75,24 @@ test("complete custom configuration loads; endpoint changes preserve wallet iden
     assert.equal(walletDirectory(), join(homedir(), ".incentiv-mcp", "wallet"));
     assert.equal(loadConfig({}).endpoints.rpcUrls[0], MAINNET.endpoints.rpcUrls[0]);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("the Portal URL is an endpoint: overriding it keeps the manifest, and only Incentiv HTTPS hosts are accepted", () => {
+  assert.equal(MAINNET.endpoints.portalUrl, "https://portal.incentiv.io/agents");
+  assert.equal(loadConfig({}).endpoints.portalUrl, MAINNET.endpoints.portalUrl);
+  const other = loadConfig({ INCENTIV_PORTAL_URL: "https://portal-override.example.incentiv.io/agents" });
+  assert.equal(other.endpoints.portalUrl, "https://portal-override.example.incentiv.io/agents");
+  assert.equal(other.manifest.manifestId, MAINNET.manifest.manifestId);
+  assert.deepEqual(other.manifest, MAINNET.manifest);
+  for (const value of ["http://portal.incentiv.io/agents", "https://portal.incentiv.io.example.test/agents", "https://example.test/agents",
+    "https://incentiv.io.example.test/", "https://evilincentiv.io/agents", "https://portal.incentiv.io:8443/agents", "https://user:pw@portal.incentiv.io/agents", "https://portal.incentiv.io/agents#x", "not a url"]) {
+    assert.throws(() => loadConfig({ INCENTIV_PORTAL_URL: value }), /endpoints\.portalUrl/, value);
+  }
+  // A configuration that enables the registry needs somewhere to send agent links; one without it does not.
+  const missing = structuredClone(MAINNET); delete missing.endpoints.portalUrl;
+  assert.throws(() => parseConfig(missing), /requires endpoints\.portalUrl/);
+  delete missing.manifest.agentRegistry; identify(missing);
+  assert.equal(parseConfig(missing).endpoints.portalUrl, undefined);
 });
 
 test("partial overrides, incomplete files, stale IDs and inconsistent capabilities are rejected", () => {
@@ -136,6 +157,27 @@ test("verification checks every RPC and every enabled pin at a fixed block", asy
   }
   for (const call of calls.filter((c) => c.method === "eth_getCode" || c.method === "eth_call")) assert.equal(call.params[1], "0x123");
   for (const pin of localContractPins(cfg)) assert.ok(calls.some((c) => c.method === "eth_getCode" && c.params[0] === pin.address));
+});
+
+test("a registry upgrade stops capability approval but not startup or ordinary wallet sessions", async () => {
+  const cfg = fixture(), good = mockedRpc(cfg, []), other = "0x0000000000000000000000000000000000000009";
+  const upgraded = (url, method, params) => method === "eth_getStorageAt" ? encodeAbiParameters([{ type: "address" }], [other]) : good(url, method, params);
+  await verifyNetwork(cfg, upgraded, "local");
+  await verifyNetwork(cfg, upgraded);
+  await assert.rejects(verifyNetwork(cfg, upgraded, "capability"), /Registry implementation mismatch/);
+  // An upgraded implementation that no longer answers eip712Domain is still reported as a registry change.
+  const reverting = (url, method, params) => method === "eth_call" && params[0].to.toLowerCase() === cfg.manifest.agentRegistry.proxy.address.toLowerCase() ? Promise.reject(new Error("execution reverted")) : upgraded(url, method, params);
+  await assert.rejects(verifyNetwork(cfg, reverting, "capability"), /Registry implementation mismatch/);
+  // A pinned implementation whose domain differs is still refused.
+  const domain = (url, method, params) => method === "eth_call" && params[0].to.toLowerCase() === cfg.manifest.agentRegistry.proxy.address.toLowerCase() ? Promise.resolve("0x") : good(url, method, params);
+  await assert.rejects(verifyNetwork(cfg, domain, "capability"));
+  await verifyNetwork(cfg, good, "capability");
+  const calls = [];
+  await verifyNetwork(cfg, mockedRpc(cfg, calls), "local");
+  assert.ok(!calls.some(c => c.params[0] === cfg.manifest.agentRegistry.proxy.address));
+  const pinned = [];
+  await verifyNetwork(cfg, mockedRpc(cfg, pinned), "capability");
+  for (const pin of registryContractPins(cfg)) assert.ok(pinned.some(c => c.method === "eth_getCode" && c.params[0] === pin.address));
 });
 
 test("local verification retains every Incentiv pin without depending on remote bridge RPCs", async () => {
@@ -265,7 +307,7 @@ for (const scenario of ["chain", "genesis", "code", "empty code", "beacon", "imp
 test("disabled bridge removes all four tools, remote access and matching docs in both modes", async () => {
   const cfg = structuredClone(MAINNET); cfg.manifest.bridge.enabled = false; identify(cfg);
   for (const bundle of [makeServer(new Ctx(cfg), () => []), await createLocalStdioMcpServer(new Ctx(cfg))]) {
-    assert.ok([20, 25].includes(bundle.catalog.length));
+    assert.ok([20, 29].includes(bundle.catalog.length));
     assert.ok(bundle.catalog.every((tool) => !tool.name.includes("bridge")));
     const markdown = renderMarkdown(cfg, bundle.catalog);
     const html = renderHtml(cfg, bundle.catalog);

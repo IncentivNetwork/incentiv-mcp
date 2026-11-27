@@ -21,7 +21,7 @@ try {
   await Promise.race([client.connect(transport), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Installed MCP startup timed out")), 60_000); })]);
   clearTimeout(timer);
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 29);
+  assert.equal(tools.length, 33);
   for (const name of ["get_network_status", "get_portfolio", "create_agent_wallet", "get_agent_wallet", "send_transfer", "send_swap", "get_agent_operation"]) assert.ok(tools.some(tool => tool.name === name), `Missing ${name}`);
-  console.log(`Installed incentiv-mcp@${pkg.version}: version, help and 29-tool catalog verified; no wallet operation invoked.`);
+  console.log(`Installed incentiv-mcp@${pkg.version}: version, help and 33-tool catalog verified; no wallet operation invoked.`);
 } finally { clearTimeout(timer); await client.close(); await transport.close(); }

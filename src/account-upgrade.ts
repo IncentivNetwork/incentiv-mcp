@@ -1,4 +1,4 @@
-import { canonicalJson, configurationId, parseConfig, type Config } from "./config.js";
+import { canonicalJson, configurationId, parseConfig, withoutAgentRegistry, type Config } from "./config.js";
 import { NetworkError } from "./network.js";
 
 // Only the reproduced September 2026 implementation is eligible for this transition.
@@ -6,7 +6,7 @@ export const PREVIOUS_ACCOUNT_NETWORK_ID = "0xd2710c6ff1e86a0c66fb2274612b5f8b77
 export const CURRENT_ACCOUNT_NETWORK_ID = "0xf7beea402d23219daa3790b6685ca14119813c0b802ff570696836bdda260101";
 
 export function previousImplementationConfig(config: Config): Config {
-  const previous = parseConfig(config);
+  const previous = withoutAgentRegistry(config);
   if (previous.identity.networkId !== CURRENT_ACCOUNT_NETWORK_ID) throw new NetworkError("wallet_network_mismatch", "No reviewed implementation upgrade exists for this network identity");
   previous.identity.accountImplementation = {
     address: "0x43fb62a71d0Ce27FD6AB70347A438d67eC2DFC6C",

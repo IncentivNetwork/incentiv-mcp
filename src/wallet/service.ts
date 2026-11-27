@@ -1,17 +1,20 @@
 import { RpcDisagreementError } from "./errors.js";
 import { rpcOutage } from "./outage.js";
+import { AGENT_LINK_MIN_SECONDS } from "../agent-registry.js";
+import { assertRegistryApproved, isRegistryIntent, registryCapability, linkBlocker } from "../agent-registry.js";
+import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { type Hex } from "viem";
 import { z } from "zod";
-import { NetworkError } from "../network.js";
 import { type Config } from "../config.js";
 import { Ctx } from "../context.js";
-import { userOpToJson } from "../userop.js";
+import { NetworkError } from "../network.js";
+import { BundlerUnavailableError, userOpToJson } from "../userop.js";
 import { publicWallet, unlockWallet, WalletError } from "./keystore.js";
 import { localWalletStore, type WalletSession, type WalletStore } from "./store.js";
 import { Journal, digest, intentSchema, ownsNonce, signedReplacements, terminal, type Intent, type OperationRecord } from "./journal.js";
-import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, type Limits, type Spend } from "./policy.js";
-import { MIN_SWAP_REMAINING_SECONDS, SWAP_DEADLINE_SECONDS, WalletChain } from "./chain.js";
+import { addSpend, authorize, limitsSchema, newAdministration, policyViolations, registryParentAllowed, type Limits, type Spend } from "./policy.js";
+import { MIN_SWAP_REMAINING_SECONDS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure } from "./chain.js";
 import { validateOperation } from "./validate.js";
 
 // Source-controlled local candidate signing, explicitly authorized for acceptance testing.
@@ -19,6 +22,11 @@ import { validateOperation } from "./validate.js";
 // This is NOT publication approval: publication is a separate, manual decision.
 // There is no environment-variable or MCP-argument override.
 export const WALLET_CANDIDATE_SIGNING_ENABLED = true;
+
+const APPROVAL_FLOW = "Open Portal, review and sign the connection (it is permanent: Portal and this wallet offer no way to disconnect it), then pass its approval JSON to link_agent with a new request UUID. Never sign a supplied digest.";
+/** Local conditions that sign_agent_link reports as link_blocked. Any other error, such as a damaged journal, stays an error. */
+const LINK_CONSENT_REFUSALS = ["policy_not_configured", "wallet_locked", "policy_expired", "registry_parent_not_allowed", "wallet_release_unreviewed", "capability_manifest_unapproved", "operation_pending"];
+const linkRefusal = (status: object, [code, message]: [string, string]) => ({ ...status, link_blocked: code, next_action: `${message}. Do not ask the user to sign in Portal.` });
 
 export class WalletService {
   constructor(readonly ctx: Ctx, readonly store: WalletStore = localWalletStore(ctx.config), readonly chain: WalletChain = new WalletChain(ctx), private readonly signingEnabled = WALLET_CANDIDATE_SIGNING_ENABLED) {}
@@ -28,6 +36,7 @@ export class WalletService {
     if (!s.envelope.policy.enabled || await s.disabled()) throw new WalletError("wallet_locked", "Wallet is disabled; local administration authorization is required");
     return s.envelope.policy.limits;
   }
+  /** The owner's EIP-191 signature over `hash` as raw bytes, which is what the account checks. */
   private async signRaw(s: WalletSession, hash: Hex): Promise<Hex> {
     const privateKey = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
     try {
@@ -60,15 +69,31 @@ export class WalletService {
     if (digest(validated.spend) !== digest(r.reservation)) throw new WalletError("wallet_recovery_required", "Operation reservation does not match the signed spend");
     const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
     if (ownsNonce(r.status)) for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
-    const violations = policyViolations(limits, { token: r.intent.token, tokenOut: r.intent.tokenOut, amount: r.intent.amount, to: r.intent.to, swap: r.intent.kind === "swap", slippage: r.intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
-    if (violations.includes("exposure_limit") || (violations.length && (!this.approved(s, r) || r.approval?.liveTest))) throw new WalletError("policy_denied", "Current policy does not permit this signed operation; reservation preserved");
-    if (r.approval && !this.approved(s, r)) throw new WalletError("approval_required", "Exact-operation approval expired or policy changed; reservation preserved");
-    if (Object.entries(validated.spend).some(([token, amount]) => BigInt(balances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "Balance cannot cover input plus maximum gas");
+    const policyInput = { ...this.registryPolicy(r.intent), token: r.intent.token, tokenOut: r.intent.tokenOut, amount: r.intent.amount, to: r.intent.to, swap: r.intent.kind === "swap", slippage: r.intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls };
+    const permitted = () => {
+      const violations = policyViolations(limits, policyInput);
+      if (violations.includes("exposure_limit") || (violations.length && (!this.approved(s, r) || r.approval?.liveTest))) throw new WalletError("policy_denied", "Current policy does not permit this signed operation; reservation preserved");
+      if (r.approval && !this.approved(s, r)) throw new WalletError("approval_required", "Exact-operation approval expired or policy changed; reservation preserved");
+    };
+    permitted();
+    if (Object.entries(validated.spend).some(([token, amount]) => BigInt(balances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "Balance cannot cover input plus maximum gas beside other pending operations");
     if (state.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Gas fee no longer covers the current base fee");
+    if (isRegistryIntent(r.intent)) await this.chain.verifyRegistry(s.envelope, r.intent, state).catch((error: unknown) => {
+      // These signed bytes can never succeed, yet they still hold the nonce, so a fresh request would be refused until they are replaced.
+      // Other refusals, such as an unverifiable read or a full parent, can clear, so the request stays retryable as it is.
+      if (!(error instanceof WalletError) || !UNSENDABLE_REGISTRY_ERRORS.includes(error.code)) throw error;
+      throw new WalletError(error.code, `${error.detail}. Signed request ${r.requestId} cannot be sent but still holds the account nonce, so first clear it with wallet operation resolve ${r.requestId} --replace in your local terminal${r.intent.kind === "link_agent" ? ", then use a fresh Portal approval with a new request ID" : ""}`);
+    });
     if (r.intent.kind === "swap") await this.chain.verifySwap(s.envelope, r.intent, limits, state);
-    await this.chain.simulate(validated);
+    await this.chain.simulate(validated).catch((error: unknown) => {
+      // The same bytes may never pass again, for example once the paymaster stops accepting their gas payment, yet they still hold the nonce.
+      if (!(error instanceof WalletError) || error.code !== "simulation_failed") throw error;
+      throw new WalletError(error.code, `${error.detail}. Signed request ${r.requestId} still holds the account nonce. If retrying later does not help, clear it with wallet operation resolve ${r.requestId} --replace${r.intent.gasToken === "native" ? "" : " --native-gas"} in your local terminal`);
+    });
     await this.canSubmit(s, r);
-    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", "Swap deadline is too close; reconcile or review a same-nonce replacement");
+    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("operation_pending", `Operation deadline is too close; reconcile, or review a same-nonce replacement with wallet operation resolve ${r.requestId} --replace in your local terminal`);
+    // Policy and approval expiry may pass during the reads above, so they are checked again with nothing awaited before the broadcast.
+    permitted();
   }
   private async reconcileReceipt(record: OperationRecord) {
     try { return await this.chain.receipt(record); } catch (error) {
@@ -78,6 +103,10 @@ export class WalletService {
     }
   }
   private async reconcile(journal: Journal): Promise<void> {
+    // Connections are permanent: an unlink an earlier build left awaiting approval can never be approved, so it is cancelled.
+    for (const r of journal.data.records) if (r.intent.kind === "unlink_agent" && (r.status === "preparing" || r.status === "approval_required")) {
+      delete r.approval; r.lastError = "registry_unlink_unsupported"; await journal.transition(r, "cancelled");
+    }
     for (const r of journal.data.records.filter(r => ownsNonce(r.status))) {
       if (r.status === "signed") continue; // No network submission was started; exact bytes remain retryable.
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
@@ -106,18 +135,35 @@ export class WalletService {
         const gas = r.intent.gasToken === "native" ? receipt.actualGasCost : BigInt(r.reservation[r.intent.gasToken] ?? "0") - input - replacementGas;
         if (gas < 0n) throw new WalletError("wallet_recovery_required", "Invalid persisted gas reservation");
         addSpend(spend, r.intent.gasToken, gas);
+        if (receipt.registryError) r.lastError = receipt.registryError;
         r.consumed = spend; r.consumedAt = Date.now(); r.transactionHash = receipt.transactionHash;
         await journal.transition(r, receipt.success ? "confirmed" : "reverted");
       } catch (error) {
-        if (error instanceof WalletError && rpcOutage(error) === error) throw error;
+        if (error instanceof WalletError) throw error;
         if (r.status === "submitted") await journal.transition(r, "submission_unknown");
       }
     }
   }
+  /**
+   * Connections are permanent: an unlink an earlier build signed is never sent, whatever the current policy says.
+   * Checked before policy, so the refusal names the only way to free the nonce it holds.
+   */
+  private refuseUnlink(r: OperationRecord): void {
+    if (r.intent.kind === "unlink_agent") throw new WalletError("registry_unlink_unsupported", `Agent connections are permanent; this wallet does not unlink agents. Signed request ${r.requestId} cannot be sent but still holds the account nonce, so first clear it with wallet operation resolve ${r.requestId} --replace in your local terminal`);
+  }
   private async submit(s: WalletSession, journal: Journal, r: OperationRecord): Promise<void> {
+    this.refuseUnlink(r);
     await this.canSubmit(s, r);
     if (!r.operation || !r.userOpHash) throw new WalletError("wallet_recovery_required", "Signed operation is missing");
-    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", "Signed swap deadline expired; review a same-nonce replacement with wallet operation resolve --replace");
+    if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", `Signed operation deadline expired; review a same-nonce replacement with wallet operation resolve ${r.requestId} --replace in your local terminal`);
+    // A registry request signed under pins this release no longer approves, or before a release without the registry,
+    // cannot be sent; approving new pins waits for its nonce, so only a same-nonce replacement clears it.
+    if (isRegistryIntent(r.intent)) try { assertRegistryApproved(this.ctx.config, s.envelope); } catch (error) {
+      if (!(error instanceof WalletError)) throw error;
+      if (error.code === "capability_manifest_unapproved") throw new WalletError(error.code, `Registry request ${r.requestId} was signed before this release changed the Agent Registry pins, so it cannot be sent. Clear it with wallet operation resolve ${r.requestId} --replace in your local terminal, then run wallet capabilities approve`);
+      if (error.code === "registry_unavailable") throw new WalletError(error.code, `Registry request ${r.requestId} was signed, but this release does not include the Agent Registry, so it cannot be sent. Clear it with wallet operation resolve ${r.requestId} --replace in your local terminal`);
+      throw error;
+    }
     // An RPC or bundler outage while rechecking says nothing about the signed bytes, so the same request ID stays usable.
     const recheck = () => this.revalidate(s, journal, r).catch((error: unknown) => { throw rpcOutage(error); });
     await recheck();
@@ -140,7 +186,7 @@ export class WalletService {
     }
     await journal.transition(r, "submitted");
   }
-  async send(kind: "transfer" | "swap", args: Record<string, unknown>, prepareOnly = false) {
+  async send(kind: Intent["kind"], args: Record<string, unknown>, prepareOnly = false) {
     const requestId = z.string().uuid().parse(args.request_id).toLowerCase();
     let response = await this.store.session(async s => {
       const limits = await this.enabled(s);
@@ -148,7 +194,10 @@ export class WalletService {
       const intent = intentSchema.parse(await this.chain.normalize(kind, args).catch((error: unknown) => { throw rpcOutage(error); }));
       let r = journal.data.records.find(r => r.requestId === requestId);
       if (r && r.intentHash !== digest(intent)) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different intent");
+      // A finished request is returned as it is; only work that can still spend needs the strict settlement recheck.
+      if (r && terminal(r.status)) return result(r);
       await this.reconcile(journal);
+      // Reconciliation may have just settled it, so it is returned rather than prepared again.
       if (r && terminal(r.status)) return result(r);
       if (r && ownsNonce(r.status)) {
         if (prepareOnly) return result(r);
@@ -157,30 +206,45 @@ export class WalletService {
         if (args.wait_for_confirmation === true) await confirmationRead(() => this.reconcile(journal));
         return result(r);
       }
-      if (journal.data.records.some(r => ownsNonce(r.status))) throw new WalletError("operation_pending", "An unresolved operation owns the account nonce; reconcile it first");
+      const holder = journal.data.records.find(o => ownsNonce(o.status));
+      if (holder) throw mainNoncePending(holder, "retry this request");
+      // Rejected new registry requests must not consume journal capacity. An existing record is checked below, where a failure closes it.
+      const existing = !!r;
+      if (!existing && intent.kind === "link_agent") {
+        // Reusing one Portal approval under new request IDs must not be able to fill the journal,
+        // so attempts are counted per approval rather than per intent (which varies with gas token).
+        const approval = digest(intent.registryApproval);
+        const attempts = journal.data.records.filter(o => o.intent.kind === "link_agent" && digest(o.intent.registryApproval) === approval);
+        const open = attempts.find(o => !terminal(o.status));
+        if (open) throw new WalletError("operation_pending", `Request ${open.requestId} already holds this Portal approval; retry with that request ID`);
+        if (attempts.length >= MAX_LINK_ATTEMPTS) throw new WalletError("policy_denied", "This Portal approval has been tried too many times; obtain a fresh approval");
+      }
+      if (!existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
       if (r?.status === "approval_required") {
-        if (r.lastError === "rpc_unavailable") delete r.lastError;
+        if (TEMPORARY_ERRORS.includes(r.lastError ?? "")) delete r.lastError;
         if (r.approval && r.approval.expiresAt <= Date.now()) { await journal.transition(r, "expired"); return result(r); }
         await journal.transition(r, "preparing");
       }
       r ??= await journal.create(requestId, intent);
       try {
+        if (existing && isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent);
         const state = await this.chain.state(s.envelope);
         const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits));
         const used = journal.used();
         // First policy evaluation precedes building; violations may build an unsigned review candidate.
         const initialSpend: Spend = {}; addSpend(initialSpend, intent.token, BigInt(intent.amount));
-        const initial = policyViolations(limits, { token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: initialSpend, used, balances, gasCost: 0n, fee: 0n, gasUnits: 0n, gasToken: intent.gasToken, gasCharge: 0n, calls: [] });
+        const initial = policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: initialSpend, used, balances, gasCost: 0n, fee: 0n, gasUnits: 0n, gasToken: intent.gasToken, gasCharge: 0n, calls: [] });
         if (kind === "swap") await this.chain.verifySwap(s.envelope, intent, limits, state);
         if (r.approval && !this.approved(s, r)) delete r.approval;
         if (!r.approval) {
+          if (kind === "link_agent") r.deadline = Number(intent.registryApproval!.parent_deadline);
           if (kind === "swap") r.deadline = Math.min(Math.floor(Date.now() / 1000), state.timestamp) + SWAP_DEADLINE_SECONDS;
           const built = await this.chain.build(s.envelope, intent, state, r.deadline);
           r.operation = userOpToJson(built.op); r.userOpHash = built.userOpHash; r.nonce = built.op.nonce.toString();
         }
         const validated = validateOperation(this.ctx.config, s.envelope, intent, r.operation!, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash!, deadline: r.deadline });
-        const violations = [...new Set([...initial, ...policyViolations(limits, { token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls })])];
-        for (const [token, amount] of Object.entries(validated.spend)) if (BigInt(balances[token] ?? "0") < BigInt(amount)) throw new WalletError("policy_denied", "Insufficient input balance plus maximum gas payment");
+        const violations = [...new Set([...initial, ...policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls })])];
+        if (Object.entries(validated.spend).some(([token, amount]) => BigInt(balances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "Insufficient input balance plus maximum gas payment beside other pending operations");
         r.reservation = validated.spend;
         await this.chain.simulate(validated);
         // Exposure must be addressed by configuring limits or reducing wallet funding.
@@ -194,29 +258,28 @@ export class WalletService {
         const fresh = await this.chain.state(s.envelope);
         if (fresh.nonce !== state.nonce || fresh.deployed !== state.deployed) throw new WalletError("validation_failed", "Account state changed during build; use a new request ID after review");
         if (fresh.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Gas fee no longer covers the current base fee");
+        if (isRegistryIntent(intent)) await this.chain.verifyRegistry(s.envelope, intent, fresh);
         if (kind === "swap") await this.chain.verifySwap(s.envelope, intent, limits, fresh);
         const freshBalances = await this.chain.balances(s.envelope, this.balanceTokens(limits));
-        const finalViolations = policyViolations(limits, { token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used: journal.used(), balances: freshBalances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
+        const finalViolations = policyViolations(limits, { ...this.registryPolicy(intent), token: intent.token, tokenOut: intent.tokenOut, amount: intent.amount, to: intent.to, swap: kind === "swap", slippage: intent.slippageBps, spend: validated.spend, used: journal.used(), balances: freshBalances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
         if (finalViolations.includes("exposure_limit") || (finalViolations.length && (!r.approval || r.approval.liveTest))) {
           r.reasons = finalViolations; delete r.approval; await journal.transition(r, "approval_required"); return result(r);
         }
-        for (const [token, amount] of Object.entries(validated.spend)) if (BigInt(freshBalances[token] ?? "0") < BigInt(amount)) throw new WalletError("policy_denied", "Balance changed before signing");
+        if (Object.entries(validated.spend).some(([token, amount]) => BigInt(freshBalances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "Balance changed before signing");
         if (prepareOnly || (!this.signingEnabled && !this.liveTestApproved(s, r))) {
           r.reasons = ["release_test_approval_required"]; await journal.transition(r, "approval_required"); return result(r);
         }
         await this.canSubmit(s, r);
         if (r.approval && r.approval.expiresAt <= Date.now()) throw new WalletError("approval_required", "Exact-operation approval expired before signing");
-        if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("validation_failed", "Swap deadline is too close");
-        const privateKey = unlockWallet(this.ctx.config, s.envelope, s.wrappingKey);
-        try {
-          // viem requires a hex string; V8 cannot guarantee zeroization of that temporary.
-          r.operation!.signature = await privateKeyToAccount(`0x${privateKey.toString("hex")}`).signMessage({ message: { raw: validated.hash } });
-        } finally { privateKey.fill(0); }
+        if (r.deadline && r.deadline <= Math.floor(Date.now() / 1000) + MIN_SWAP_REMAINING_SECONDS) throw new WalletError("validation_failed", "Operation deadline is too close");
+        r.operation!.signature = await this.signRaw(s, validated.hash);
         await this.canSubmit(s, r);
         await journal.transition(r, "signed"); // fsync completes before any submission.
       } catch (error) {
+        // An RPC outage says nothing about the request, so its ID and any local approval stay usable.
         const mapped = rpcOutage(error), failure = mapped instanceof WalletError ? mapped : undefined;
-        if (r.status === "preparing" && failure?.code === "rpc_unavailable") { r.lastError = failure.code; if (!r.approval) delete r.reasons; await journal.transition(r, "approval_required"); }
+        // Without an approval the operation may have been rebuilt, so earlier reasons may not describe it; a retry evaluates it again.
+        if (r.status === "preparing" && TEMPORARY_ERRORS.includes(failure?.code ?? "")) { r.lastError = failure!.code; if (!r.approval) delete r.reasons; await journal.transition(r, "approval_required"); }
         else if (r.status === "preparing") { r.lastError = failure?.code ?? "validation_failed"; await journal.transition(r, "failed"); }
         if (failure) throw failure;
         throw new WalletError("validation_failed", "Local operation preparation failed");
@@ -236,6 +299,115 @@ export class WalletService {
     }
     return response;
   }
+  private registryPolicy(intent: Intent) {
+    return isRegistryIntent(intent) ? { registryKind: intent.kind as "link_agent" | "unlink_agent", registryParent: intent.registryParent } : {};
+  }
+  async registryStatus(parent?: string) {
+    return this.store.session(s => this.chain.registryStatus(s.envelope, parent ? getAddress(parent) : undefined));
+  }
+  private agentLinkUrl(s: WalletSession) {
+    const cap = registryCapability(this.ctx.config), url = new URL(this.ctx.config.endpoints.portalUrl!);
+    url.searchParams.set("agent", s.envelope.account);
+    url.searchParams.set("chain_id", String(this.ctx.config.identity.chainId));
+    url.searchParams.set("registry", cap.proxy.address);
+    return url;
+  }
+  /** The Portal URL that asks the user to approve this agent's connection for link_agent. Reads only. */
+  async prepareAgentLink() {
+    return this.store.session(async s => {
+      const url = this.agentLinkUrl(s);
+      // A Portal approval for a wallet that cannot sign is unusable, so the user is not asked for one.
+      try {
+        const limits = await this.linkPolicy(s);
+        assertOutlastsApproval(limits);
+        if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot send link_agent. Use a release with signing enabled to connect this agent");
+        // Local refusals come before any registry read, so they hold whatever the RPC does.
+        assertRegistryApproved(this.ctx.config, s.envelope);
+        if (!limits.agentRegistry?.parents.length) throw new WalletError("registry_parent_not_allowed", "Local wallet policy allows no Portal account to connect this agent. Add one with incentiv-mcp setup in your local terminal, then call prepare_agent_link again");
+        // link_agent refuses a new request while another operation holds the nonce, and a Portal approval lasts minutes.
+        const journal = await Journal.open(s); await this.reconcile(journal);
+        const holder = journal.data.records.find(o => ownsNonce(o.status));
+        if (holder) throw mainNoncePending(holder, "call prepare_agent_link again");
+        const status = await this.chain.registryStatus(s.envelope);
+        const blocked = linkBlocker(status, status.deployed);
+        if (blocked) return linkRefusal(status, blocked);
+        // The policy can expire during the registry read.
+        assertOutlastsApproval(await this.linkPolicy(s));
+        return { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };
+      } catch (error) {
+        if (error instanceof WalletError && ["policy_not_configured", "wallet_locked", "policy_expired", "capability_manifest_unapproved", "registry_parent_not_allowed", "wallet_release_unreviewed", "operation_pending"].includes(error.code)) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
+        throw error;
+      }
+    });
+  }
+  private async linkPolicy(s: WalletSession): Promise<Limits> {
+    const limits = await this.enabled(s);
+    if (limits.expiresAt && limits.expiresAt <= Date.now()) throw new WalletError("policy_expired", "Local wallet policy has expired. Renew it with incentiv-mcp setup in your local terminal");
+    return limits;
+  }
+  /**
+   * The local conditions for signing link consent to `parent`, each refused with a WalletError: an enabled
+   * policy that allows the parent, a release that may sign, an approved registry capability, and no
+   * registry request that may still land. Requests that only await approval are returned as `queued`.
+   */
+  private async linkConsentChecks(s: WalletSession, parent: string) {
+    const limits = await this.linkPolicy(s);
+    if (!registryParentAllowed(limits, parent)) throw new WalletError("registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call sign_agent_link again");
+    if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent or send link_agent. Use a release with signing enabled to connect this agent");
+    assertRegistryApproved(this.ctx.config, s.envelope);
+    // Settle requests that already landed, so a confirmed link is not reported as still unresolved.
+    const journal = await Journal.open(s); await this.reconcile(journal);
+    const registry = journal.data.records.filter(r => isRegistryIntent(r.intent) && !terminal(r.status));
+    // A link or unlink that may still land would change this agent's registry nonce, voiding any consent signed now.
+    const pending = registry.find(r => ownsNonce(r.status));
+    // A signed request, or one the network may have dropped, settles only when it is sent again or replaced.
+    const resendable = pending?.status === "signed" || pending?.status === "submission_unknown";
+    if (resendable && pending.deadline && pending.deadline <= Math.floor(Date.now() / 1000)) throw new WalletError("operation_pending", `Registry request ${pending.requestId} was ${pending.status === "signed" ? "signed but never submitted" : "never confirmed"}, and its deadline has passed. Resolve it with wallet operation resolve ${pending.requestId} --replace in your local terminal, then call sign_agent_link again`);
+    // An unlink recorded by an earlier build is never sent again, so only a same-nonce replacement clears it.
+    if (pending?.intent.kind === "unlink_agent" && pending.status === "signed") throw new WalletError("operation_pending", `Registry request ${pending.requestId} is an unlink signed by an earlier build, which this wallet no longer sends. Clear it with wallet operation resolve ${pending.requestId} --replace in your local terminal, then call sign_agent_link again`);
+    if (pending?.intent.kind === "unlink_agent" && pending.status === "submission_unknown") throw new WalletError("operation_pending", `Registry request ${pending.requestId} is an unlink from an earlier build that was submitted but never confirmed. Check it with get_agent_operation; if it does not confirm, clear it with wallet operation resolve ${pending.requestId} --replace in your local terminal, then call sign_agent_link again`);
+    if (pending?.status === "signed") throw new WalletError("operation_pending", `Registry request ${pending.requestId} is signed but was never submitted. Retry link_agent with that request_id to submit it, then call sign_agent_link again`);
+    if (pending?.status === "submission_unknown") throw new WalletError("operation_pending", `Registry request ${pending.requestId} was submitted but has not been confirmed and may have been dropped. Retry link_agent with that request_id to send it again, check it with get_agent_operation, then call sign_agent_link again`);
+    if (pending) throw new WalletError("operation_pending", `Registry request ${pending.requestId} is still unresolved. Check it with get_agent_operation until it settles, then call sign_agent_link again`);
+    // An unlink from an earlier build that awaits approval can never be approved now, so it cannot land.
+    return { limits, queued: registry.filter(r => r.intent.kind !== "unlink_agent").map(r => r.requestId) };
+  }
+  /**
+   * This agent's own AgentLink consent to `parent`, in a Portal URL, so Portal can submit the link from the
+   * parent's account once the user trusts this agent. That needs the same authenticated local policy as
+   * link_agent: the parent must be allowed, and the wallet enabled for signing. The signature names this one
+   * parent, which still has to send the link itself, so it gives nobody else a way to link this agent. It
+   * expires no later than the local policy, and nothing here can withdraw it before then.
+   */
+  async signAgentLink(parent: string) {
+    return this.store.session(async s => {
+      const url = this.agentLinkUrl(s), requested = getAddress(parent);
+      // Local checks decide before any registry read, and their refusals take the same shape as the registry's.
+      let local: Awaited<ReturnType<WalletService["linkConsentChecks"]>>;
+      try { local = await this.linkConsentChecks(s, requested); } catch (error) {
+        if (error instanceof WalletError && LINK_CONSENT_REFUSALS.includes(error.code)) return linkRefusal({ agent: s.envelope.account, requested_parent: requested }, [error.code, error.detail]);
+        throw error;
+      }
+      const { limits, queued } = local;
+      // How soon the policy ends is decided against the block's clock, with the deadline, in agentLinkConsent.
+      const { status, blocked, consent } = await this.chain.agentLinkConsent(s.envelope, requested, limits.expiresAt ? Math.floor(limits.expiresAt / 1000) : undefined);
+      if (blocked) return linkRefusal(status, blocked);
+      // The registry checks a signature through the agent account's ERC-1271, so an undeployed agent cannot consent this way.
+      if (!consent) return { ...status, link_blocked: "registry_agent_not_deployed", next_action: "This agent is not deployed yet, so it cannot sign link consent. Call prepare_agent_link and use the Portal approval flow with link_agent instead." };
+      await this.canSubmit(s);
+      const signature = await this.signRaw(s, consent.digest);
+      await this.chain.verifyAgentLinkSignature(s.envelope, consent.digest, signature, consent.block);
+      // As for operations, the wallet must still be enabled and owned once the signature exists.
+      await this.canSubmit(s);
+      url.searchParams.set("parent", requested);
+      url.searchParams.set("agent_nonce", consent.nonce.toString());
+      url.searchParams.set("agent_deadline", consent.deadline.toString());
+      url.searchParams.set("agent_signature", signature);
+      return { ...status, portal_url: url.href, agent_signed: true, agent_link: { parent: requested, agent_nonce: consent.nonce.toString(), agent_deadline: consent.deadline.toString() },
+        ...(queued.length ? { warning: `Registry request ${queued.join(", ")} has not been sent yet. If it is later approved or retried and lands, it changes this agent's registry nonce and this consent stops working.` } : {}),
+        next_action: "Give this URL to the user and tell them the connection is permanent: once made, neither Portal nor this wallet offers a way to disconnect it. In Portal they trust this agent, then submit the connection from their account and pay its fee. Do not call link_agent. Check get_agent_registry_status afterwards. The request expires at agent_deadline, which is never later than local policy expiry, or earlier if this agent's registry nonce changes. Changing local policy does not withdraw it." };
+    });
+  }
   private balanceTokens(limits: Limits): string[] {
     return ["native", ...Object.keys(limits.tokens), ...Object.values(this.ctx.config.manifest.canonicalTokens).map(p => p.address), this.ctx.config.manifest.contracts.wcent.address];
   }
@@ -243,8 +415,8 @@ export class WalletService {
     return this.store.session(async s => {
       const journal = await Journal.open(s, !s.envelope.policy.configured);
       await this.reconcile(journal);
-      const state = await this.chain.state(s.envelope), policy = s.envelope.policy;
-      const balances = await this.chain.balances(s.envelope, policy.configured ? this.balanceTokens(policy.limits) : ["native"]);
+      const state = await this.chain.state(s.envelope).catch((error: unknown) => { throw rpcOutage(error); }), policy = s.envelope.policy;
+      const balances = await this.chain.balances(s.envelope, policy.configured ? this.balanceTokens(policy.limits) : ["native"]).catch((error: unknown) => { throw rpcOutage(error); });
       const reserved: Spend = {};
       for (const r of journal.data.records.filter(r => ownsNonce(r.status))) for (const [token, amount] of Object.entries(r.reservation)) addSpend(reserved, token, BigInt(amount));
       const spendable = Object.fromEntries(Object.entries(balances).map(([token, amount]) => [token, (BigInt(amount) > BigInt(reserved[token] ?? "0") ? BigInt(amount) - BigInt(reserved[token] ?? "0") : 0n).toString()]));
@@ -258,7 +430,9 @@ export class WalletService {
   async operation(id: string) {
     return this.store.session(async s => {
       const journal = await Journal.open(s); await this.reconcile(journal);
-      const r = journal.data.records.find(r => r.requestId === id.toLowerCase() || r.userOpHash === id.toLowerCase() || signedReplacements(r).some(c => c.userOpHash === id.toLowerCase()));
+      const key = id.toLowerCase();
+      const r = journal.data.records.find(r => r.requestId === key || r.userOpHash === key ||
+        r.replacement?.userOpHash === key || r.priorReplacement?.userOpHash === key);
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
       return result(r);
     });
@@ -291,17 +465,19 @@ export class WalletService {
       const r = journal.data.records.find(r => r.requestId === id);
       const retry = liveTest && !!r?.approval?.liveTest && (r.status === "signed" || r.status === "submission_unknown");
       if (!r || (r.status !== "approval_required" && !retry) || !r.operation || !r.userOpHash || digest(r) !== reviewedDigest) throw new WalletError("approval_required", "Review the current locally validated operation first");
+      assertNeedsApproval(r);
       if (r.reasons?.includes("exposure_limit")) throw new WalletError("policy_denied", "Change exposure limits interactively or reduce wallet funding first");
       if (liveTest && (r.intent.kind !== "transfer" || r.intent.gasToken !== "native" || r.replacement)) throw new WalletError("policy_denied", "Funded test approval only permits a transfer with native gas and no replacement");
       const state = await this.chain.state(s.envelope);
       const unsigned = { ...r.operation, signature: "0x" };
       const validated = validateOperation(this.ctx.config, s.envelope, r.intent, unsigned, { nonce: state.nonce, deployed: state.deployed, hash: r.userOpHash, deadline: r.deadline });
+      if (isRegistryIntent(r.intent)) await this.chain.verifyRegistry(s.envelope, r.intent, state);
       if (r.intent.kind === "swap") await this.chain.verifySwap(s.envelope, r.intent, limits, state);
       if (liveTest) {
         const balances = await this.chain.balances(s.envelope, this.balanceTokens(limits)), used = journal.used();
         // An exact retry already owns this reservation; do not count it twice.
         if (ownsNonce(r.status)) for (const [token, amount] of Object.entries(r.reservation)) addSpend(used, token, -BigInt(amount));
-        const violations = policyViolations(limits, { token: r.intent.token, amount: r.intent.amount, to: r.intent.to, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
+        const violations = policyViolations(limits, { ...this.registryPolicy(r.intent), token: r.intent.token, amount: r.intent.amount, to: r.intent.to, swap: false, slippage: 0, spend: validated.spend, used, balances, gasCost: validated.gasCost, fee: validated.op.maxFeePerGas, gasUnits: validated.gasUnits, gasToken: r.intent.gasToken, gasCharge: validated.gasCharge, calls: validated.calls });
         if (violations.length || Object.entries(validated.spend).some(([token, amount]) => BigInt(balances[token] ?? "0") < BigInt(amount))) throw new WalletError("policy_denied", "A funded test must satisfy every policy and balance limit; it cannot approve exceptions");
         if (state.fees.baseFeePerGas > validated.op.maxFeePerGas) throw new WalletError("validation_failed", "Reviewed gas fee no longer covers the current base fee");
       }
@@ -412,12 +588,55 @@ async function confirmationRead<T>(read: () => Promise<T>): Promise<T | undefine
   }
 }
 
+const MAX_LINK_ATTEMPTS = 8;
+/** Refusals that say nothing about the request itself, so an unsigned request returns to approval_required and keeps its ID. */
+const TEMPORARY_ERRORS = ["registry_rpc_unavailable", "rpc_unavailable", "registry_factory_not_allowed", "registry_parent_not_eligible", "registry_approval_outlasts_policy", "registry_limit_reached"];
+/** Registry refusals that the same signed bytes can never get past. */
+const UNSENDABLE_REGISTRY_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid", "registry_link_changed", "registry_unlink_unsupported",
+  // Connections are permanent, so an agent that is already linked, or an account role that forbids the link, does not change.
+  "registry_already_linked", "registry_ineligible"];
+const PORTAL_APPROVAL_ERRORS = ["registry_approval_stale", "registry_approval_expired", "registry_approval_invalid"];
+/** What an agent should do after the registry reverted its request; only a link's parent consent comes from a Portal approval. */
+function registryNextAction(kind: Intent["kind"], code: string) {
+  // Only an unlink recorded by an earlier build reaches this: connections are permanent, so it is never retried.
+  if (kind === "unlink_agent") return code === "registry_link_changed"
+    ? "This agent is no longer linked to that parent, so there was nothing to unlink. Check get_agent_registry_status; no Portal approval is needed."
+    : `The registry refused this unlink (${code}). Connections are permanent and this wallet no longer sends unlinks; check get_agent_registry_status.`;
+  return PORTAL_APPROVAL_ERRORS.includes(code)
+    ? "Refresh registry status. Invalid or expired parent consent requires a fresh approval in Portal and a new request UUID."
+    : `The registry refused this link (${code}). Check get_agent_registry_status before asking the user for a fresh Portal approval with a new request UUID.`;
+}
 const GAS_FIXABLE_ERRORS = ["policy_denied", "simulation_failed", "validation_failed"];
 const nativeGasHint = (cfg: Config, gasToken: string) => gasToken === "native" ? "" : ` To pay gas in ${cfg.identity.nativeSymbol} instead, review again with --native-gas.`;
+
+/** Every policy exception records its reasons. Without any, a retry re-evaluates the request, so there is nothing to approve. */
+export function assertNeedsApproval(r: OperationRecord) {
+  if (r.status === "approval_required" && !r.reasons?.length) throw new WalletError("validation_failed", "This request does not need terminal approval; retry it with the same request ID");
+}
+
+const PORTAL_APPROVAL_WINDOW_SECONDS = 2 * AGENT_LINK_MIN_SECONDS;
+function assertOutlastsApproval(limits: Limits) {
+  if (limits.expiresAt && limits.expiresAt < Date.now() + PORTAL_APPROVAL_WINDOW_SECONDS * 1000) throw new WalletError("policy_expired", `Local wallet policy expires within ${PORTAL_APPROVAL_WINDOW_SECONDS / 60} minutes. A Portal approval lasts ${AGENT_LINK_MIN_SECONDS / 60} minutes from when it is signed, and link_agent refuses one that outlasts the policy. Renew it with incentiv-mcp setup in your local terminal`);
+}
+
+/** Why a new request cannot start while `holder` owns the account nonce, with the step that frees it. */
+function mainNoncePending(holder: OperationRecord, next: string) {
+  const id = holder.requestId;
+  // An unlink an earlier build recorded is never sent again, so only a same-nonce replacement frees the nonce.
+  if (holder.intent.kind === "unlink_agent" && holder.status === "signed") return new WalletError("operation_pending", `Request ${id} is an unlink signed by an earlier build, which this wallet no longer sends, and it holds the account nonce. Clear it with wallet operation resolve ${id} --replace in your local terminal, then ${next}`);
+  if (holder.intent.kind === "unlink_agent") return new WalletError("operation_pending", `Request ${id} is an unlink from an earlier build that holds the account nonce. Check it with get_agent_operation; if it does not confirm, clear it with wallet operation resolve ${id} --replace in your local terminal, then ${next}`);
+  return new WalletError("operation_pending", `Request ${id} owns the account nonce; check it with get_agent_operation until it settles, then ${next}`);
+}
 
 function result(r: OperationRecord) {
   const nativeGas = r.intent.gasToken === "native" && (r.status === "confirmed" || r.status === "reverted") && r.consumed?.native !== undefined
     ? (BigInt(r.consumed.native) - (r.status === "confirmed" && r.intent.token === "native" ? BigInt(r.intent.amount) : 0n)).toString() : undefined;
-  const retry = r.status === "approval_required" && r.lastError === "rpc_unavailable";
-  return { request_id: r.requestId, intent: r.intent, ...(retry ? { next_action: "A temporary RPC failure interrupted this request. Retry with the same request ID." } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, prior_replacement_user_op_hash: r.priorReplacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
+  const { registryApproval, ...publicIntent } = r.intent;
+  const intent = registryApproval ? { ...publicIntent, registryApproval: { ...registryApproval, parent_signature: "[redacted]" } } : publicIntent;
+  const eventMissing = r.status === "confirmed" && r.lastError === "registry_event_missing";
+  const registryError = eventMissing || (r.status === "reverted" && isRegistryIntent(r.intent) && r.lastError?.startsWith("registry_")) ? r.lastError : undefined;
+  const interrupted = r.status === "approval_required" && TEMPORARY_ERRORS.includes(r.lastError ?? "");
+  return { request_id: r.requestId, intent, registry_error: registryError, ...(eventMissing ? { next_action: "The operation succeeded on-chain but its registry event was not found. Check get_agent_registry_status before relying on this change." } : registryError ? { next_action: registryNextAction(r.intent.kind, registryError) } : interrupted ? { next_action: `${r.lastError === "registry_factory_not_allowed" ? "The Agent Registry does not currently allow this account's factory. Retry with the same request ID once it does, while the Portal approval is still valid" : r.lastError === "registry_parent_not_eligible" ? "The Agent Registry does not currently accept this Portal account as a parent. Retry with the same request ID once it does, while the Portal approval is still valid"
+      : r.lastError === "registry_limit_reached" ? "This Portal account has reached its agent limit. Retry with the same request ID if the limit changes, while the Portal approval is still valid"
+      : r.lastError === "registry_approval_outlasts_policy" ? "The Portal approval lasts past the local wallet policy's expiry. Once the user renews the policy with incentiv-mcp setup, retry with the same request ID while the Portal approval is still valid" : "A temporary RPC failure interrupted this request. Retry with the same request ID"}${r.reasons?.length ? "." : "; terminal approval is not needed."}` } : {}), status: r.status, user_op_hash: r.userOpHash, replacement_user_op_hash: r.replacement?.userOpHash, prior_replacement_user_op_hash: r.priorReplacement?.userOpHash, transaction_hash: r.transactionHash, actual_native_gas_cost_wei: nativeGas, reasons: r.status === "approval_required" ? r.reasons : undefined, attempts: r.attempts, last_error: ["confirmed", "reverted", "superseded"].includes(r.status) ? undefined : r.lastError };
 }

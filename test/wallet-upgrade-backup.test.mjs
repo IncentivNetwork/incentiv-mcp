@@ -3,7 +3,7 @@ import test from "node:test";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { MAINNET } from "../src/config.ts";
+import { MAINNET as PACKAGED, withoutAgentRegistry } from "../src/config.ts";
 import { previousImplementationConfig } from "../src/account-upgrade.ts";
 import { assertWalletNetwork } from "../src/network.ts";
 import { backupWallet, restoreWallet, reviewImplementationBackup } from "../src/wallet/backup.ts";
@@ -13,6 +13,8 @@ import { unlockWallet } from "../src/wallet/keystore.ts";
 import { WalletStore } from "../src/wallet/store.ts";
 import { fixture, limits, password, recipient } from "../scripts/wallet-pipeline-fixture.mjs";
 
+// Implementation upgrades target the current manifest without the registry capability.
+const MAINNET = withoutAgentRegistry(PACKAGED);
 const recovery = Buffer.from("PUBLIC_TEST_RECOVERY_UPGRADE_2026");
 const intent = { intentSchemaVersion: 1, kind: "transfer", token: "native", amount: "1000", gasToken: "native", to: recipient, slippageBps: 0, feeTier: 3000 };
 
