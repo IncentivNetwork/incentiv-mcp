@@ -325,7 +325,10 @@ export class WalletChain {
     const lanes = await Promise.all(this.clients.map(c => c.readContract({ address: entryPoint, abi: entryPointAbi, functionName: "getNonce", args: [sender, nonce >> 64n], blockNumber: head })));
     if (!same(lanes)) throw new Error("RPC nonces disagree");
     if (lanes[0] <= nonce) return;
-    const start = record.searchedBlock !== undefined ? BigInt(record.searchedBlock) + 1n : record.fromBlock !== undefined ? BigInt(record.fromBlock) : head > SEARCH_BLOCKS ? head - SEARCH_BLOCKS : 0n;
+    // A reorg can re-mine the operation below the block it was signed at, so the first pass starts a margin earlier.
+    // Its nonce is used once, so nothing older can match it.
+    const signedAt = record.fromBlock !== undefined ? BigInt(record.fromBlock) : undefined;
+    const start = record.searchedBlock !== undefined ? BigInt(record.searchedBlock) + 1n : signedAt !== undefined ? (signedAt > REORG_MARGIN_BLOCKS ? signedAt - REORG_MARGIN_BLOCKS : 0n) : head > SEARCH_BLOCKS ? head - SEARCH_BLOCKS : 0n;
     // Blocks only some RPCs could search, from a pass an RPC's log queries failed: they stay to be searched again by
     // every RPC, but discovery goes on past them, so a log outage on one RPC cannot strand a later receipt.
     const discovered = record.discoveredBlock !== undefined ? BigInt(record.discoveredBlock) : undefined;

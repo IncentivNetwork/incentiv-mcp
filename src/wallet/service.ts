@@ -580,7 +580,14 @@ export class WalletService {
     }
     const existing = journal.data.records.find(r => r.requestId === requestId);
     if (existing) {
-      if (existing.intent.kind !== "x402_payment" || existing.intent.x402!.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
+      if (existing.intent.kind !== "x402_payment" || existing.intent.x402!.request !== request) {
+        // A changed argument must not lead the agent to a new request ID while the bound payment can still settle.
+        // A signed payment never left this computer and expires unpaid.
+        const pending = existing.intent.kind === "x402_payment" && ownsNonce(existing.status) && existing.status !== "signed";
+        throw new WalletError("idempotency_conflict", pending
+          ? `This request ID is bound to a different request, whose payment is ${existing.status} and may still settle. Check get_agent_operation before buying again under a new request ID. ${X402_UNKNOWN_ACTION(existing.requestId)}`
+          : "This request ID is permanently bound to a different request");
+      }
       // Any send needs current wallet policy (checked in deliverX402): even after an uncertain attempt, the seller
       // may never have received the signature. A payment the seller may hold is resent unchanged.
       if (existing.status === "signed") return this.deliverX402(s, journal, existing, req, limits);
@@ -592,7 +599,7 @@ export class WalletService {
       // Whether an answer handed back earlier reached the caller is unknown here, so a retry may ask the seller again.
       if (existing.status === "submitted" || existing.status === "confirmed") return this.redeliverX402(s, journal, existing, req, limits);
       // Either the payment or its cancellation will take the nonce lane; a new request ID uses another lane, so both could pay.
-      if (existing.status === "superseding") return { ...x402Result(existing), next_action: "A cancellation of this payment is pending, and the payment itself may still settle instead. Check get_agent_operation and wait until it shows superseded (cancelled, nothing paid) or confirmed (paid; retry this request ID for the answer). Buying again with a new request ID before then may pay twice." };
+      if (existing.status === "superseding") return { ...x402Result(existing), next_action: `A cancellation of this payment is pending, and the payment itself may still settle instead. Check get_agent_operation and wait until it shows superseded (cancelled, nothing paid), reverted (the payment failed on chain, so the seller was not paid) or confirmed (paid; ${answerAdvice(req)}). Buying again with a new request ID before then may pay twice.` };
       return { ...x402Result(existing), next_action: "Use a new request ID to try again." };
     }
     if (!limits.x402) throw new WalletError("policy_denied", "x402 payments are off in local wallet policy; the user can enable them with incentiv-mcp setup");
@@ -766,7 +773,7 @@ export class WalletService {
         await this.chain.assertCanonicalSnapshot(state).catch(rethrowSnapshotError);
         await this.reopenX402Settlement(journal, r);
       }
-      return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The RPC no longer shows this payment's settlement: the chain reorganized, or the RPC is behind" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again, and retry this request ID for the answer once it shows confirmed. Nothing more was paid. ${X402_UNKNOWN_ACTION(r.requestId)}` };
+      return { ...x402Result(r), content_delivered: false, next_action: `${r.lastError === "x402_confirmation_rolled_back" ? "The RPC no longer shows this payment's settlement: the chain reorganized, or the RPC is behind" : "The seller reported settling this payment, but it is not on chain yet"}, so this wallet does not send it again. Check get_agent_operation before buying again; once it shows confirmed, ${answerAdvice(req)}. Nothing more was paid. ${X402_UNKNOWN_ACTION(r.requestId)}` };
     }
     if (replayable(req)) {
       // Asking again sends a request from this computer, so it needs current policy like any other x402 request.
@@ -912,7 +919,8 @@ export class WalletService {
       const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === id.toLowerCase() || a.userOpHash === id.toLowerCase());
       if (archived) return { request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archivedError(archived), archived: true };
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
-      return result(r);
+      // An x402 payment is shown as pay_x402_resource shows it, in USDC rather than atomic units.
+      return r.intent.kind === "x402_payment" ? x402Result(r) : result(r);
     });
   }
   async review(id?: string) {
@@ -1012,13 +1020,16 @@ export class WalletService {
       return { wallet: publicWallet(s.envelope), cutoff: new Date(cutoff).toISOString(), total: archive.length, journal_bytes: journal.bytes, clearable: clearable.length, request_ids: clearable.map(a => a.requestId) };
     });
   }
-  /** Clears exactly the reviewed archive entries, with the administration passphrase. Their request IDs could then pay again. */
-  async clearX402Archive(cutoff: number, passphrase: Buffer, reviewedDigest: Hex) {
+  /**
+   * Clears the reviewed archive entries that are still archived and older than the cutoff, with the administration
+   * passphrase. Their request IDs could then pay again. A payment archived after the review is left for the next one.
+   */
+  async clearX402Archive(cutoff: number, passphrase: Buffer, reviewed: readonly string[]) {
     return this.store.session(async s => {
       await authorize(s.envelope.policy, passphrase);
       const journal = await Journal.open(s); await this.reconcile(journal);
-      const ids = (journal.data.archived ?? []).filter(a => a.at <= cutoff).map(a => a.requestId);
-      if (digest(ids) !== reviewedDigest) throw new WalletError("approval_required", "Archived payments changed; review them again");
+      const shown = new Set(reviewed);
+      const ids = (journal.data.archived ?? []).filter(a => a.at <= cutoff && shown.has(a.requestId)).map(a => a.requestId);
       const cleared = new Set(ids);
       journal.data.archived = (journal.data.archived ?? []).filter(a => !cleared.has(a.requestId));
       journal.data.sequence++; await journal.save();
@@ -1216,6 +1227,8 @@ export function assertNeedsApproval(r: OperationRecord) {
 
 /** Whether a paid request may be sent again: a GET, or a POST the caller marked with an Idempotency-Key for the seller. */
 const replayable = (req: X402Request) => req.method === "GET" || !!req.headers["idempotency-key"]?.trim();
+/** What a retry can do for a paid answer: a POST without an Idempotency-Key is never sent again, even once paid. */
+const answerAdvice = (req: X402Request) => replayable(req) ? "retry this request ID for the answer" : "its answer can't be requested again, since this wallet does not resend a paid POST without an Idempotency-Key";
 
 /**
  * How long a paid request waits for its answer: longer than the stock facilitator's 60-second settle window, so a

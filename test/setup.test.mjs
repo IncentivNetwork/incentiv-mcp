@@ -7,7 +7,7 @@ import { encodeFunctionData, toFunctionSelector } from "viem";
 import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
-import { allowance, answer, policySummary, promptPolicy, setupTargets, technicalLimits } from "../src/setup-policy.ts";
+import { allowance, answer, policySummary, promptPolicy, promptX402, setupTargets, technicalLimits } from "../src/setup-policy.ts";
 import { connectionFor, clientConfigPath, mergeConnection, saveClientConfig, connectClient } from "../src/setup-client.ts";
 import { setupWallet, checkRuntime } from "../src/setup.ts";
 import { parseWalletProfileArgs } from "../src/wallet-profile.ts";
@@ -330,4 +330,13 @@ test("setup does not ask for Portal accounts on a wallet that has not approved t
   assert.equal(policy.agentRegistry, undefined); assert.equal(replies.length, 0);
   assert.ok(!asked.some(q => /Portal accounts/.test(q)));
   assert.ok(told.some(m => /run wallet capabilities approve, then rerun setup/.test(m)));
+});
+
+test("setup says why x402 stays off instead of skipping it silently", async () => {
+  const told = [], tell = text => told.push(text), ask = async () => { throw new Error("must not ask"); };
+  const usdc = MAINNET.manifest.canonicalTokens.USDC.address;
+  assert.equal(await promptX402({ ...MAINNET, identity: { ...MAINNET.identity, chainId: 1 } }, { tokens: { [usdc]: { perTransaction: "1" } } }, ask, tell), undefined);
+  assert.match(told.pop(), /only on Incentiv Mainnet/);
+  assert.equal(await promptX402(MAINNET, { tokens: {} }, ask, tell), undefined);
+  assert.match(told.pop(), /need a USDC limit/);
 });

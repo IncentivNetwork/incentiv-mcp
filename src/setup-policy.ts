@@ -109,7 +109,8 @@ export function withoutUnlink(_config: Config, limits: Limits): Limits {
  */
 export async function promptX402(config: Config, limits: Pick<Limits, "tokens">, ask: Ask, tell: Tell): Promise<Limits["x402"]> {
   const usdc = config.manifest.canonicalTokens.USDC?.address;
-  if (config.identity.chainId !== 24101 || !usdc || !Object.keys(limits.tokens).some(token => token.toLowerCase() === usdc.toLowerCase())) return undefined;
+  if (config.identity.chainId !== 24101 || !usdc) { tell("x402 payments are available only on Incentiv Mainnet, so they stay off."); return undefined; }
+  if (!Object.keys(limits.tokens).some(token => token.toLowerCase() === usdc.toLowerCase())) { tell("x402 payments need a USDC limit, so they stay off; add USDC to the token limits to allow them."); return undefined; }
   tell("x402 lets this agent pay websites and APIs per request in USDC. Each payment also counts against the USDC limits above, and gas (about 0.03 USDC) is paid on top.");
   // Every payment also has to pass the USDC input limit per operation, so a higher x402 maximum would never apply.
   const cap = BigInt(Object.entries(limits.tokens).find(([token]) => token.toLowerCase() === usdc.toLowerCase())![1].perTransaction);

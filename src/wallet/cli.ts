@@ -152,7 +152,7 @@ async function clearX402Archive(service: WalletService, days = "90") {
   console.error("Each archived payment keeps its request ID from paying again. Once cleared, an agent that retries one of these request IDs pays again, and get_agent_operation no longer finds them.");
   if (await textPrompt("Type CLEAR ARCHIVE to clear these archived payments: ") !== "CLEAR ARCHIVE") throw new WalletError("policy_denied", "Action cancelled");
   const administration = await secretPrompt("Administration passphrase: ");
-  try { console.error(JSON.stringify(await service.clearX402Archive(cutoff, administration, digest(ids)), null, 2)); }
+  try { console.error(JSON.stringify(await service.clearX402Archive(cutoff, administration, ids), null, 2)); }
   finally { administration.fill(0); }
 }
 

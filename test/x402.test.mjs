@@ -840,9 +840,12 @@ test("ended x402 payments are archived after two days with their hashes, and sta
   // Only the user frees it, with the administration passphrase, after reviewing exactly what is cleared.
   const cutoff = Date.now() - 90 * 86_400_000, review = await f.service.x402Archive(cutoff);
   assert.deepEqual(review.request_ids, [id]);
-  await assert.rejects(f.service.clearX402Archive(cutoff, password, digest([])), { code: "approval_required" });
-  await assert.rejects(f.service.clearX402Archive(cutoff, Buffer.from("wrong administration password"), digest(review.request_ids)));
-  assert.equal((await f.service.clearX402Archive(cutoff, password, digest(review.request_ids))).cleared, 1);
+  // Only reviewed entries are cleared: one archived after the review waits for the next.
+  assert.equal((await f.service.clearX402Archive(cutoff, password, [])).cleared, 0);
+  assert.equal((await f.service.clearX402Archive(cutoff, password, [randomUUID()])).cleared, 0);
+  await assert.rejects(f.service.clearX402Archive(cutoff, Buffer.from("wrong administration password"), review.request_ids));
+  assert.equal((await journal()).archived.length, 1);
+  assert.equal((await f.service.clearX402Archive(cutoff, password, review.request_ids)).cleared, 1);
   await assert.rejects(f.service.operation(id), { code: "operation_not_found" });
   assert.equal((await journal()).archived.length, 0);
 });
@@ -981,7 +984,7 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   assert.equal(calls.logs.length, 0);
   ({ chain, calls } = make(true));
   assert.deepEqual(await chain.receipt({ ...record, transactionHash: wrong }), expected);
-  assert.deepEqual([...new Set(calls.logs.map(String))], ["500,1000"]); // Every RPC searches forward from the block it was signed at.
+  assert.deepEqual([...new Set(calls.logs.map(String))], ["372,1000"]); // Every RPC searches forward from a reorg margin below the block it was signed at.
   ({ chain, calls } = make(true));
   assert.deepEqual(await chain.receipt(record), expected);
   // A stale bundler hash, one that fails verification or is no longer found, falls through to the other sources.
@@ -993,14 +996,14 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   chain.bundlerHint = async () => wrong;
   for (const client of chain.clients) { const get = client.getTransactionReceipt; client.getTransactionReceipt = async a => { if (a.hash === wrong) throw new Error("not found"); return get(a); }; }
   assert.deepEqual(await chain.receipt(record), expected);
-  assert.deepEqual([...new Set(calls.logs.map(String))], ["500,1000"]); // Every RPC searches the same range.
+  assert.deepEqual([...new Set(calls.logs.map(String))], ["372,1000"]); // Every RPC searches the same range.
   ({ chain, calls } = make(false));
   assert.equal(await chain.receipt(record), undefined);
   assert.equal(calls.logs.length, 0);
   // A payment settled more than one search window after it was signed is reached over several attempts: each
-  // covers a bounded range forward from the signing block and records its progress, short of the head.
+  // covers a bounded range forward from a reorg margin below the signing block and records its progress, short of the head.
   ({ chain, calls } = make(true, 3_000_000n, 1_500_000n));
-  const old = { ...record, fromBlock: "100" };
+  const old = { ...record, fromBlock: "228" }; // Searched from block 100, a reorg margin earlier.
   assert.equal(await chain.receipt(old), undefined);
   // One pass searches at most 100,000 blocks while it holds the wallet lock; later passes continue from there.
   assert.equal(old.searchedBlock, "100099");
@@ -1130,7 +1133,10 @@ test("operation results never carry the seller's raw terms, and an interrupted p
   const f = await x402Fixture(t), id = randomUUID();
   await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
   const shown = await f.service.operation(id);
-  assert.equal(shown.intent.x402.accepted, undefined); assert.equal(shown.intent.x402.resource, undefined);
+  assert.equal(shown.intent.accepted, undefined); assert.equal(shown.intent.resource, undefined);
+  assert.ok(!JSON.stringify(shown).includes("Weather"));
+  // get_agent_operation shows a payment as pay_x402_resource does: in USDC, with the seller as pay_to.
+  assert.equal(shown.intent.amount, "0.05"); assert.equal(shown.intent.maxAmount, "0.05"); assert.ok(shown.intent.pay_to);
   assert.ok(!JSON.stringify(await f.service.get()).includes("Weather"));
   await f.store.session(async s => { const journal = await Journal.open(s); const r = journal.data.records[0]; r.status = "preparing"; await journal.save(); });
   assert.equal((await f.service.operation(id)).status, "failed");
@@ -1400,7 +1406,7 @@ test("the receipt search reads every RPC, tries each distinct transaction, and n
   const orphaned = { ...record };
   const staleLog = { transactionHash: stale, blockNumber: at, blockHash: `0x${"dd".repeat(32)}` };
   assert.equal(await chain(client([staleLog], undefined, at, 200_000n)).searchOperation(orphaned), undefined);
-  assert.equal(orphaned.searchedBlock, "100499");
+  assert.equal(orphaned.searchedBlock, "100371");
 
   // A log API outage should not block a receipt that both RPCs can verify.
   let failedQueries = 0;
@@ -1784,16 +1790,16 @@ test("a receipt beyond the first search window is found while another RPC's log 
   chain.clients = [client("fails"), client([{ transactionHash: tx }])];
   chain.bundlerHint = async () => undefined;
   const record = { requestId: randomUUID(), intent: { kind: "x402_payment" }, userOpHash, nonce: nonce.toString(), fromBlock: "500", operation: { sender, paymaster } };
-  // The first pass covers blocks 500 to 100499 on the working RPC only: the verified cursor stays, discovery moves on.
+  // The first pass covers blocks 372 to 100371 on the working RPC only: the verified cursor stays, discovery moves on.
   assert.equal(await chain.searchOperation(record), undefined);
-  assert.equal(record.searchedBlock, undefined); assert.equal(record.discoveredBlock, "100499");
+  assert.equal(record.searchedBlock, undefined); assert.equal(record.discoveredBlock, "100371");
   // The next pass continues discovery and finds the receipt, which every RPC still verifies.
   assert.deepEqual(await chain.searchOperation({ ...record }), { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: at, blockHash });
   // Once the failing RPC recovers, the incomplete range is searched again by every RPC and the discovery cursor retires.
   failing = false;
   chain.clients = [client("fails"), client([])];
   assert.equal(await chain.searchOperation(record), undefined);
-  assert.equal(record.searchedBlock, "100499"); assert.equal(record.discoveredBlock, undefined);
+  assert.equal(record.searchedBlock, "100371"); assert.equal(record.discoveredBlock, undefined);
 });
 
 test("the cheapest usable payment option is chosen", async t => {
@@ -1877,7 +1883,7 @@ test("an unresolvable old log does not keep the receipt search from a later veri
   const record = { requestId: randomUUID(), intent: { kind: "x402_payment" }, userOpHash, nonce: nonce.toString(), fromBlock: "500", operation: { sender, paymaster } };
   assert.equal(await chain.searchOperation(record), undefined);
   // The old candidate is kept for retry, and the search moves past it.
-  assert.equal(record.searchedBlock, "100499");
+  assert.equal(record.searchedBlock, "100371");
   assert.deepEqual(record.retryLogs, [{ transactionHash: stale, blockNumber: "990", blockHash: `0x${"dd".repeat(32)}` }]);
   assert.deepEqual(await chain.searchOperation({ ...record }), { success: true, actualGasCost: 1234n, transactionHash: tx, blockNumber: at, blockHash });
 });
@@ -1958,7 +1964,7 @@ test("a failed log chunk preserves earlier receipt candidates with the search cu
   f.chain.bundlerHint = async () => undefined;
   assert.equal((await f.service.operation(id)).status, "submitted");
   const [saved] = await f.records();
-  assert.equal(saved.searchedBlock, "5000");
+  assert.equal(saved.searchedBlock, "4999");
   assert.equal(saved.retryLogs[0].transactionHash, tx);
   recovering = true;
   ranges.length = 0;
@@ -2104,7 +2110,7 @@ test("receipt discovery falls back to an excluded RPC for the failing range", as
   const head = 20_000n, at = 6_000n;
   const hash = n => `0x${n.repeat(64)}`;
   const tx = hash("a"), blockHash = hash("b");
-  const record = { intent: { kind: "x402_payment" }, userOpHash: hash("1"), nonce: "0", fromBlock: "500", operation: { sender: seller } };
+  const record = { intent: { kind: "x402_payment" }, userOpHash: hash("1"), nonce: "0", fromBlock: "628", operation: { sender: seller } }; // Searched from 500.
   const reads = [];
   const client = (name, refuse) => ({
     getBlockNumber: async () => head,
@@ -2600,4 +2606,53 @@ test("an archived settled payment does not report an earlier delivery error", as
   await f.store.session(async s => { const j = await Journal.open(s); j.data.archived.find(a => a.requestId === id).lastError = "x402_payment_refused"; await j.save(); });
   assert.equal((await f.service.operation(id)).last_error, undefined);
   assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).last_error, undefined);
+});
+
+test("a payment re-mined below the block it was signed at after a reorg is still found", async () => {
+  const event = parseAbiItem("event UserOperationEvent(bytes32 indexed userOpHash, address indexed sender, address indexed paymaster, uint256 nonce, bool success, uint256 actualGasCost, uint256 actualGasUsed)");
+  const sender = "0x30a343d137ed0492d9d7ad25fc55590d807629b3", userOpHash = `0x${"77".repeat(32)}`, nonce = 5n << 64n;
+  const tx = `0x${"aa".repeat(32)}`, blockHash = `0x${"cc".repeat(32)}`;
+  const log = { address: entryPoint, topics: encodeEventTopics({ abi: [event], eventName: "UserOperationEvent", args: { userOpHash, sender, paymaster } }), data: encodeAbiParameters([{ type: "uint256" }, { type: "bool" }, { type: "uint256" }, { type: "uint256" }], [nonce, true, 1234n, 1n]) };
+  // Signed at block 500; a reorg re-mines it at 498 on the new chain, and no bundler or seller hint is left.
+  const at = 498n;
+  for (const head of [500n, 600n]) {
+    const ranges = [];
+    const client = {
+      getBlockNumber: async () => head,
+      getBlock: async () => ({ hash: blockHash }),
+      readContract: async () => nonce + 1n,
+      getLogs: async ({ fromBlock, toBlock }) => { ranges.push([fromBlock, toBlock]); return fromBlock <= at && at <= toBlock ? [{ transactionHash: tx, blockNumber: at, blockHash }] : []; },
+      getTransactionReceipt: async ({ hash }) => ({ status: "success", blockHash, blockNumber: at, transactionHash: hash, logs: hash === tx ? [log] : [] }),
+    };
+    const chain = new WalletChain(new Ctx(MAINNET));
+    chain.clients = [client, client];
+    chain.bundlerHint = async () => undefined;
+    const record = { requestId: randomUUID(), intent: { kind: "x402_payment" }, userOpHash, nonce: nonce.toString(), fromBlock: "500", operation: { sender, paymaster } };
+    assert.equal((await chain.receipt(record))?.transactionHash, tx, `head ${head}`);
+    assert.equal(ranges[0][0], 372n, `head ${head}`);
+  }
+});
+
+test("a retry only promises an answer that the wallet will fetch again", async t => {
+  for (const [method, extra, promised] of [["GET", {}, true], ["POST", { body: "{}" }, false], ["POST", { body: "{}", headers: { "Idempotency-Key": "k1" } }, true]]) {
+    const f = await x402Fixture(t), id = randomUUID(), args = { url: URL_, method, max_amount: "0.05", request_id: id, ...extra };
+    assert.equal((await f.service.payX402(args)).status, "submitted");
+    // The seller reported settling, but the lane is still unused, so the retry waits.
+    const early = await f.service.payX402(args);
+    assert.equal(early.content_delivered, false);
+    assert.equal(/retry this request ID for the answer/.test(early.next_action), promised, `${method} ${JSON.stringify(extra)}`);
+    if (!promised) assert.match(early.next_action, /can't be requested again/);
+  }
+});
+
+test("a conflicting retry of a payment that may still settle says so instead of inviting a new request ID", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  f.seen.fail = 1; // The seller never answers the paid request.
+  assert.equal((await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id })).status, "submission_unknown");
+  await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.06", request_id: id }),
+    e => e.code === "idempotency_conflict" && /submission_unknown and may still settle/.test(e.message) && new RegExp(`wallet operation resolve ${id} --replace`).test(e.message));
+  // A request ID bound to another kind of operation stays a plain conflict.
+  const transfer = randomUUID();
+  await f.service.send({ ...args, request_id: transfer }).catch(() => {});
+  if ((await f.records()).some(r => r.requestId === transfer)) await assert.rejects(f.service.payX402({ url: URL_, max_amount: "0.05", request_id: transfer }), e => e.code === "idempotency_conflict" && /permanently bound/.test(e.message));
 });
