@@ -159,6 +159,11 @@ const BUNDLER_RETRYABLE_CODES = [-32603, -32005];
 const bundlerRejection = (code: number, message: string, data: unknown) =>
   code === -32603 && ((typeof data === "string" && /^0x[0-9a-f]{8,}$/i.test(data)) || /revert|\bAA\d\d\b/i.test(message));
 
+/** ERC-4337 bundler codes that reject the operation itself; -32504 (a throttled or banned entity) is not one of them. */
+const BUNDLER_REJECTION_CODES = [-32500, -32501, -32502, -32503, -32505, -32506, -32507, -32508, -32521];
+/** Whether a busy status's RPC error still reports the operation's own rejection, rather than the bundler's state. */
+const reportsRejection = (error: { code: number; message: string; data?: unknown }) => BUNDLER_REJECTION_CODES.includes(error.code)
+  || /revert|\bAA\d\d\b/i.test(error.message) || (typeof error.data === "string" && /^0x[0-9a-f]{8,}$/i.test(error.data));
 const wellFormedRpcError = (error: unknown) => !!error && typeof error === "object" && "code" in error && Number.isInteger(error.code) && "message" in error && typeof error.message === "string";
 
 export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): Promise<unknown> {
@@ -183,8 +188,10 @@ export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): P
   if (!body || typeof body !== "object" || Array.isArray(body)) throw unreadable("Bundler answer is not an RPC response");
   // A success may carry "error": null, and an error may carry "result": null.
   const errorOnly = "error" in body && body.error != null && wellFormedRpcError(body.error) && (!("result" in body) || body.result === null);
-  // Some bundlers send a rejected operation's RPC error with HTTP 500, so a busy status is an outage only without one.
-  if ((busy || refused) && !errorOnly) throw unreadable("");
+  // Some bundlers send a rejected operation's RPC error with HTTP 500. Any other busy answer, a rate limiter's own
+  // error code included, and every 408 or 429, is an outage.
+  if (busy && !(errorOnly && res.status >= 500 && reportsRejection((body as { error: { code: number; message: string; data?: unknown } }).error))) throw unreadable("");
+  if (refused && !errorOnly) throw unreadable("");
   if ("error" in body && body.error != null) {
     const { error } = body;
     if (!errorOnly || !error || typeof error !== "object" || !("code" in error) || !Number.isInteger(error.code) ||

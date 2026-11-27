@@ -332,7 +332,7 @@ export class WalletChain {
     const heads = await Promise.all(this.clients.map(c => c.getBlockNumber({ cacheTime: 0 })));
     const head = heads.reduce((a, b) => a < b ? a : b);
     const lanes = await Promise.all(this.clients.map(c => c.readContract({ address: entryPoint, abi: entryPointAbi, functionName: "getNonce", args: [sender, nonce >> 64n], blockNumber: head })));
-    if (!same(lanes)) throw new Error("RPC nonces disagree");
+    if (!same(lanes)) throw new RpcDisagreementError("RPC nonces disagree");
     if (lanes[0] <= nonce) return;
     // A reorg can re-mine the operation below the block it was signed at, so the first pass starts a margin earlier.
     // Its nonce is used once, so nothing older can match it.

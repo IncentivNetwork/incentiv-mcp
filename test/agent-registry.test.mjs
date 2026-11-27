@@ -1611,6 +1611,12 @@ test("a bundler's internal or limit error during simulation keeps a new request 
     [() => new Response("not found", { status: 404 }), "rpc_unavailable", "404"],
     [rpc({ error: { code: -32001, message: "unauthorized" } }, 401), "rpc_unavailable", "401 rpc error"],
     [rpc({ result: null, error: { code: -32500, message: "AA23 reverted" } }), "simulation_failed", "result null"],
+    // A rate limiter or overloaded server uses its own codes; only a reported rejection fails the operation.
+    [rpc({ error: { code: 429, message: "exceeded compute units" } }, 429), "rpc_unavailable", "429 own code"],
+    [rpc({ error: { code: -32500, message: "AA23 reverted" } }, 429), "rpc_unavailable", "429 with a rejection code"],
+    [rpc({ error: { code: -32000, message: "server overloaded" } }, 503), "rpc_unavailable", "503 overloaded"],
+    [rpc({ error: { code: -32504, message: "paymaster throttled" } }, 503), "rpc_unavailable", "503 throttled"],
+    [rpc({ error: { code: -32521, message: "execution reverted" } }, 500), "simulation_failed", "500 execution reverted"],
   ]) {
     const f = await fixture(t), id = randomUUID();
     f.chain.clients.splice(0, f.chain.clients.length, { readContract: async () => ({ reject: 0 }) });

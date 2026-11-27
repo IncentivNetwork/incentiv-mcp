@@ -445,6 +445,8 @@ export class WalletService {
         const status = await this.chain.registryStatus(s.envelope);
         const blocked = linkBlocker(status, status.deployed);
         if (blocked) return linkRefusal(status, blocked);
+        // A pending payment would deploy an undeployed agent, and link_agent refuses to deploy it a second time.
+        assertDeploysOnce(status.deployed, journal);
         // The policy can expire during the registry read.
         assertOutlastsApproval(await this.linkPolicy(s));
         return { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };

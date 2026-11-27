@@ -2799,3 +2799,14 @@ test("reconciliation reads account state once for all signed payments", async t 
   assert.equal((await f.service.operation(ids[0])).status, "signed");
   assert.equal(reads, 1);
 });
+
+test("prepare_agent_link refuses while a pending payment would deploy the agent", async t => {
+  const f = await x402Fixture(t), id = randomUUID();
+  await f.service.payX402({ url: URL_, max_amount: "0.05", request_id: id });
+  assert.equal((await f.service.operation(id)).status, "submitted");
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, agentRegistry: { parents: ["0x00000000000000000000000000000000000000b2"], allowUnlink: false } } }));
+  f.chain.registryStatus = async () => ({ parent: "0x0000000000000000000000000000000000000000", agent_is_parent: false, agent_eligible: false, factory_allowed: true, deployed: false });
+  const refused = await f.service.prepareAgentLink();
+  assert.equal(refused.link_blocked, "operation_pending"); assert.equal(refused.portal_url, undefined);
+  assert.match(refused.next_action, new RegExp(id));
+});
