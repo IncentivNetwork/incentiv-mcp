@@ -1385,6 +1385,23 @@ test("prepare_agent_link gives no Portal URL to a wallet that cannot sign the li
   assert.equal(refused.link_blocked, "wallet_locked"); assert.equal(refused.portal_url, undefined); assert.match(refused.next_action, /Do not ask the user to sign/);
 });
 
+test("prepare_agent_link refuses an expired local policy before and after reading the registry", async t => {
+  const f = await fixture(t), now = Date.now, expiresAt = now() + 60_000;
+  await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt } }));
+  f.chain.registryStatus = async () => {
+    t.mock.method(Date, "now", () => expiresAt);
+    return { parent: zero, agent_is_parent: false, agent_eligible: false, factory_allowed: true, deployed: false };
+  };
+
+  const expiredDuringRead = await f.service.prepareAgentLink();
+  assert.equal(expiredDuringRead.link_blocked, "policy_expired");
+  assert.equal(expiredDuringRead.portal_url, undefined);
+  assert.match(expiredDuringRead.next_action, /Renew it with incentiv-mcp setup/);
+
+  f.chain.registryStatus = async () => assert.fail("an expired policy needs no registry read");
+  assert.deepEqual(await f.service.prepareAgentLink(), expiredDuringRead);
+});
+
 test("a token-paid replacement the bundler keeps refusing can be replaced once more with native gas, and either may still win", async t => {
   for (const winner of ["prior", "native", "original"]) {
     const f = await tokenRegistryFixture(t), id = randomUUID(), balances = f.chain.balances, args = { request_id: id, approval: f.approval, gas_token: "USDC" };

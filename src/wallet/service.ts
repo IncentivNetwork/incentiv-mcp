@@ -423,14 +423,23 @@ export class WalletService {
     return this.store.session(async s => {
       const url = this.agentLinkUrl(s);
       // A Portal approval for a wallet that cannot sign is unusable, so the user is not asked for one.
-      try { await this.enabled(s); } catch (error) {
-        if (error instanceof WalletError) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
+      try {
+        await this.linkPolicy(s);
+        const status = await this.chain.registryStatus(s.envelope);
+        const blocked = linkBlocker(status, status.deployed);
+        if (blocked) return linkRefusal(status, blocked);
+        await this.linkPolicy(s);
+        return { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };
+      } catch (error) {
+        if (error instanceof WalletError && ["policy_not_configured", "wallet_locked", "policy_expired"].includes(error.code)) return linkRefusal({ agent: s.envelope.account }, [error.code, error.detail]);
         throw error;
       }
-      const status = await this.chain.registryStatus(s.envelope);
-      const blocked = linkBlocker(status, status.deployed);
-      return blocked ? linkRefusal(status, blocked) : { ...status, portal_url: url.href, next_action: APPROVAL_FLOW };
     });
+  }
+  private async linkPolicy(s: WalletSession): Promise<Limits> {
+    const limits = await this.enabled(s);
+    if (limits.expiresAt && limits.expiresAt <= Date.now()) throw new WalletError("policy_expired", "Local wallet policy has expired. Renew it with incentiv-mcp setup in your local terminal");
+    return limits;
   }
   /**
    * The local conditions for signing link consent to `parent`, each refused with a WalletError: an enabled
@@ -438,9 +447,7 @@ export class WalletService {
    * registry request that may still land. Requests that only await approval are returned as `queued`.
    */
   private async linkConsentChecks(s: WalletSession, parent: string) {
-    const limits = await this.enabled(s);
-    // The 15-minute margin is checked against the block's clock with the deadline; an expired policy needs no chain read.
-    if (limits.expiresAt && limits.expiresAt <= Date.now()) throw new WalletError("policy_expired", "Local wallet policy has expired. Renew it with incentiv-mcp setup in your local terminal");
+    const limits = await this.linkPolicy(s);
     if (!registryParentAllowed(limits, parent)) throw new WalletError("registry_parent_not_allowed", "Local wallet policy does not allow this parent. Add it with incentiv-mcp setup in your local terminal, then call sign_agent_link again");
     if (!this.signingEnabled) throw new WalletError("wallet_release_unreviewed", "This release has candidate signing disabled, so it cannot sign link consent. Use prepare_agent_link and the Portal approval flow");
     assertRegistryApproved(this.ctx.config, s.envelope);
