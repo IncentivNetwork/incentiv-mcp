@@ -134,7 +134,8 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
   const now = freshBlockTime(state.timestamp);
   if (Number(a.parent_deadline) <= now + 10) throw new WalletError("registry_approval_expired", "Portal approval expired or is too close to expiry; obtain a fresh approval");
   if (Number(a.parent_deadline) > now + AGENT_LINK_REQUEST_SECONDS) throw new WalletError("registry_approval_invalid", "Portal approval lasts more than 24 hours, longer than this wallet accepts; obtain a fresh approval");
-  if (notAfter !== undefined && Number(a.parent_deadline) > notAfter) throw new WalletError("registry_approval_invalid", "Portal approval lasts past the local wallet policy's expiry; obtain a fresh approval, or renew the policy with incentiv-mcp setup in your local terminal");
+  // Its own code: renewing the policy clears it, so signed bytes refused only for this stay sendable.
+  if (notAfter !== undefined && Number(a.parent_deadline) > notAfter) throw new WalletError("registry_approval_outlasts_policy", "Portal approval lasts past the local wallet policy's expiry; renew the policy with incentiv-mcp setup in your local terminal, or obtain a fresh approval");
   const blocked = linkBlocker(status, state.deployed) ?? parentBlocker(status, a.parent);
   if (blocked) throw new WalletError(...blocked);
   if (status.parent_nonce !== a.parent_nonce) throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval");

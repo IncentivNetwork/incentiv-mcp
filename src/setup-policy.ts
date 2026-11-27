@@ -24,6 +24,13 @@ export function allowance(text: string, decimals: number): string {
   return value.toString();
 }
 
+/** The policy schema caps these lists; checking at the prompt asks again instead of failing setup after every answer. */
+export const MAX_POLICY_LIST = 100;
+function atMost<T>(list: T[], what: string): T[] {
+  if (list.length > MAX_POLICY_LIST) throw new WalletError("validation_failed", `Enter at most ${MAX_POLICY_LIST} ${what}`);
+  return list;
+}
+
 export async function answer<T>(ask: Ask, tell: Tell, label: string, parse: (text: string) => T): Promise<T> {
   for (;;) {
     const text = (await ask(label)).trim();
@@ -68,7 +75,7 @@ export async function promptAgentRegistry(config: Config, ask: Ask, tell: Tell):
   const parents = await answer(ask, tell, "Allowed Portal smart-account addresses, comma-separated: ", value => {
     const values = [...new Set(value.split(",").map(v => v.trim()))];
     if (!values.length || !values.every(v => isAddress(v) && !/^0x0{40}$/i.test(v))) throw new WalletError("validation_failed", "Enter Portal smart-account addresses");
-    return [...new Set(values.map(value => getAddress(value)))];
+    return atMost([...new Set(values.map(value => getAddress(value)))], "Portal smart-account addresses");
   });
   const registry = config.manifest.agentRegistry.proxy.address.toLowerCase();
   tell(`Registry link permission will be added for ${registry}. Gas budgets still apply.`);
@@ -134,17 +141,17 @@ export async function promptX402(config: Config, limits: Pick<Limits, "tokens">,
   });
   const origins = await answer(ask, tell, "Sites the agent may pay, as https origins separated by commas (blank allows any site): ", value => {
     const list = value ? [...new Set(value.split(",").map(s => s.trim()))] : [];
-    return list.map(item => {
+    return atMost(list.map(item => {
       let url: URL;
       try { url = new URL(item); } catch { throw new WalletError("validation_failed", "Enter origins such as https://api.example.com"); }
       if (url.protocol !== "https:" || url.pathname !== "/" || url.search || url.hash || url.username || url.password || item.endsWith("?") || item.endsWith("#")) throw new WalletError("validation_failed", "Enter https origins without a path, such as https://api.example.com");
       return url.origin;
-    });
+    }), "origins");
   });
   const payTo = await answer(ask, tell, "Seller payment addresses the agent may pay, separated by commas (blank allows any): ", value => {
     const addresses = value ? [...new Set(value.split(",").map(s => s.trim()))] : [];
     if (!addresses.every(a => isAddress(a))) throw new WalletError("validation_failed", "Enter complete valid EVM addresses");
-    return addresses.map(a => getAddress(a));
+    return atMost(addresses.map(a => getAddress(a)), "seller payment addresses");
   });
   return {
     origins: origins.length ? { mode: "allowlist", origins } : { mode: "any" },

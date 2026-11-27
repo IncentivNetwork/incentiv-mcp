@@ -409,8 +409,8 @@ test("a signed link the registry no longer accepts names the replacement that fr
   await assert.rejects(f.service.send("link_agent", args), error => error.code === "registry_approval_stale" && /^registry_approval_stale: Parent nonce changed; obtain a fresh Portal approval\. Signed request/.test(error.message) && replace.test(error.message));
   await assert.rejects(f.service.resolve(id, password), error => error.code === "registry_approval_stale" && replace.test(error.message));
   assert.equal((await f.service.operation(id)).status, "signed"); assert.equal(f.submissions.length, 0);
-  // Refusals that can clear, such as a temporary RPC failure, an unverifiable read or a full parent, are not a reason to replace anything.
-  for (const [code, message] of [["registry_rpc_unavailable", "RPC down"], ["registry_verification_failed", "Registry state could not be verified"], ["registry_limit_reached", "Parent has reached its agent limit; unlink an agent in Portal first"]]) {
+  // Refusals that can clear, such as a temporary RPC failure, an unverifiable read, a full parent or a policy shortened after signing, are not a reason to replace anything.
+  for (const [code, message] of [["registry_rpc_unavailable", "RPC down"], ["registry_verification_failed", "Registry state could not be verified"], ["registry_limit_reached", "Parent has reached its agent limit; unlink an agent in Portal first"], ["registry_approval_outlasts_policy", "Portal approval lasts past the local wallet policy's expiry; renew the policy with incentiv-mcp setup in your local terminal, or obtain a fresh approval"]]) {
     f.chain.verifyRegistry = async () => { throw new WalletError(code, message); };
     await assert.rejects(f.service.send("link_agent", args), error => error.code === code && error.message === `${code}: ${message}`);
   }
@@ -1488,12 +1488,12 @@ test("a Portal approval lasting past 24 hours or the local policy's expiry is re
     await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(await approval({ parent_deadline: String(deadline) })), state()), e => e.code === "registry_approval_invalid" && /24 hours/.test(e.message));
   }
   // Within 24 hours but past the policy's expiry.
-  await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(await approval({ parent_deadline: String(now + 3_600) })), state(), now + 1_800), e => e.code === "registry_approval_invalid" && /policy's expiry/.test(e.message));
+  await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(await approval({ parent_deadline: String(now + 3_600) })), state(), now + 1_800), e => e.code === "registry_approval_outlasts_policy" && /policy's expiry/.test(e.message));
   // The wallet's own policy supplies that expiry.
   const chain = new WalletChain(new Ctx(MAINNET));
   chain.clients.splice(0, chain.clients.length, client());
   const wallet = { account: agent, approvedCapabilityManifestId: MAINNET.manifest.manifestId, policy: { schemaVersion: 1, configured: true, enabled: true, limits: { ...limits, expiresAt: (now + 1_800) * 1000 } } };
-  await assert.rejects(chain.verifyRegistry(wallet, intent(await approval({ parent_deadline: String(now + 3_600) })), state()), { code: "registry_approval_invalid" });
+  await assert.rejects(chain.verifyRegistry(wallet, intent(await approval({ parent_deadline: String(now + 3_600) })), state()), { code: "registry_approval_outlasts_policy" });
 });
 
 test("an RPC or bundler outage while replacing reports rpc_unavailable and keeps the record", async t => {
@@ -1517,22 +1517,24 @@ test("an RPC or bundler outage while replacing reports rpc_unavailable and keeps
 });
 
 test("a bundler's internal or limit error during simulation keeps a new request ID retryable", async t => {
-  for (const status of [200, 408]) for (const code of status === 200 ? [-32603, -32005] : [undefined]) {
+  for (const status of [200, 408]) for (const [code, data] of status === 200 ? [[-32603], [-32005], [-32603, { stack: "at handler" }]] : [[undefined]]) {
     const f = await fixture(t), id = randomUUID(), simulate = f.chain.simulate;
     f.chain.clients.splice(0, f.chain.clients.length, { readContract: async () => ({ reject: 0 }) });
     f.chain.simulate = WalletChain.prototype.simulate;
-    const fetch = t.mock.method(globalThis, "fetch", async () => status === 200 ? Response.json({ jsonrpc: "2.0", id: 1, error: { code, message: "busy" } }) : new Response("", { status }));
+    const fetch = t.mock.method(globalThis, "fetch", async () => status === 200 ? Response.json({ jsonrpc: "2.0", id: 1, error: { code, message: "busy", ...(data ? { data } : {}) } }) : new Response("", { status }));
     await assert.rejects(f.service.send("transfer", transfer(id)), { code: "rpc_unavailable" });
     fetch.mock.restore();
     assert.notEqual((await f.service.operation(id).catch(() => ({ status: "none" }))).status, "failed", `${status} ${code}`);
     f.chain.simulate = simulate;
     assert.equal((await f.service.send("transfer", transfer(id))).status, "submitted", `${status} ${code}`);
   }
-  // A bundler that rejects the operation still fails it.
-  const f = await fixture(t), id = randomUUID();
-  f.chain.clients.splice(0, f.chain.clients.length, { readContract: async () => ({ reject: 0 }) });
-  f.chain.simulate = WalletChain.prototype.simulate;
-  t.mock.method(globalThis, "fetch", async () => Response.json({ jsonrpc: "2.0", id: 1, error: { code: -32500, message: "AA23 reverted" } }));
-  await assert.rejects(f.service.send("transfer", transfer(id)), { code: "simulation_failed" });
-  t.mock.restoreAll();
+  // A bundler that rejects the operation still fails it, including a revert some bundlers report as -32603.
+  for (const error of [{ code: -32500, message: "AA23 reverted" }, { code: -32603, message: "execution reverted" }, { code: -32603, message: "AA23 reverted (or OOG)" }, { code: -32603, message: "internal error", data: "0x08c379a0" }]) {
+    const f = await fixture(t), id = randomUUID();
+    f.chain.clients.splice(0, f.chain.clients.length, { readContract: async () => ({ reject: 0 }) });
+    f.chain.simulate = WalletChain.prototype.simulate;
+    const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ jsonrpc: "2.0", id: 1, error }));
+    await assert.rejects(f.service.send("transfer", transfer(id)), { code: "simulation_failed" }, JSON.stringify(error));
+    fetch.mock.restore();
+  }
 });

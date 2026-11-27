@@ -510,7 +510,7 @@ export class WalletService {
       if (!policy.limits.x402) throw new WalletError("policy_denied", "x402 payments are off in local wallet policy, so this wallet sends no x402 requests; the user can enable them with incentiv-mcp setup");
       if (x402Violations(policy.limits, req.origin, ZERO_ADDRESS, "0").includes("x402_origin_not_allowed")) throw new WalletError("policy_denied", "Local wallet policy does not allow this site for x402, so nothing was sent");
       // Start the request while the policy is still locked. Release the wallet before waiting on the seller.
-      const pending = this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: 30_000 })
+      const pending = this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: UNPAID_REQUEST_TIMEOUT_MS })
         .then(response => ({ response }), (error: unknown) => ({ error }));
       return { pending };
     });
@@ -635,7 +635,7 @@ export class WalletService {
       await restoreProbe();
       throw error;
     }
-    const unpaid = await this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES }).catch(async (error: unknown) => {
+    const unpaid = await this.http({ ...req, maxBytes: MAX_RESPONSE_BYTES, timeoutMs: UNPAID_REQUEST_TIMEOUT_MS }).catch(async (error: unknown) => {
       // If nothing was sent, restore the earlier binding. Otherwise the resource may have acted on the request.
       if (neverSent(error)) await restoreProbe();
       if (error instanceof WalletError) throw error;
@@ -1250,6 +1250,8 @@ const answerAdvice = (req: X402Request) => replayable(req) ? "retry this request
  * slow settlement still returns the answer instead of finishing after the wallet stopped waiting.
  */
 const PAID_REQUEST_TIMEOUT_MS = 90_000;
+/** An unpaid request runs under the wallet lock in pay_x402_resource, so it gets the same short bound as get_x402_payment_requirements. */
+const UNPAID_REQUEST_TIMEOUT_MS = 30_000;
 /**
  * Reorg check window for existing settlements that predate recording their receipt block.
  */

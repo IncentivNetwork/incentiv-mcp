@@ -17,8 +17,10 @@ export async function creationLock(root: string, timeoutMs = 10_000) {
   const recovery = join(root, "wallet.create.recover.lock");
   const record = { token: randomUUID(), pid: process.pid, host: await hostIdentity(), startedAt: Date.now() - process.uptime() * 1000 };
   const deadline = Date.now() + timeoutMs;
+  let recovering = false;
   for (;;) {
-    if (!await exists(recovery)) {
+    recovering = await exists(recovery);
+    if (!recovering) {
       try { await writeNew(path, JSON.stringify(record)); break; } catch (error) { if (!isExists(error)) throw error; }
       // Never infer death merely from an expired heartbeat. PID reuse/live owners
       // remain locked; an unverifiable/foreign host requires explicit recovery.
@@ -41,7 +43,9 @@ export async function creationLock(root: string, timeoutMs = 10_000) {
         }
       }
     }
-    if (Date.now() >= deadline) throw new WalletError("wallet_locked", "Another creator or a recovery lock owns the wallet; retry or inspect recovery evidence");
+    if (Date.now() >= deadline) throw new WalletError("wallet_locked", recovering
+      ? "A lock recovery is in progress on this wallet; retry shortly, or inspect recovery evidence if this persists"
+      : "Another wallet operation is in progress, such as an x402 payment waiting on its seller. Nothing was changed; retry shortly (reusing a request ID is safe)");
     await delay(100);
   }
   let failure = false;

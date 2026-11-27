@@ -7,7 +7,7 @@ import { encodeFunctionData, toFunctionSelector } from "viem";
 import { MAINNET, withoutAgentRegistry } from "../src/config.ts";
 import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilities.ts";
 import { erc20Abi, swapRouterAbi, wcentAbi } from "../src/abi.ts";
-import { allowance, answer, policySummary, promptPolicy, promptX402, setupTargets, technicalLimits, X402_MIN_USDC_GAS } from "../src/setup-policy.ts";
+import { allowance, answer, MAX_POLICY_LIST, policySummary, promptAgentRegistry, promptPolicy, promptX402, setupTargets, technicalLimits, X402_MIN_USDC_GAS } from "../src/setup-policy.ts";
 import { connectionFor, clientConfigPath, mergeConnection, saveClientConfig, connectClient } from "../src/setup-client.ts";
 import { setupWallet, checkRuntime } from "../src/setup.ts";
 import { parseWalletProfileArgs } from "../src/wallet-profile.ts";
@@ -353,4 +353,22 @@ test("setup keeps x402 off when its limits would refuse every payment, and warns
   const answers = ["n"], ask = async () => answers.shift();
   assert.equal(await promptX402(MAINNET, limits({ gasPayment: "20000" }, "1000000000000000000"), ask, tell), undefined);
   assert.ok(told.some(text => /must pay gas in native/.test(text)));
+});
+
+test("setup asks again when a list is longer than the policy allows, instead of failing after every answer", async () => {
+  const many = n => Array.from({ length: n }, (_, i) => `0x${(i + 1).toString(16).padStart(40, "0")}`);
+  const sites = n => Array.from({ length: n }, (_, i) => `https://s${i}.example.com`);
+  const usdc = MAINNET.manifest.canonicalTokens.USDC.address;
+  const limits = { tokens: { [usdc]: { perTransaction: "1000000", daily: "10000000", exposure: "10000000", gasPayment: "1000000" } } };
+  const told = [], tell = text => told.push(text);
+  const replies = ["y", "", sites(MAX_POLICY_LIST + 1).join(","), sites(2).join(","), many(MAX_POLICY_LIST + 1).join(","), many(MAX_POLICY_LIST).join(",")];
+  const x402 = await promptX402(MAINNET, limits, async () => { assert.ok(replies.length); return replies.shift(); }, tell);
+  assert.equal(replies.length, 0);
+  assert.equal(x402.origins.origins.length, 2); assert.equal(x402.payTo.addresses.length, MAX_POLICY_LIST);
+  assert.equal(told.filter(m => /at most 100 origins/.test(m)).length, 1);
+  assert.equal(told.filter(m => /at most 100 seller payment addresses/.test(m)).length, 1);
+  const parents = ["y", many(MAX_POLICY_LIST + 1).join(","), many(3).join(",")];
+  const registry = await promptAgentRegistry(MAINNET, async () => { assert.ok(parents.length); return parents.shift(); }, tell);
+  assert.equal(parents.length, 0); assert.equal(registry.agentRegistry.parents.length, 3);
+  assert.ok(told.some(m => /at most 100 Portal smart-account addresses/.test(m)));
 });

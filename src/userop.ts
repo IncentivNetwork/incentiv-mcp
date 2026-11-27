@@ -155,6 +155,9 @@ function opToWire(op: UserOp): Record<string, string> {
 export class BundlerUnavailableError extends Error {}
 /** JSON-RPC errors that reflect the bundler's own state, not the operation: internal error and limit exceeded. */
 const BUNDLER_RETRYABLE_CODES = [-32603, -32005];
+/** Some bundlers report a validation or execution revert as -32603; one that carries revert data or names a revert is about the operation. */
+const bundlerRejection = (code: number, message: string, data: unknown) =>
+  code === -32603 && ((typeof data === "string" && /^0x[0-9a-f]{8,}$/i.test(data)) || /revert|\bAA\d\d\b/i.test(message));
 
 export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): Promise<unknown> {
   let res: Response;
@@ -176,8 +179,8 @@ export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): P
     if ("result" in body || !error || typeof error !== "object" || !("code" in error) || !Number.isInteger(error.code) ||
         !("message" in error) || typeof error.message !== "string") throw new BundlerUnavailableError("Bundler answer has an invalid RPC error");
     const data = "data" in error && error.data ? ` ${JSON.stringify(error.data)}` : "";
-    // An internal error or exceeded limit says nothing about the operation, as for the chain RPC.
-    if (BUNDLER_RETRYABLE_CODES.includes(error.code as number)) throw new BundlerUnavailableError(`Bundler error ${error.code}: ${error.message}${data}`);
+    // An internal error or exceeded limit says nothing about the operation, as for the chain RPC, unless it reports a revert.
+    if (BUNDLER_RETRYABLE_CODES.includes(error.code as number) && !bundlerRejection(error.code as number, error.message, "data" in error ? error.data : undefined)) throw new BundlerUnavailableError(`Bundler error ${error.code}: ${error.message}${data}`);
     throw new Error(`Bundler error ${error.code}: ${error.message}${data}`);
   }
   if (!("result" in body)) throw new BundlerUnavailableError("Bundler answer omitted its RPC result");
