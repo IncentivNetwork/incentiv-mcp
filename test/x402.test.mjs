@@ -1113,11 +1113,37 @@ test("refused requests do not accumulate in the journal, and bindings that are k
   // Bindings of POSTs the resource may have acted on are kept, up to a cap; past it no unbound POST is sent.
   await f.store.session(async s => { const journal = await Journal.open(s); journal.data.probes = Array.from({ length: 10_000 }, () => ({ requestId: randomUUID(), request: digest(randomUUID()), outcome: "not_required", at: Date.now() })); await journal.save(); });
   const unpaid = f.seen.unpaid;
-  await assert.rejects(f.service.payX402(post(randomUUID())), e => e.code === "policy_denied" && /Idempotency-Key/.test(e.message));
+  for (const headers of [undefined, { "Idempotency-Key": "k1" }]) {
+    await assert.rejects(f.service.payX402({ ...post(randomUUID()), headers }), e => e.code === "policy_denied" && /cannot bind a new POST/.test(e.message));
+  }
   assert.equal(f.seen.unpaid, unpaid);
-  // A POST the seller can deduplicate is not bound, so it still goes out.
-  await assert.rejects(f.service.payX402({ ...post(randomUUID()), headers: { "Idempotency-Key": "k1" } }), { code: "x402_price_above_max" });
-  assert.equal(f.seen.unpaid, unpaid + 1);
+});
+
+test("an unpaid POST with a seller key stays bound even after a later challenge", async t => {
+  const f = await x402Fixture(t), challenge = f.service.http;
+  let calls = 0;
+  f.service.http = async req => {
+    calls++;
+    if (calls === 1) throw new Error("response lost");
+    if (calls === 2) return challenge(req);
+    return { status: 200, headers: {}, body: Buffer.from("answer"), truncated: false };
+  };
+  const post = { url: URL_, method: "POST", body: "{}", max_amount: "0.05", request_id: randomUUID(), headers: { "Idempotency-Key": "original" } };
+  await assert.rejects(f.service.payX402(post), { code: "x402_request_failed" });
+  const rejectChanged = async () => {
+    for (const changed of [{ headers: {} }, { headers: { "Idempotency-Key": "different" } }, { body: '{"changed":true}' }]) {
+      await assert.rejects(f.service.payX402({ ...post, ...changed }), { code: "idempotency_conflict" });
+    }
+  };
+  await rejectChanged();
+  assert.equal(calls, 1);
+  await assert.rejects(f.service.payX402(post), { code: "x402_request_uncertain" });
+  await rejectChanged();
+  assert.equal(calls, 2);
+  assert.equal((await f.service.payX402(post)).content.text, "answer");
+  await rejectChanged();
+  assert.equal(calls, 3);
+  assert.deepEqual(await f.records(), []);
 });
 
 test("only an x402 payment may expire once signed or reopen once confirmed", async t => {

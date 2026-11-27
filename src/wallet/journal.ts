@@ -78,9 +78,8 @@ const recordSchema = z.strictObject({
 export const signedReplacements = (r: OperationRecord) => [...(r.replacement?.signed ? [r.replacement] : []), ...(r.priorReplacement ? [r.priorReplacement] : [])];
 export type OperationRecord = z.infer<typeof recordSchema>;
 /**
- * x402 only: an unpaid request that cannot safely be sent twice (a POST without an Idempotency-Key), journaled
- * under its request ID before it is sent, so a retry with that ID never sends it again unless it was refused
- * with a 402, which means the resource did not act on it.
+ * x402 only: an unpaid POST, journaled under its request ID before it is sent. The digest binds any seller-side
+ * Idempotency-Key to the original request. A valid 402 allows the binding to change if no prior POST may have run.
  */
 export const probeSchema = z.strictObject({ requestId: z.string().uuid(), request: hash, outcome: z.enum(["sending", "payment_required", "not_required"]), at: z.number().int() });
 export type Probe = z.infer<typeof probeSchema>;

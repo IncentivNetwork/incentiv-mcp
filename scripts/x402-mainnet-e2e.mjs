@@ -81,7 +81,7 @@ async function withBuyer(profile, work, dist = join(root, "dist"), signal) {
   } finally { await client.close(); }
 }
 
-async function withSeller(run, work, dropFirstSettlement, signal) {
+async function withSeller(run, work, dropFirstSettlement = false, signal = new AbortController().signal) {
   const seller = await startSeller({ payTo: run.seller, runId: run.id, dropFirstSettlement, acceptPayments: false });
   let tunnel;
   try {

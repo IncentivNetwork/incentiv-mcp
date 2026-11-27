@@ -606,25 +606,24 @@ export class WalletService {
     const early = x402Violations(limits, req.origin, "0x0000000000000000000000000000000000000000", "0").filter(r => r !== "x402_pay_to_not_allowed");
     if (early.length) throw new WalletError("policy_denied", `Local wallet policy refuses this resource: ${early.join(", ")}`);
 
-    // A request that cannot safely be sent twice is bound to its request ID before the unpaid request goes out:
-    // a resource that needs no payment acts on it straight away.
+    // Bind every unpaid POST before sending. Even with a seller-side key, only an identical request can replay safely.
     const probe = journal.data.probes?.find(p => p.requestId === requestId);
     if (probe) {
       // A valid 402 shows the resource did not act on the POST, so that binding may change, say to a higher max_amount, as a GET's can.
       if (probe.request !== request && probe.outcome !== "payment_required") throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
-      if (probe.outcome === "not_required") return { request_id: requestId, status: "not_required", content_delivered: false, next_action: "This POST was already sent under this request ID and needed no payment; its answer was returned then. This wallet does not send it again: use a new request ID to send it again." };
-      if (probe.outcome === "sending") throw new WalletError("x402_request_uncertain", "This POST may already have reached the resource under this request ID, which may have acted on it. Nothing was paid. This wallet does not send it again: use a new request ID to send it again.");
+      if (!replayable(req) && probe.outcome === "not_required") return { request_id: requestId, status: "not_required", content_delivered: false, next_action: "This POST was already sent under this request ID and needed no payment; its answer was returned then. This wallet does not send it again: use a new request ID to send it again." };
+      if (!replayable(req) && probe.outcome === "sending") throw new WalletError("x402_request_uncertain", "This POST may already have reached the resource under this request ID, which may have acted on it. Nothing was paid. This wallet does not send it again: use a new request ID to send it again.");
     }
     const bind = async (outcome: "sending" | "payment_required" | "not_required" | undefined, at = Date.now(), bound: string = request) => {
-      if (replayable(req)) return;
+      if (req.method !== "POST") return;
       journal.data.probes = (journal.data.probes ?? []).filter(p => p.requestId !== requestId);
       // A binding that may guard an acted-on POST is never dropped, so their number is capped instead.
-      if (outcome === "sending" && journal.data.probes.length >= MAX_PROBES) throw new WalletError("policy_denied", `This wallet already keeps ${MAX_PROBES} unpaid POST requests bound to their request IDs, so it sends no more without an Idempotency-Key header the seller honours; nothing was sent or paid. The user can clear old bindings with incentiv-mcp wallet x402 clear-bindings in their own terminal`);
+      if (outcome === "sending" && journal.data.probes.length >= MAX_PROBES) throw new WalletError("policy_denied", `This wallet already keeps ${MAX_PROBES} unpaid POST requests bound to their request IDs, so it cannot bind a new POST request ID; nothing was sent or paid. The user can clear old bindings with incentiv-mcp wallet x402 clear-bindings in their own terminal`);
       if (outcome) journal.data.probes.push({ requestId, request: bound, outcome, at });
       await journal.save();
     };
     assertPolicyLive(limits, "nothing was sent or paid");
-    await bind("sending");
+    if (probe?.outcome !== "not_required") await bind("sending");
     // The earlier binding comes back as it was, its own request included.
     const restoreProbe = () => bind(probe?.outcome, probe?.at, probe?.request);
     // An unpaid request can still have side effects. Check again after the durable POST binding.
@@ -656,6 +655,12 @@ export class WalletService {
     // Only a valid x402 challenge shows the resource did not act on the request; a plain 402 may follow a side
     // effect, so the binding stays uncertain if it is not one.
     const required = parsePaymentRequired(unpaid);
+    // A challenge on a later retry says nothing about an earlier POST that might have run for free.
+    if (probe && probe.outcome !== "payment_required") {
+      await restoreProbe();
+      if (probe.outcome === "not_required") return { request_id: requestId, status: "not_required", content_delivered: false, next_action: "This POST previously needed no payment. The seller asked for payment on this retry, so the wallet did not pay or recover its answer." };
+      throw new WalletError("x402_request_uncertain", "The seller asked for payment on this retry, but it may have acted on the earlier unpaid POST. Nothing was paid. Check the seller's result before making a new request.");
+    }
     await bind("payment_required");
     // The cheapest option within max_amount that local policy allows; failing that, the cheapest, whose refusal says why.
     const accepted = selectRequirements(required, cfg, o => BigInt(o.amount) <= maxAmount && !x402QuoteViolations(limits, xcfg.usdc, req.origin, o.payTo, o.amount).length);
