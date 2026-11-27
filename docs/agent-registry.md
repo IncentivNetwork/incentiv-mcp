@@ -25,7 +25,7 @@ For an agent that is not deployed yet, `sign_agent_link` signs nothing and retur
 
 1. Run setup and fund your agent account for gas (native CENT, or an approved token through the paymaster).
 2. Call `prepare_agent_link`. Open the returned first-party Portal `/agents` URL. Never send a parent signature through a URL.
-3. Check both full smart-account addresses. Portal reads the digest itself and signs its bytes using the EOA or passkey wrapper. Approvals last 15 minutes.
+3. Check both full smart-account addresses. Portal reads the digest itself and signs its bytes using the EOA or passkey wrapper. Approvals last 15 minutes. This wallet refuses an approval that lasts more than 24 hours or past the local policy's expiry, since a signed link can land until the approval's deadline.
 4. Copy the approval JSON into `link_agent` with a new `request_id` UUID, optional `gas_token` and `wait_for_confirmation`. This still requires authenticated local policy.
 5. Reuse the same UUID only for identical retries. `get_agent_operation` reconciles the request; `get_agent_registry_status` reads the current relationship. Historical completion and the current relationship can differ if the link was removed outside MCP and Portal.
 

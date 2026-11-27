@@ -188,7 +188,7 @@ export class WalletService {
     let response = await this.store.session(async s => {
       const limits = await this.enabled(s);
       const journal = await Journal.open(s);
-      const intent = intentSchema.parse(await this.chain.normalize(kind, args));
+      const intent = intentSchema.parse(await this.chain.normalize(kind, args).catch((error: unknown) => { throw rpcOutage(error); }));
       let r = journal.data.records.find(r => r.requestId === requestId);
       if (r && r.intentHash !== digest(intent)) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different intent");
       await this.reconcile(journal);
@@ -389,8 +389,8 @@ export class WalletService {
     return this.store.session(async s => {
       const journal = await Journal.open(s, !s.envelope.policy.configured);
       await this.reconcile(journal);
-      const state = await this.chain.state(s.envelope), policy = s.envelope.policy;
-      const balances = await this.chain.balances(s.envelope, policy.configured ? this.balanceTokens(policy.limits) : ["native"]);
+      const state = await this.chain.state(s.envelope).catch((error: unknown) => { throw rpcOutage(error); }), policy = s.envelope.policy;
+      const balances = await this.chain.balances(s.envelope, policy.configured ? this.balanceTokens(policy.limits) : ["native"]).catch((error: unknown) => { throw rpcOutage(error); });
       const reserved: Spend = {};
       for (const r of journal.data.records.filter(r => ownsNonce(r.status))) for (const [token, amount] of Object.entries(r.reservation)) addSpend(reserved, token, BigInt(amount));
       const spendable = Object.fromEntries(Object.entries(balances).map(([token, amount]) => [token, (BigInt(amount) > BigInt(reserved[token] ?? "0") ? BigInt(amount) - BigInt(reserved[token] ?? "0") : 0n).toString()]));
@@ -482,7 +482,7 @@ export class WalletService {
       const overToken = !!r?.replacement?.signed && r.replacement.gasToken !== undefined && !r.priorReplacement;
       if (!r || !ownsNonce(r.status) || (r.replacement?.signed && !(overToken && nativeGas))) throw new WalletError("operation_pending", `Replacement requires an unresolved original operation without a signed replacement${overToken ? `; a signed replacement that pays gas in a token can be replaced once more with wallet operation resolve ${id} --replace --native-gas` : ""}`);
       if (r.priorReplacement && !nativeGas) throw new WalletError("operation_pending", `Request ${id} already has a signed token-paid replacement, so only a native one can follow it: run wallet operation resolve ${id} --replace --native-gas`);
-      const state = await this.chain.state(s.envelope);
+      const state = await this.chain.state(s.envelope).catch((error: unknown) => { throw rpcOutage(error); });
       // Native gas clears the nonce when the token balance or paymaster cannot.
       const gasToken = nativeGas ? "native" : r.intent.gasToken;
       const built = await this.replacementStep(r.requestId, gasToken, () => this.chain.buildReplacement(s.envelope, r, state, gasToken));
@@ -503,6 +503,8 @@ export class WalletService {
       // Only gas payment problems can be cleared by paying in native gas; other errors keep their own guidance.
       if (error instanceof WalletError) throw GAS_FIXABLE_ERRORS.includes(error.code) ? new WalletError(error.code, `${error.message.slice(error.code.length + 2)}.${nativeGasHint(this.ctx.config, gasToken)}`) : error;
       if (error instanceof NetworkError) throw error;
+      // An outage says nothing about the gas token, so paying in native gas would not help.
+      if (rpcOutage(error) !== error) throw new WalletError("rpc_unavailable", "Could not reach the RPC or bundler to prepare this replacement; retry");
       throw new WalletError("validation_failed", `Could not prepare this replacement; retry.${nativeGasHint(this.ctx.config, gasToken)}`);
     }
   }
@@ -515,7 +517,7 @@ export class WalletService {
       const journal = await Journal.open(s); await this.reconcile(journal);
       const r = journal.data.records.find(r => r.requestId === id);
       if (!r || !ownsNonce(r.status) || !r.replacement || r.replacement.signed || r.replacement.expiresAt <= Date.now() || digest(r) !== reviewedDigest) throw new WalletError("approval_required", "Replacement changed or expired; review it again");
-      const state = await this.chain.state(s.envelope);
+      const state = await this.chain.state(s.envelope).catch((error: unknown) => { throw rpcOutage(error); });
       if (state.nonce !== BigInt(r.nonce!)) throw new WalletError("operation_pending", "Original nonce has already moved; reconcile before replacing");
       const replacement = r.replacement;
       const validated = validateOperation(this.ctx.config, s.envelope, this.replacementIntent(s, replacement.gasToken ?? "native"), replacement.operation, { nonce: state.nonce, deployed: state.deployed, hash: replacement.userOpHash });
@@ -523,7 +525,7 @@ export class WalletService {
       const gasToken = replacement.gasToken ?? "native";
       if (gasToken !== "native" && validated.gasCharge.toString() !== replacement.gasCharge) throw new WalletError("validation_failed", "Replacement token gas payment changed");
       await this.replacementStep(r.requestId, gasToken, () => this.chain.simulate(validated));
-      const balances = await this.chain.balances(s.envelope, [gasToken]);
+      const balances = await this.chain.balances(s.envelope, [gasToken]).catch((error: unknown) => { throw rpcOutage(error); });
       if (BigInt(balances[gasToken] ?? "0") < validated.gasCharge) throw new WalletError("policy_denied", `Balance cannot cover the reviewed replacement gas payment.${nativeGasHint(this.ctx.config, gasToken)}`);
       await this.canSubmit(s);
       if (replacement.expiresAt <= Date.now()) throw new WalletError("approval_required", "Replacement review expired before signing");

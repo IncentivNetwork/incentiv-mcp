@@ -121,7 +121,11 @@ export function registryCall(cfg: Config, agent: Address, intent: Intent) {
 export function assertNotUnlink(intent: Intent): asserts intent is Intent & { kind: Exclude<Intent["kind"], "unlink_agent"> } {
   if (intent.kind === "unlink_agent") throw new WalletError("registry_unlink_unsupported", "Agent connections are permanent; this wallet does not unlink agents");
 }
-export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wallet: { account: string }, intent: Intent, state: { block: bigint; timestamp: number; deployed: boolean }) {
+/**
+ * `notAfter` is the local policy's expiry in seconds. A link operation carries no validity window of its own, so once
+ * signed it can land until the parent's deadline; that deadline is held to the bounds a signed consent has.
+ */
+export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wallet: { account: string }, intent: Intent, state: { block: bigint; timestamp: number; deployed: boolean }, notAfter?: number) {
   assertNotUnlink(intent);
   await verifyRegistryDeployment(client, cfg, state.block);
   registryCall(cfg, wallet.account as Address, intent);
@@ -129,6 +133,8 @@ export async function verifyRegistryIntent(client: PublicClient, cfg: Config, wa
   const a = intent.registryApproval!;
   const now = freshBlockTime(state.timestamp);
   if (Number(a.parent_deadline) <= now + 10) throw new WalletError("registry_approval_expired", "Portal approval expired or is too close to expiry; obtain a fresh approval");
+  if (Number(a.parent_deadline) > now + AGENT_LINK_REQUEST_SECONDS) throw new WalletError("registry_approval_invalid", "Portal approval lasts more than 24 hours, longer than this wallet accepts; obtain a fresh approval");
+  if (notAfter !== undefined && Number(a.parent_deadline) > notAfter) throw new WalletError("registry_approval_invalid", "Portal approval lasts past the local wallet policy's expiry; obtain a fresh approval, or renew the policy with incentiv-mcp setup in your local terminal");
   const blocked = linkBlocker(status, state.deployed) ?? parentBlocker(status, a.parent);
   if (blocked) throw new WalletError(...blocked);
   if (status.parent_nonce !== a.parent_nonce) throw new WalletError("registry_approval_stale", "Parent nonce changed; obtain a fresh Portal approval");

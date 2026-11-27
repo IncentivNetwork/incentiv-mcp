@@ -174,7 +174,8 @@ export class WalletChain {
     assertNotUnlink(intent);
     await this.registryRead(wallet, async () => {
       const current = state ?? await this.state(wallet);
-      await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, current)));
+      const expiresAt = wallet.policy?.configured ? wallet.policy.limits.expiresAt : undefined;
+      await Promise.all(this.clients.map(client => verifyRegistryIntent(client, this.ctx.config, wallet, intent, current, expiresAt === undefined ? undefined : Math.floor(expiresAt / 1000))));
     });
   }
   async registryStatus(wallet: WalletEnvelope, parent?: Address) {

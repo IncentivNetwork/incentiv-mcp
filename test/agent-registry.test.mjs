@@ -1444,3 +1444,58 @@ test("only a token-paid replacement can be followed by a native one", async t =>
   const [record] = await f.store.session(async s => (await Journal.open(s)).data.records);
   assert.equal(record.priorReplacement, undefined);
 });
+
+test("a Portal approval lasting past 24 hours or the local policy's expiry is refused before signing", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  for (const deadline of [now + 86_400 + 60, Number.MAX_SAFE_INTEGER]) {
+    await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(await approval({ parent_deadline: String(deadline) })), state()), e => e.code === "registry_approval_invalid" && /24 hours/.test(e.message));
+  }
+  // Within 24 hours but past the policy's expiry.
+  await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(await approval({ parent_deadline: String(now + 3_600) })), state(), now + 1_800), e => e.code === "registry_approval_invalid" && /policy's expiry/.test(e.message));
+  // The wallet's own policy supplies that expiry.
+  const chain = new WalletChain(new Ctx(MAINNET));
+  chain.clients.splice(0, chain.clients.length, client());
+  const wallet = { account: agent, approvedCapabilityManifestId: MAINNET.manifest.manifestId, policy: { schemaVersion: 1, configured: true, enabled: true, limits: { ...limits, expiresAt: (now + 1_800) * 1000 } } };
+  await assert.rejects(chain.verifyRegistry(wallet, intent(await approval({ parent_deadline: String(now + 3_600) })), state()), { code: "registry_approval_invalid" });
+});
+
+test("an RPC or bundler outage while replacing reports rpc_unavailable and keeps the record", async t => {
+  const f = await fixture(t), id = randomUUID(), outage = () => new HttpRequestError({ url: "https://rpc.incentiv.io", status: 503 });
+  assert.equal((await f.service.send("transfer", transfer(id))).status, "submitted");
+  const state = f.chain.state, balances = f.chain.balances, build = f.chain.buildReplacement;
+  f.chain.state = async () => { throw outage(); };
+  await assert.rejects(f.service.reviewReplacement(id), { code: "rpc_unavailable" });
+  f.chain.state = state;
+  f.chain.buildReplacement = async () => { throw outage(); };
+  await assert.rejects(f.service.reviewReplacement(id), e => e.code === "rpc_unavailable" && !/native-gas|CENT/.test(e.message));
+  f.chain.buildReplacement = build;
+  const review = await f.service.reviewReplacement(id);
+  f.chain.state = async () => { throw outage(); };
+  await assert.rejects(f.service.replace(id, password, digest(review.records[0])), { code: "rpc_unavailable" });
+  f.chain.state = state;
+  f.chain.balances = async () => { throw outage(); };
+  await assert.rejects(f.service.replace(id, password, digest(review.records[0])), { code: "rpc_unavailable" });
+  f.chain.balances = balances;
+  assert.equal((await f.service.replace(id, password, digest(review.records[0]))).status, "superseding");
+});
+
+test("a bundler's internal or limit error during simulation keeps a new request ID retryable", async t => {
+  for (const status of [200, 408]) for (const code of status === 200 ? [-32603, -32005] : [undefined]) {
+    const f = await fixture(t), id = randomUUID(), simulate = f.chain.simulate;
+    f.chain.clients.splice(0, f.chain.clients.length, { readContract: async () => ({ reject: 0 }) });
+    f.chain.simulate = WalletChain.prototype.simulate;
+    const fetch = t.mock.method(globalThis, "fetch", async () => status === 200 ? Response.json({ jsonrpc: "2.0", id: 1, error: { code, message: "busy" } }) : new Response("", { status }));
+    await assert.rejects(f.service.send("transfer", transfer(id)), { code: "rpc_unavailable" });
+    fetch.mock.restore();
+    assert.notEqual((await f.service.operation(id).catch(() => ({ status: "none" }))).status, "failed", `${status} ${code}`);
+    f.chain.simulate = simulate;
+    assert.equal((await f.service.send("transfer", transfer(id))).status, "submitted", `${status} ${code}`);
+  }
+  // A bundler that rejects the operation still fails it.
+  const f = await fixture(t), id = randomUUID();
+  f.chain.clients.splice(0, f.chain.clients.length, { readContract: async () => ({ reject: 0 }) });
+  f.chain.simulate = WalletChain.prototype.simulate;
+  t.mock.method(globalThis, "fetch", async () => Response.json({ jsonrpc: "2.0", id: 1, error: { code: -32500, message: "AA23 reverted" } }));
+  await assert.rejects(f.service.send("transfer", transfer(id)), { code: "simulation_failed" });
+  t.mock.restoreAll();
+});
