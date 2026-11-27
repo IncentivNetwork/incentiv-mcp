@@ -16,7 +16,7 @@ import { addSpend, authorize, limitsSchema, newAdministration, policyViolations,
 import { MIN_SWAP_REMAINING_SECONDS, REORG_MARGIN_BLOCKS, SWAP_DEADLINE_SECONDS, WalletChain, isTransportFailure, type ChainState } from "./chain.js";
 import { validateOperation } from "./validate.js";
 import { httpsTransport, sentNothing, type HttpResponse, type HttpTransport } from "../x402/http.js";
-import { incentivX402, parsePaymentRequired, paymentHeader, paymentNonceKey, selectRequirements, settlement, x402Config, X402_SCHEME, type PaymentRequirements, type SettleResponse } from "../x402/protocol.js";
+import { incentivX402, parsePaymentRequired, paymentHeader, paymentNonceKey, selectRequirements, settlement, x402Config, X402_NETWORK, X402_SCHEME, type PaymentRequirements, type SettleResponse } from "../x402/protocol.js";
 import { MAX_RESPONSE_BYTES, recordedUrl, responseContent, usdcAmount, USDC_DECIMALS, x402Request, type X402Request } from "../x402/request.js";
 
 // Source-controlled local candidate signing, explicitly authorized for acceptance testing.
@@ -572,11 +572,11 @@ export class WalletService {
     if (archived) {
       if (archived.request !== request) throw new WalletError("idempotency_conflict", "This request ID is permanently bound to a different request");
       const paid = archived.status === "confirmed";
-      return { request_id: requestId, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archived.lastError, archived: true, content_delivered: false,
+      return { request_id: requestId, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archivedError(archived), archived: true, content_delivered: false,
         next_action: paid
           ? "This payment settled and its record is archived, so its answer is no longer available. Buying again with a new request ID pays again."
           // Any outcome other than confirmed (never sent, expired, cancelled, reverted) left the seller unpaid.
-          : `This request ID's payment ended as ${archived.status}${archived.lastError ? ` (${archived.lastError})` : ""} without paying the seller, and its record is archived. This retry sent no payment. Use a new request ID to try again.` };
+          : `This request ID's payment ended as ${archived.status}${archivedError(archived) ? ` (${archivedError(archived)})` : ""} without paying the seller, and its record is archived. This retry sent no payment. Use a new request ID to try again.` };
     }
     const existing = journal.data.records.find(r => r.requestId === requestId);
     if (existing) {
@@ -760,6 +760,8 @@ export class WalletService {
     // seller could still submit the payment, so sending it again would be a send under no current policy.
     const state = await this.chain.stateFor(s.envelope, r).catch(rethrowSnapshotError);
     if (state.nonce === BigInt(r.nonce!)) {
+      // Past the reorg margin a settlement is not rechecked, so an unused lane only means this RPC is behind.
+      if (r.status === "confirmed" && r.settlementFinal) throw new WalletError("rpc_unavailable", "The RPC shows this settled payment's nonce as unused, so it is behind; retry this request ID later. Nothing more was paid");
       if (r.status === "confirmed") {
         await this.chain.assertCanonicalSnapshot(state).catch(rethrowSnapshotError);
         await this.reopenX402Settlement(journal, r);
@@ -854,7 +856,7 @@ export class WalletService {
       r.lastError = "submission_unknown"; await journal.transition(r, "submission_unknown");
       return { ...x402Result(r), next_action: `The seller did not answer, so the payment may or may not settle. ${replayable(req) ? "Retry pay_x402_resource with the same request ID while the deadline is open; " : ""}${X402_UNKNOWN_ACTION(r.requestId)}` };
     }
-    const settled = sellerSettlement(settlement(response));
+    const settled = sellerSettlement(settlement(response), s.envelope.account);
     const served = httpSucceeded(response.status) && !response.incomplete;
     // The seller's report of a successful settlement is kept whatever the HTTP status, since an upfront payment
     // can settle before a handler fails. Reconciliation verifies it on chain either way.
@@ -908,7 +910,7 @@ export class WalletService {
       const journal = await Journal.open(s); await this.reconcile(journal);
       const r = journal.data.records.find(r => r.requestId === id.toLowerCase() || r.userOpHash === id.toLowerCase());
       const archived = r ? undefined : journal.data.archived?.find(a => a.requestId === id.toLowerCase() || a.userOpHash === id.toLowerCase());
-      if (archived) return { request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archived.lastError, archived: true };
+      if (archived) return { request_id: archived.requestId, intent: { kind: "x402_payment" }, status: archived.status, user_op_hash: archived.userOpHash, transaction_hash: archived.transactionHash, last_error: archivedError(archived), archived: true };
       if (!r) throw new WalletError("operation_not_found", "No journaled operation matches this ID or hash");
       return result(r);
     });
@@ -1127,11 +1129,16 @@ export class WalletService {
 }
 const httpSucceeded = (status: number) => status >= 200 && status < 300;
 
+/** An unpaid error body is seller-written text the tool screens. A non-text body can't be screened, so it is only described. */
+function errorContent(response: HttpResponse) {
+  const { base64: _binary, ...content } = responseContent(response) as ReturnType<typeof responseContent> & { base64?: string };
+  return content;
+}
 function unpaidHttpFailure(response: HttpResponse) {
   return {
     status: "request_failed",
     http_status: response.status,
-    content: responseContent(response),
+    content: errorContent(response),
     next_action: response.incomplete
       ? "The resource response was interrupted before a payment was sent. Check the resource before retrying."
       : `The resource returned HTTP ${response.status} before a payment was sent. Check the resource response before retrying.`,
@@ -1158,12 +1165,12 @@ function rethrowX402RecheckError(error: unknown): never {
 }
 
 const MAX_LINK_ATTEMPTS = 8;
-/** A chain read for an ordinary spend that failed, or whose block was replaced; retrying reads a new snapshot. */
 /** A failed read in the checks before a signed payment is sent or resent: this call sends nothing, and the record keeps its request ID. */
 function rethrowSendCheckError(error: unknown): never {
   if (!rpcFault(error)) throw error;
   throw new WalletError("rpc_unavailable", "Could not read chain state from RPC before sending this payment, so this call did not send it; retry with the same request ID");
 }
+/** A chain read for an ordinary spend that failed, or whose block was replaced; retrying reads a new snapshot. */
 function rethrowSnapshotError(error: unknown): never {
   if (!rpcFault(error)) throw error;
   throw new WalletError("rpc_unavailable", "Chain state changed or RPC is unavailable during the wallet check; retry this request");
@@ -1228,6 +1235,9 @@ const X402_JOURNAL_BYTES = 12 * 1024 * 1024;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 /** Payments that never reached a seller: nothing can send them again or ask for their answer, so they are archived at once. */
 const UNSENT_TERMINAL = ["failed", "expired", "cancelled"];
+/** Outcomes a receipt settled: an earlier delivery error no longer describes them. */
+const SETTLED_STATUSES = ["confirmed", "reverted", "superseded"];
+const archivedError = (archived: { status: string; lastError?: string }) => SETTLED_STATUSES.includes(archived.status) ? undefined : archived.lastError;
 /** A refused unpaid request needs its binding only while a retry with its request ID is likely. */
 const REFUSED_PROBE_MS = 86_400_000;
 /** Bindings of unpaid POSTs that the resource may have acted on are kept for good, up to this many (about 2 MB). */
@@ -1250,7 +1260,9 @@ async function compactX402(journal: Journal, now = Date.now()) {
       if (r.updatedAt > now - COMPACT_AFTER_MS) return true;
       if (r.settledBlock !== undefined && !r.settlementFinal) return true;
     }
-    archive.push({ requestId: r.requestId, request: r.intent.x402!.request, status: r.status, ...(r.lastError ? { lastError: r.lastError.slice(0, 64) } : {}), ...(r.userOpHash ? { userOpHash: r.userOpHash } : {}), ...(r.transactionHash ? { transactionHash: r.transactionHash } : {}), at: r.updatedAt });
+    // A settled outcome supersedes any earlier delivery error, as the live record shows it.
+    const lastError = archivedError(r);
+    archive.push({ requestId: r.requestId, request: r.intent.x402!.request, status: r.status, ...(lastError ? { lastError: lastError.slice(0, 64) } : {}), ...(r.userOpHash ? { userOpHash: r.userOpHash } : {}), ...(r.transactionHash ? { transactionHash: r.transactionHash } : {}), at: r.updatedAt });
     return false;
   });
   if (records.length !== journal.data.records.length) changed = true;
@@ -1274,12 +1286,17 @@ function assertDeploysOnce(deployed: boolean, journal: Journal) {
   if (pending) throw new WalletError("operation_pending", `This account is not deployed yet and pending request ${pending.requestId} deploys it; retry once get_agent_operation shows it settled`);
 }
 
-/** The seller's settlement report with only well-formed values. Its free text is cut short here and screened by the tool. */
-function sellerSettlement(settled: SettleResponse | undefined) {
+/**
+ * The seller's settlement report with only well-formed values. A network or payer other than this payment's own is
+ * dropped, so the result and its x402 MCP metadata never name another chain or account. Its free text is cut short
+ * here and screened by the tool.
+ */
+function sellerSettlement(settled: SettleResponse | undefined, account: string) {
   if (!settled) return;
   const match = (value: unknown, pattern: RegExp) => typeof value === "string" && pattern.test(value) ? value.toLowerCase() : undefined;
   const reason = typeof settled.errorReason === "string" ? settled.errorReason.slice(0, 300) || undefined : undefined;
-  const fields = { transaction: match(settled.transaction, /^0x[0-9a-fA-F]{64}$/), network: match(settled.network, /^[a-zA-Z0-9-]{1,32}:[a-zA-Z0-9-]{1,64}$/), payer: match(settled.payer, /^0x[0-9a-fA-F]{40}$/), error_reason: reason };
+  const payer = match(settled.payer, /^0x[0-9a-fA-F]{40}$/);
+  const fields = { transaction: match(settled.transaction, /^0x[0-9a-fA-F]{64}$/), network: settled.network === X402_NETWORK ? X402_NETWORK : undefined, payer: payer === account.toLowerCase() ? payer : undefined, error_reason: reason };
   return { success: settled.success === true, ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)) } as { success: boolean; transaction?: string; network?: string; payer?: string; error_reason?: string };
 }
 

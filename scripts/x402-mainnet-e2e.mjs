@@ -353,15 +353,14 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
   await acquireLock();
   const store = localWalletStore(MAINNET, run.buyerProfile);
   let enabled = false, temp;
-  // An interrupt skips the finally below, so it disables the buyer and releases the marker itself.
-  const interrupted = signal => {
+  // An interrupt skips the finally below, so it releases the marker and disables the buyer itself. The suite keeps
+  // running meanwhile and may configure the buyer again, so disabling comes last and the process exits right after it.
+  const interrupted = async signal => {
     console.error(`Stopped by ${signal}. Run status before running again.`);
-    (enabled ? store.disable() : Promise.resolve()).catch(error => console.error(`Could not disable the test buyer: ${error.message}`))
-      .finally(async () => {
-        if (temp) await rm(temp, { recursive: true, force: true }).catch(() => {});
-        await unlink(lock).catch(() => {});
-        process.exit(130);
-      });
+    if (temp) await rm(temp, { recursive: true, force: true }).catch(() => {});
+    await unlink(lock).catch(() => {});
+    if (enabled) await store.disable().catch(error => console.error(`Could not disable the test buyer: ${error.message}`));
+    process.exit(130);
   };
   process.once("SIGINT", interrupted);
   process.once("SIGTERM", interrupted);
@@ -451,7 +450,7 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
     try { if (enabled) await store.disable(); }
     finally {
       try { if (temp) await rm(temp, { recursive: true, force: true }); }
-      finally { await unlink(lock); }
+      finally { await unlink(lock).catch(error => { if (error.code !== "ENOENT") throw error; }); }
     }
   }
 }

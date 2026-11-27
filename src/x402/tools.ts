@@ -47,11 +47,11 @@ export function registerX402Tools(server: McpServer, wallet: WalletService, scre
       return { result: { ...found, resources: found.resources.map(r => screening.fields(r, ["url", "service_name", "description", "mime_type", "last_updated"], ["tags", "input"])) } };
     });
 
-  // The body of an unpaid error response is seller-written error text, so it is screened. Resource content, paid
+  // The body and content type of an unpaid error response are seller-written, so they are screened. Resource content, paid
   // or free, is returned as is and marked third_party_content.
   const screenFailure = <T extends Record<string, unknown>>(answer: T): T => {
-    const content = answer.content as { text?: unknown } | undefined;
-    return answer.status === "request_failed" && typeof content?.text === "string" ? { ...answer, content: screening.fields(content as { text: string }, ["text"]) } : answer;
+    const content = answer.content as { text?: unknown; content_type?: unknown } | undefined;
+    return answer.status === "request_failed" && content ? { ...answer, content: screening.fields(content as { text?: string; content_type?: string }, ["text", "content_type"]) } : answer;
   };
 
   add("get_x402_payment_requirements",
