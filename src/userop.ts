@@ -166,13 +166,30 @@ export async function bundlerRpc(ctx: Ctx, method: string, params: unknown[]): P
   } catch (error) { throw new BundlerUnavailableError(`Bundler unreachable: ${(error as Error).message}`); }
   if (res.status === 429 || res.status >= 500) throw new BundlerUnavailableError(`Bundler HTTP ${res.status}`);
   if (!res.ok) throw new Error(`Bundler HTTP ${res.status}`);
-  let body: { result?: unknown; error?: { code: number; message: string; data?: unknown } };
-  try { body = await res.json() as typeof body; } catch (error) { throw new BundlerUnavailableError(`Bundler answer unreadable: ${(error as Error).message}`); }
-  if (body.error) {
-    const data = body.error.data ? ` ${JSON.stringify(body.error.data)}` : "";
-    throw new Error(`Bundler error ${body.error.code}: ${body.error.message}${data}`);
+  let body: unknown;
+  try { body = await res.json(); } catch { throw new BundlerUnavailableError("Bundler answer is not valid JSON"); }
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new BundlerUnavailableError("Bundler answer is not an RPC response");
+  if ("error" in body) {
+    const { error } = body;
+    if ("result" in body || !error || typeof error !== "object" || !("code" in error) || !Number.isInteger(error.code) ||
+        !("message" in error) || typeof error.message !== "string") throw new BundlerUnavailableError("Bundler answer has an invalid RPC error");
+    const data = "data" in error && error.data ? ` ${JSON.stringify(error.data)}` : "";
+    throw new Error(`Bundler error ${error.code}: ${error.message}${data}`);
   }
+  if (!("result" in body)) throw new BundlerUnavailableError("Bundler answer omitted its RPC result");
   return body.result;
+}
+
+export async function estimateUserOpGas(ctx: Ctx, op: UserOp) {
+  const estimate = await bundlerRpc(ctx, "eth_estimateUserOperationGas", [opToWire(op), ctx.config.identity.entryPoint.address]);
+  if (!estimate || typeof estimate !== "object" || Array.isArray(estimate)) throw new BundlerUnavailableError("Bundler answer has no gas estimate");
+  const fields = estimate as Record<string, unknown>;
+  const gas = (value: unknown): bigint => {
+    if (typeof value === "string" && /^(?:[0-9]+|0x[0-9a-f]+)$/i.test(value)) return BigInt(value);
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+    throw new BundlerUnavailableError("Bundler answer has an invalid or missing gas estimate field");
+  };
+  return { callGasLimit: gas(fields.callGasLimit), verificationGasLimit: gas(fields.verificationGasLimit ?? fields.verificationGas), preVerificationGas: gas(fields.preVerificationGas) };
 }
 
 function asBigInt(v: unknown): bigint {
@@ -446,13 +463,10 @@ export async function buildUserOpUnsigned(ctx: Ctx, opts: BuildOptions): Promise
     estOp.signature = await ephemeral.signMessage({
       message: { raw: computeUserOpHash(estOp, ctx.config.identity.entryPoint.address, ctx.config.identity.chainId) },
     });
-    const est = (await bundlerRpc(ctx, "eth_estimateUserOperationGas", [
-      opToWire(estOp),
-      ctx.config.identity.entryPoint.address,
-    ])) as Record<string, unknown>;
-    op.callGasLimit = (asBigInt(est.callGasLimit) * 120n) / 100n;
-    op.verificationGasLimit = (asBigInt(est.verificationGasLimit ?? est.verificationGas) * 110n) / 100n;
-    op.preVerificationGas = (asBigInt(est.preVerificationGas) * 105n) / 100n;
+    const est = await estimateUserOpGas(ctx, estOp);
+    op.callGasLimit = (est.callGasLimit * 120n) / 100n;
+    op.verificationGasLimit = (est.verificationGasLimit * 110n) / 100n;
+    op.preVerificationGas = (est.preVerificationGas * 105n) / 100n;
     if (op.paymaster) {
       // Under the paymaster cap, and excluded from the token charge.
       op.paymasterVerificationGasLimit = 300_000n;

@@ -14,7 +14,7 @@ import { approveCapabilities, reviewCapabilities } from "../src/wallet/capabilit
 import { limitsSchema, policyViolations } from "../src/wallet/policy.ts";
 import { isTransportFailure, replacementFees, WalletChain } from "../src/wallet/chain.ts";
 import { Ctx } from "../src/context.ts";
-import { computeUserOpHash, encodeExecuteBatch, userOpToJson } from "../src/userop.ts";
+import { buildUserOpUnsigned, computeUserOpHash, encodeExecuteBatch, userOpToJson } from "../src/userop.ts";
 import { args as transfer, fixture, limits, password, unsigned } from "../scripts/wallet-pipeline-fixture.mjs";
 import { join } from "node:path";
 import { previousImplementationConfig } from "../src/account-upgrade.ts";
@@ -1240,10 +1240,24 @@ test("a bundler outage during simulation keeps the request retryable, while a bu
   const chain = new WalletChain(new Ctx(MAINNET)), fetch = globalThis.fetch;
   const validated = { calls: [], hash: `0x${"11".repeat(32)}`, op: { sender: agent, nonce: 0n, callData: "0x", callGasLimit: 100_000n, verificationGasLimit: 100_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n, signature: "0x" } };
   try {
-    for (const answer of [() => { throw new TypeError("fetch failed"); }, () => new Response("busy", { status: 503 }), () => new Response("slow down", { status: 429 }), () => new Response("<html>", { status: 200 })]) {
+    for (const answer of [
+      () => { throw new TypeError("fetch failed"); },
+      () => new Response("busy", { status: 503 }),
+      () => new Response("slow down", { status: 429 }),
+      () => new Response("<html>", { status: 200 }),
+      () => Response.json(null),
+      () => Response.json({}),
+      () => Response.json({ error: { message: "proxy could not reach upstream" } }),
+      () => Response.json({ result: {} }),
+      () => Response.json({ result: { callGasLimit: "oops", verificationGasLimit: "0x100", preVerificationGas: "0x100" } }),
+    ]) {
       globalThis.fetch = async () => answer();
       await assert.rejects(chain.simulate(validated), { code: "rpc_unavailable" });
     }
+    globalThis.fetch = async () => Response.json({ result: { callGasLimit: "256", verificationGas: 256, preVerificationGas: "0x100" } });
+    await chain.simulate(validated);
+    globalThis.fetch = async () => Response.json({ result: { callGasLimit: "100001", verificationGasLimit: "0x100", preVerificationGas: "0x100" } });
+    await assert.rejects(chain.simulate(validated), { code: "simulation_failed" });
     globalThis.fetch = async () => Response.json({ jsonrpc: "2.0", id: 1, error: { code: -32500, message: "AA23 reverted" } });
     await assert.rejects(chain.simulate(validated), { code: "simulation_failed" });
     globalThis.fetch = async () => new Response("bad request", { status: 400 });
@@ -1251,10 +1265,12 @@ test("a bundler outage during simulation keeps the request retryable, while a bu
   } finally { globalThis.fetch = fetch; }
 });
 
-test("a build interrupted by a bundler outage keeps its request ID usable", async t => {
+test("a build interrupted by an incomplete bundler estimate keeps its request ID usable", async t => {
   const f = await registryFixture(t), id = randomUUID(), args = { request_id: id, approval: f.approval }, build = f.chain.build;
-  const { BundlerUnavailableError } = await import("../src/userop.ts");
-  f.chain.build = async () => { throw new BundlerUnavailableError("Bundler HTTP 503"); };
+  t.mock.method(globalThis, "fetch", async () => Response.json({ result: { callGasLimit: "0x100", verificationGasLimit: "0x100" } }));
+  f.chain.build = (wallet, intent, state) => buildUserOpUnsigned(new Ctx(MAINNET), {
+    account: wallet.account, calls: [registryCall(MAINNET, wallet.account, intent)], state: { ...state, deployed: true },
+  });
   await assert.rejects(f.service.send("link_agent", args), { code: "rpc_unavailable" });
   assert.equal((await f.service.operation(id)).status, "approval_required");
   f.chain.build = build;
