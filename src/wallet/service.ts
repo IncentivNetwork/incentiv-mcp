@@ -92,6 +92,13 @@ export class WalletService {
     // Policy and approval expiry may pass during the reads above, so they are checked again with nothing awaited before the broadcast.
     permitted();
   }
+  private async reconcileReceipt(record: OperationRecord) {
+    try { return await this.chain.receipt(record); } catch (error) {
+      if (error instanceof WalletError) throw error;
+      // An unavailable receipt for one hash does not prevent verifying another at the same nonce.
+      return undefined;
+    }
+  }
   private async reconcile(journal: Journal): Promise<void> {
     // Connections are permanent: an unlink an earlier build left awaiting approval can never be approved, so it is cancelled.
     for (const r of journal.data.records) if (r.intent.kind === "unlink_agent" && (r.status === "preparing" || r.status === "approval_required")) {
@@ -101,11 +108,11 @@ export class WalletService {
       if (r.status === "signed") continue; // No network submission was started; exact bytes remain retryable.
       if (r.status === "submitting") await journal.transition(r, "submission_unknown");
       try {
-        const receipt = await this.chain.receipt(r);
+        const receipt = await this.reconcileReceipt(r);
         let superseded = false;
         // Each signed replacement is looked up, including a token-paid one a native replacement was reviewed over.
         for (const candidate of receipt ? [] : signedReplacements(r)) {
-          const replaced = await this.chain.receipt({ ...r, operation: candidate.operation, userOpHash: candidate.userOpHash, replacement: candidate });
+          const replaced = await this.reconcileReceipt({ ...r, operation: candidate.operation, userOpHash: candidate.userOpHash, replacement: candidate });
           if (!replaced) continue;
           const gasToken = candidate.gasToken ?? "native";
           r.consumed = gasToken === "native" ? { native: replaced.actualGasCost.toString() } : { [gasToken]: candidate.gasCharge! }; r.consumedAt = Date.now(); r.transactionHash = replaced.transactionHash;
