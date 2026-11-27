@@ -987,6 +987,10 @@ test("an x402 receipt is found from the seller's transaction or the EntryPoint's
   assert.deepEqual([...new Set(calls.logs.map(String))], ["372,1000"]); // Every RPC searches forward from a reorg margin below the block it was signed at.
   ({ chain, calls } = make(true));
   assert.deepEqual(await chain.receipt(record), expected);
+  ({ chain, calls } = make(true));
+  chain.bundlerHint = async () => ({ invalid: "hash" });
+  assert.deepEqual(await chain.receipt({ ...record, transactionHash: tx }), expected);
+  assert.equal(calls.logs.length, 0);
   // A stale bundler hash, one that fails verification or is no longer found, falls through to the other sources.
   ({ chain, calls } = make(true));
   chain.bundlerHint = async () => wrong;

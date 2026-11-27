@@ -305,7 +305,7 @@ export class WalletChain {
     // Each hint counts only once verified; a stale or unverifiable one (say after a reorg) falls through to the next.
     const tried = new Set<string>();
     const verify = async (hash: Hex | undefined) => {
-      if (!hash || tried.has(hash.toLowerCase())) return;
+      if (typeof hash !== "string" || !/^0x[0-9a-f]{64}$/i.test(hash) || tried.has(hash.toLowerCase())) return;
       tried.add(hash.toLowerCase());
       return this.verifiedReceipt(record, hash).catch(() => undefined);
     };

@@ -57,7 +57,8 @@ async function save(name, data) {
   await syncDirectory(directory);
 }
 
-async function withBuyer(profile, work, dist = join(root, "dist")) {
+async function withBuyer(profile, work, dist = join(root, "dist"), signal) {
+  signal?.throwIfAborted();
   const client = new Client({ name: "incentiv-x402-mainnet-e2e", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: process.execPath, args: [join(dist, "index.js"), "--wallet-profile", profile], cwd: dist, stderr: "inherit",
@@ -65,7 +66,8 @@ async function withBuyer(profile, work, dist = join(root, "dist")) {
   try {
     await client.connect(transport);
     return await work(async (name, args = {}, expectedError) => {
-      const response = await client.callTool({ name, arguments: args }, undefined, { timeout: 180_000 });
+      signal?.throwIfAborted();
+      const response = await client.callTool({ name, arguments: args }, undefined, { timeout: 180_000, signal });
       const result = JSON.parse(response.content[0].text);
       if (expectedError) {
         assert.equal(response.isError, true, `${name} must refuse before signing`);
@@ -79,20 +81,19 @@ async function withBuyer(profile, work, dist = join(root, "dist")) {
   } finally { await client.close(); }
 }
 
-// The open seller tunnel, so a signal handler can close it: only close() stops its ssh process.
-let openTunnel;
-
-async function withSeller(run, work, dropFirstSettlement = false) {
+async function withSeller(run, work, dropFirstSettlement, signal) {
   const seller = await startSeller({ payTo: run.seller, runId: run.id, dropFirstSettlement, acceptPayments: false });
   let tunnel;
   try {
-    tunnel = openTunnel = await startTunnel(seller.internal);
+    signal.throwIfAborted();
+    tunnel = await startTunnel(seller.internal);
     const url = tunnel.origin + seller.resource;
     const deadline = Date.now() + 65_000;
     for (;;) {
+      signal.throwIfAborted();
       let response;
       let failure;
-      try { response = await fetch(url, { signal: AbortSignal.timeout(5_000), redirect: "error" }); }
+      try { response = await fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]), redirect: "error" }); }
       catch (error) { failure = error.cause?.code ?? error.message; }
       if (response?.status === 402) {
         const challenge = decodePaymentRequiredHeader(response.headers.get("payment-required"));
@@ -105,11 +106,12 @@ async function withSeller(run, work, dropFirstSettlement = false) {
       }
       await response?.body?.cancel();
       if (Date.now() >= deadline) throw new Error(`Seller HTTPS preflight did not return HTTP 402: ${failure ?? response?.status}`);
-      await delay(2_000);
+      await delay(2_000, undefined, { signal });
     }
+    signal.throwIfAborted();
     return await work({ ...seller, origin: tunnel.origin, url });
   } finally {
-    try { openTunnel = undefined; await tunnel?.close(); }
+    try { await tunnel?.close(); }
     finally { await seller.close(); }
   }
 }
@@ -221,7 +223,7 @@ async function configureBuyer(run, policy, enabled = true) {
   } finally { passphrase.fill(0); }
 }
 
-async function verifyFreeRefusals(run, seller, dist) {
+async function verifyFreeRefusals(run, seller, dist, signal) {
   const balance = await tokenBalance(run.buyer);
   const policy = limits({ origin: seller.origin, address: run.seller }, Date.now() + 15 * 60_000);
   const args = { url: seller.url, max_amount: PRICE, gas_token: "USDC" };
@@ -235,6 +237,7 @@ async function verifyFreeRefusals(run, seller, dist) {
   ];
   await withBuyer(run.buyerProfile, async call => {
     for (const check of cases) {
+      signal.throwIfAborted();
       await configureBuyer(run, check.policy, check.enabled);
       const before = seller.seen.unpaid;
       const code = check.code ?? "policy_denied";
@@ -255,6 +258,7 @@ async function verifyFreeRefusals(run, seller, dist) {
       assert.deepEqual((await call("get_agent_wallet")).result.pending_reservations, {});
       console.log(`Passed: ${check.name}`);
     }
+    signal.throwIfAborted();
     await configureBuyer(run, policy);
     const { result: quote } = await call("get_x402_payment_requirements", { url: seller.url });
     assert.equal(quote.payment_required, true);
@@ -269,16 +273,16 @@ async function verifyFreeRefusals(run, seller, dist) {
     assert.deepEqual((await call("get_agent_wallet")).result.pending_reservations, {});
     assert.equal(await tokenBalance(run.buyer), balance);
     console.log("Passed: payable quote and caller price cap");
-  }, dist);
+  }, dist, signal);
 }
 
-async function clearFailedAttempt(run) {
+async function clearFailedAttempt(run, signal) {
   const attempt = await load("attempt.json");
   assert.ok(attempt, "There is no funded attempt to retry");
   assert.equal(await load("result.json"), undefined, "A completed purchase cannot be retried as failed");
   const id = attempt.purchase.request_id;
   assert.match(id, /^[0-9a-f-]{36}$/i);
-  const operation = await withBuyer(run.buyerProfile, async call => (await call("get_agent_operation", { id })).result);
+  const operation = await withBuyer(run.buyerProfile, async call => (await call("get_agent_operation", { id })).result, undefined, signal);
   assert.equal(operation.request_id, id);
   assert.equal(operation.status, "failed", "A retry requires a failed preparation");
   assert.equal(operation.archived, true, "A retry requires the terminal wallet record");
@@ -358,22 +362,17 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
   await acquireLock();
   const store = localWalletStore(MAINNET, run.buyerProfile);
   let enabled = false, temp;
-  // An interrupt skips the finally below, so it releases the marker and disables the buyer itself. The suite keeps
-  // running meanwhile and may configure the buyer again, so disabling comes last and the process exits right after it.
-  const interrupted = async signal => {
-    console.error(`Stopped by ${signal}. Run status before running again.`);
-    // SIGTERM reaches only this process, so the tunnel's ssh child is stopped here.
-    await openTunnel?.close().catch(() => {});
-    if (temp) await rm(temp, { recursive: true, force: true }).catch(() => {});
-    await unlink(lock).catch(() => {});
-    if (enabled) await store.disable().catch(error => console.error(`Could not disable the test buyer: ${error.message}`));
-    process.exit(signal === "SIGTERM" ? 143 : 130);
+  const controller = new AbortController(), { signal } = controller;
+  const interrupted = name => {
+    process.exitCode = name === "SIGTERM" ? 143 : 130;
+    controller.abort(new Error(`Stopped by ${name}. Run status before running again.`));
   };
-  process.once("SIGINT", interrupted);
-  process.once("SIGTERM", interrupted);
+  const interrupt = () => interrupted("SIGINT"), terminate = () => interrupted("SIGTERM");
+  process.on("SIGINT", interrupt);
+  process.on("SIGTERM", terminate);
   try {
     const distSha256 = await freshBuild();
-    if (retryFailed) await clearFailedAttempt(run);
+    if (retryFailed) await clearFailedAttempt(run, signal);
     else assert.equal(await load("attempt.json"), undefined, "A funded attempt was already recorded. Use status.");
     temp = await mkdtemp(join(tmpdir(), "incentiv-x402-package-"));
     const { dist, tarballSha256 } = await installTestPackage(root, temp);
@@ -381,9 +380,10 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
     const review = await service.review();
     assert.equal(getAddress(review.wallet.account), getAddress(run.buyer));
     assert.equal(review.records.length, 0);
+    signal.throwIfAborted();
     await withSeller(run, async seller => {
       enabled = true; // Disable on exit even if configuration fails after writing an enabling policy.
-      await verifyFreeRefusals(run, seller, dist);
+      await verifyFreeRefusals(run, seller, dist, signal);
       if (freeOnly) return;
       const buyerBefore = await tokenBalance(run.buyer), sellerBefore = await tokenBalance(run.seller);
       assert.equal(buyerBefore, budget);
@@ -410,7 +410,7 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
           assert.deepEqual(JSON.parse(first.content.text), seller.fixture);
         }
         return { userOpHash: first.user_op_hash, transactionHash: dropResponse ? seller.seen.droppedSettlement : meta.transaction };
-      }, dist);
+      }, dist, signal);
 
       // A new MCP process must recover the original journal record and signed operation.
       await withBuyer(run.buyerProfile, async call => {
@@ -449,15 +449,17 @@ async function runSuite(run, { retryFailed = false, freeOnly = false, dropRespon
         };
         await save("result.json", result);
         console.log(JSON.stringify(result, null, 2));
-      }, dist);
-    }, dropResponse);
+      }, dist, signal);
+    }, dropResponse, signal);
   } finally {
-    process.off("SIGINT", interrupted);
-    process.off("SIGTERM", interrupted);
-    try { if (enabled) await store.disable(); }
-    finally {
-      try { if (temp) await rm(temp, { recursive: true, force: true }); }
-      finally { await unlink(lock).catch(error => { if (error.code !== "ENOENT") throw error; }); }
+    // Only the suite cleans up. No more work can start from this invocation once it reaches this block.
+    try {
+      try { if (enabled) await store.disable(); }
+      finally { if (temp) await rm(temp, { recursive: true, force: true }); }
+      await unlink(lock);
+    } finally {
+      process.off("SIGINT", interrupt);
+      process.off("SIGTERM", terminate);
     }
   }
 }
@@ -497,5 +499,5 @@ if (process.env.INCENTIV_ALLOW_FILE_KEY === "1") {
   console.error("The mainnet suite requires OS credential storage. Unset INCENTIV_ALLOW_FILE_KEY.");
   process.exitCode = 1;
 } else {
-  await main(process.argv.slice(2)).catch(error => { console.error(error.message); process.exitCode = 1; });
+  await main(process.argv.slice(2)).catch(error => { console.error(error.message); process.exitCode ||= 1; });
 }
