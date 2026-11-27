@@ -10,11 +10,11 @@ import { localWalletStore } from "./wallet/store.js";
 import { nativeCredentials } from "./wallet/credentials.js";
 import { exists } from "./wallet/files.js";
 import { WalletError } from "./wallet/errors.js";
-import { authorize } from "./wallet/policy.js";
+import { authorize, limitsSchema } from "./wallet/policy.js";
 import { digest } from "./wallet/journal.js";
 import { backupWallet } from "./wallet/backup.js";
 import { confirmedSecret, requireTerminal, secretPrompt, textPrompt } from "./wallet/cli.js";
-import { answer, policySummary, promptPolicy, yesNo, type Ask, type Tell } from "./setup-policy.js";
+import { answer, hasLinkPermission, linkGasWarning, policySummary, promptAgentRegistry, promptPolicy, REGISTRY_APPROVAL_HINT, withLinkPermission, withoutUnlink, yesNo, type Ask, type Tell } from "./setup-policy.js";
 import { connectClient, connectionFor, type SetupClient } from "./setup-client.js";
 
 export interface SetupIO {
@@ -62,10 +62,28 @@ export async function setupWallet(service: WalletService, root: string, io: Setu
   }
   let limits, tokens;
   if (review?.wallet.policy.configured && await yesNo(ask, tell, "Keep the current permissions?", true)) {
-    limits = review.wallet.policy.limits!;
+    limits = withoutUnlink(config, review.wallet.policy.limits!);
+    if (limits !== review.wallet.policy.limits) tell("Connections are now permanent, so the unlink permission an earlier version saved is left out below. It stays stored, and is never used, until you type ENABLE at the end of setup to save these permissions.");
+    if (config.manifest.agentRegistry && !limits.agentRegistry) {
+      if (review.wallet.manifest_id === config.manifest.manifestId) {
+        const registry = await promptAgentRegistry(config, ask, tell, review.wallet.account);
+        if (registry.agentRegistry) limits = withLinkPermission(config, limitsSchema.parse({ ...limits, agentRegistry: registry.agentRegistry }));
+        const warning = registry.agentRegistry && linkGasWarning(limits);
+        if (warning) tell(warning);
+      } else tell(REGISTRY_APPROVAL_HINT);
+    } else if (config.manifest.agentRegistry && limits.agentRegistry && !hasLinkPermission(config, limits)) {
+      // The approved registry moved to a new proxy: the kept parents stay, but link() is allowed only on the old address.
+      if (review.wallet.manifest_id !== config.manifest.manifestId) tell(REGISTRY_APPROVAL_HINT);
+      else if (await yesNo(ask, tell, `The Agent Registry is now at ${config.manifest.agentRegistry.proxy.address.toLowerCase()}, and the kept permissions do not allow sending a link there. Add that link permission, keeping the allowed Portal accounts (${limits.agentRegistry.parents.join(", ")}) and every other limit? Connections are permanent.`, true)) {
+        limits = withLinkPermission(config, limits);
+        const warning = linkGasWarning(limits);
+        if (warning) tell(warning);
+      }
+      else tell("Kept without the new registry's link permission: each link_agent request will need terminal approval.");
+    }
     tokens = await Promise.all(Object.keys(limits.tokens).map(token => service.chain.token(token)));
   } else {
-    ({ limits, tokens } = await promptPolicy(config, ref => service.chain.token(ref), ask, tell));
+    ({ limits, tokens } = await promptPolicy(config, ref => service.chain.token(ref), ask, tell, !review || review.wallet.manifest_id === config.manifest.manifestId, review?.wallet.account));
   }
   tell(policySummary(limits, tokens, config.identity.nativeSymbol));
   if (!await yesNo(ask, tell, review ? "Continue with these permissions and create an encrypted backup?" : "Create this wallet DISABLED and make an encrypted backup?")) {
