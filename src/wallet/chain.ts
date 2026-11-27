@@ -163,7 +163,7 @@ export class WalletChain {
     if (BigInt(intent.minimumOut!) > low || BigInt(intent.minimumOut!) * 10_000n < high * BigInt(10_000 - intent.slippageBps)) throw new WalletError("validation_failed", "Absolute minimum output is incompatible with the quotes and slippage bound");
   }
   async verifySwap(wallet: WalletEnvelope, intent: Intent, limits: Limits, state: ChainState): Promise<void> {
-    freshBlockTime(state.timestamp, ["validation_failed", "Swap RPC block is stale or in the future"]);
+    freshBlockTime(state.timestamp, ["validation_failed", "Swap RPC block is stale or in the future"], 60);
     await this.quote(intent, limits, state.block);
     const cfg = this.ctx.config, contracts = cfg.manifest.contracts;
     const input = await this.token(intent.token), output = await this.token(intent.tokenOut!);

@@ -1363,9 +1363,13 @@ function assertDeploysOnce(deployed: boolean, journal: Journal) {
   if (pending) throw new WalletError("operation_pending", `This account is not deployed yet and pending request ${pending.requestId} deploys it; retry once get_agent_operation shows it settled`);
 }
 
-/** A Portal approval lasts AGENT_LINK_MIN_SECONDS, and link_agent refuses one that outlasts local policy. */
+/**
+ * A Portal approval lasts AGENT_LINK_MIN_SECONDS from when the user signs it, and link_agent refuses one that outlasts
+ * local policy. The user is allowed as long again to sign it.
+ */
+const PORTAL_APPROVAL_WINDOW_SECONDS = 2 * AGENT_LINK_MIN_SECONDS;
 function assertOutlastsApproval(limits: Limits) {
-  if (limits.expiresAt && limits.expiresAt < Date.now() + AGENT_LINK_MIN_SECONDS * 1000) throw new WalletError("policy_expired", `Local wallet policy expires within ${AGENT_LINK_MIN_SECONDS / 60} minutes, before a Portal approval would, so link_agent could not use one. Renew it with incentiv-mcp setup in your local terminal`);
+  if (limits.expiresAt && limits.expiresAt < Date.now() + PORTAL_APPROVAL_WINDOW_SECONDS * 1000) throw new WalletError("policy_expired", `Local wallet policy expires within ${PORTAL_APPROVAL_WINDOW_SECONDS / 60} minutes. A Portal approval lasts ${AGENT_LINK_MIN_SECONDS / 60} minutes from when it is signed, and link_agent refuses one that outlasts the policy. Renew it with incentiv-mcp setup in your local terminal`);
 }
 
 /** Why a new request cannot start while `holder` owns the account nonce, with the step that frees it. */

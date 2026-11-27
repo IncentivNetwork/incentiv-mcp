@@ -604,7 +604,9 @@ test("registry reads report RPC failures as temporary", async t => {
   f.chain.state = async () => { throw new HttpRequestError({ url: "https://rpc.example.test", status: 429 }); };
   await assert.rejects(f.service.registryStatus(), { code });
   await assert.rejects(f.service.prepareAgentLink(), { code });
-  const a = await approval(), stale = Math.floor(Date.now() / 1000) - 120;
+  const a = await approval(), stale = Math.floor(Date.now() / 1000) - 600;
+  // A quiet chain's head can be minutes old while its state is current.
+  await verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(a), { ...state(), timestamp: Math.floor(Date.now() / 1000) - 240 });
   await assert.rejects(verifyRegistryIntent(client(), MAINNET, { account: agent }, intent(a), { ...state(), timestamp: stale }), { code });
 });
 
@@ -1401,7 +1403,7 @@ test("prepare_agent_link gives no Portal URL to a wallet that cannot sign the li
 });
 
 test("prepare_agent_link refuses an expired local policy before and after reading the registry", async t => {
-  const f = await fixture(t), now = Date.now, expiresAt = now() + 16 * 60_000;
+  const f = await fixture(t), now = Date.now, expiresAt = now() + 31 * 60_000;
   await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt, agentRegistry: { parents: [parent], allowUnlink: false } } }));
   f.chain.registryStatus = async () => {
     t.mock.method(Date, "now", () => expiresAt);
@@ -1718,12 +1720,12 @@ test("a signed unlink from an earlier build names the replacement that frees the
 });
 
 test("prepare_agent_link refuses a policy that ends before a Portal approval would", async t => {
-  const f = await fixture(t), expiresAt = Date.now() + 10 * 60_000;
+  const f = await fixture(t), expiresAt = Date.now() + 20 * 60_000;
   await f.store.session(s => s.savePolicy({ ...s.envelope.policy, limits: { ...s.envelope.policy.limits, expiresAt, agentRegistry: { parents: [parent], allowUnlink: false } } }));
   f.chain.registryStatus = async () => assert.fail("a policy that ends too soon needs no registry read");
   const refused = await f.service.prepareAgentLink();
   assert.equal(refused.link_blocked, "policy_expired"); assert.equal(refused.portal_url, undefined);
-  assert.match(refused.next_action, /expires within 15 minutes.*Renew it with incentiv-mcp setup/);
+  assert.match(refused.next_action, /expires within 30 minutes\. A Portal approval lasts 15 minutes from when it is signed.*Renew it with incentiv-mcp setup/);
 });
 
 test("a link request that waits on a full parent keeps its request ID", async t => {

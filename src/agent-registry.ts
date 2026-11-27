@@ -159,12 +159,18 @@ async function acceptsSignature(client: PublicClient, account: Address, digest: 
   return magic === "0x1626ba7e";
 }
 /**
+ * Incentiv makes blocks only when there is traffic, so on a quiet chain the head is often more than a minute old
+ * while its state is still current. A registry check trusts a head up to this old; swaps, whose quotes go stale,
+ * keep a one-minute bound.
+ */
+export const MAX_BLOCK_AGE_SECONDS = 300;
+/**
  * The current time for a registry check: the later of the local clock and the block's, refusing a block
  * too far from the local clock to trust either.
  */
-export function freshBlockTime(timestamp: number, [code, message]: [string, string] = ["registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request"]): number {
+export function freshBlockTime(timestamp: number, [code, message]: [string, string] = ["registry_rpc_unavailable", "Registry RPC block is stale or in the future, or the local clock is wrong; retry this request"], maxAge = MAX_BLOCK_AGE_SECONDS): number {
   const localNow = Math.floor(Date.now() / 1000);
-  if (!Number.isSafeInteger(timestamp) || timestamp < localNow - 60 || timestamp > localNow + 30) throw new WalletError(code, message);
+  if (!Number.isSafeInteger(timestamp) || timestamp < localNow - maxAge || timestamp > localNow + 30) throw new WalletError(code, message);
   return Math.max(localNow, timestamp);
 }
 /** How long an agent-signed link request stays valid. It may wait in Portal until the user trusts the agent. */
